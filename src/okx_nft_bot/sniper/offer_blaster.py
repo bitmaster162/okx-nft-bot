@@ -266,7 +266,7 @@ class OfferBlaster:
 
             # ETH Seaport constants
             ETH_CHAIN_ID = 1
-            SEAPORT_ADDR = "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC"
+            SEAPORT_ADDR = "0x0000000000000068F116a894984e2DB1123eB395"
             WETH_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
             ETH_RPC = os.getenv("BUYER_RPC_URL_ETH", "https://eth.llamarpc.com")
             CONDUIT_KEY = "0x618Cf13c76c1FFC2168fC47c98453dCc6134F5c8888888888888888888888888"
