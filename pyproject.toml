@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "okx-nft-bot"
+version = "0.13.0"
+description = "NFT market monitor with OKX + OpenSea cross-market analytics, read-only offers layer, and Binance whitelist support matrix"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.8,<3",
+  "python-dotenv>=1.0,<2",
+  "curl_cffi>=0.7,<1",
+  "eth-account>=0.11,<1",
+  "click>=8.0,<9",
+  "web3>=6.0,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+]
+
+[project.scripts]
+okx-nft-bot = "okx_nft_bot.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

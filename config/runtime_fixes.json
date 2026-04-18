@@ -1,0 +1,25 @@
+{
+  "runtime_improvements": {
+    "fix_none_minimum_price": true,
+    "remove_blocking_sleep": true,
+    "fix_encoding_charmap": true,
+    "correct_expiry_logic": true,
+    "async_flow_optimization": true
+  },
+  "reliability": {
+    "error_budget_minutes": 5,
+    "max_consecutive_failures": 3,
+    "auto_recovery_enabled": true,
+    "health_check_interval_seconds": 30
+  },
+  "performance": {
+    "offer_cache_ttl_seconds": 60,
+    "max_concurrent_requests": 10,
+    "request_timeout_seconds": 15,
+    "retry_policy": {
+      "max_retries": 3,
+      "backoff_multiplier": 2,
+      "initial_delay_ms": 100
+    }
+  }
+}

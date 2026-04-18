@@ -1,0 +1,114 @@
+Metadata-Version: 2.4
+Name: okx-nft-bot
+Version: 0.13.0
+Summary: NFT market monitor with OKX + OpenSea cross-market analytics, read-only offers layer, and Binance whitelist support matrix
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic<3,>=2.8
+Requires-Dist: python-dotenv<2,>=1.0
+Requires-Dist: curl_cffi<1,>=0.7
+Requires-Dist: eth-account<1,>=0.11
+Requires-Dist: click<9,>=8.0
+Requires-Dist: web3<8,>=6.0
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8.0; extra == "dev"
+
+# okx_nft_bot v12
+
+v12 adds a **cross-market analytics layer** on top of the OKX + OpenSea monitor: spread detection, collection scoring/ranking, analytics snapshots, and Telegram analytics commands.
+
+## What is new in v12
+
+- `detect-spreads` CLI command
+- `rank-collections` CLI command
+- `snapshot-analytics` CLI command
+- `send-analytics-alerts` CLI command
+- Telegram `/spreads`, `/rankings`, `/sendalerts`
+- runtime metrics now include an `analytics` block
+- cross-market ranking heuristics based on freshness, activity, market diversity, 24h volume, and spread
+
+## Supported live sources
+
+- **OKX**: collection trades, listings, collection details
+- **OpenSea**: collection events, collection stats, best listings
+
+## Environment
+
+Copy `.env.example` to `.env` and fill the keys you need.
+
+- For OKX targets, set `OKX_API_KEY`, `OKX_API_SECRET`, `OKX_API_PASSPHRASE`
+- For OpenSea targets, set `OPENSEA_API_KEY`
+- For analytics delivery, set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` and/or `WEBHOOK_URL`
+
+## Collection registry
+
+Define targets in `config/collections_registry.json`.
+
+Example shape:
+
+```json
+{
+  "name": "pudgy-penguins-opensea",
+  "market": "opensea",
+  "chain": "ethereum",
+  "collection_slug": "pudgy-penguins",
+  "enabled": true,
+  "source_modes": ["trades", "listings"]
+}
+```
+
+## CLI
+
+```bash
+okx-nft-bot run-all-once
+okx-nft-bot compare-markets
+okx-nft-bot detect-spreads --min-pct 5 --limit 10
+okx-nft-bot rank-collections --limit 10
+okx-nft-bot snapshot-analytics --min-pct 5 --limit 5
+okx-nft-bot send-analytics-alerts --min-pct 5 --limit 5
+```
+
+## Offers Operator Workflow
+
+Fetch stored offers into the read-only offers DB:
+
+```bash
+# OKX: collection address + chain are explicit
+okx-nft-bot fetch-offers --market okx --chain eth --collection-address 0xabc123 --max-pages 2
+
+# OpenSea: slug is explicit; chain is optional but accepted
+okx-nft-bot fetch-offers --market opensea --slug pudgy-penguins --chain ethereum --max-pages 2
+```
+
+Inspect already stored offers:
+
+```bash
+okx-nft-bot show-offers --market okx --collection 0xabc123 --limit 5
+okx-nft-bot show-offers --market opensea --collection pudgy-penguins --limit 5
+okx-nft-bot show-offers --market opensea --active-only --limit 10
+```
+
+Legacy compatibility:
+
+- `fetch-offers --collection ...` is still accepted as a deprecated backward-compatible alias.
+- For `--market okx`, the legacy alias maps to `--collection-address`.
+- For `--market opensea`, the legacy alias maps to `--slug`.
+
+## Telegram commands
+
+```text
+/markets
+/spreads 5 5
+/rankings 5
+/sendalerts 5 5
+/offers okx
+/offers okx 0xabc123 3
+/offers opensea
+/offers opensea pudgy-penguins 3
+```
+
+## Notes
+
+- `detect-spreads` and `rank-collections` operate on normalized events already stored in SQLite.
+- Cross-market matching uses `contract_address` when available and falls back to a normalized collection key.
+- Analytics delivery is on-demand in v12; automated periodic alerting can be layered on top later.

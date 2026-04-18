@@ -1,0 +1,55 @@
+{
+  "pnl_engine": {
+    "enabled": true,
+    "track_metrics": [
+      "realized_pnl",
+      "unrealized_pnl", 
+      "fill_rate",
+      "median_time_to_fill",
+      "cancel_ratio",
+      "pnl_per_live_offer",
+      "pnl_per_usdt_exposure",
+      "hit_rate_by_counterparty"
+    ],
+    "collection_tracking": {
+      "min_trades_for_stats": 3,
+      "pnl_threshold": 0.1,
+      "exposure_limit": 100
+    }
+  },
+  "inventory_exit": {
+    "strategies": {
+      "aggressive": {
+        "time_threshold_minutes": 30,
+        "price_discount": 0.15
+      },
+      "neutral": {
+        "time_threshold_minutes": 360,
+        "price_discount": 0.05
+      },
+      "inventory_unwind": {
+        "time_threshold_minutes": 1440,
+        "price_discount": 0.25
+      },
+      "forced_release": {
+        "time_threshold_minutes": 4320,
+        "price_discount": 0.40
+      }
+    }
+  },
+  "decision_layers": {
+    "low_ticket": {
+      "max_price_usdt": 2.0,
+      "strategy": "high_volume_low_margin"
+    },
+    "mid_ticket": {
+      "min_price_usdt": 2.0,
+      "max_price_usdt": 50.0,
+      "strategy": "balanced_pnl"
+    },
+    "high_ticket": {
+      "min_price_usdt": 50.0,
+      "strategy": "conservative_limits"
+    }
+  }
+}

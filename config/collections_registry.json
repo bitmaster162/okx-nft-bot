@@ -1,0 +1,36 @@
+{
+  "collections": [
+    {
+      "name": "the-cr7-nft-collection",
+      "market": "okx",
+      "enabled": true,
+      "chain": "bsc",
+      "collection_address": "0x102a35917e9f2ff08ffc5dc4fe3e5a400e4f33a7",
+      "collection_slug": "the-cr7-nft-collection-8",
+      "platform": "okx",
+      "source_modes": [],
+      "tags": [
+        "cr7",
+        "bsc"
+      ],
+      "_comment": "Monitoring disabled: okx-sales + okx-listings standalone parsers cover all 380 collections"
+    },
+    {
+      "name": "the-cr7-nft-collection-me",
+      "market": "magiceden",
+      "enabled": false,
+      "chain": "bsc",
+      "collection_address": "0x102a35917e9f2ff08ffc5dc4fe3e5a400e4f33a7",
+      "collection_slug": "the-cr7-nft-collection",
+      "source_modes": [
+        "trades",
+        "listings"
+      ],
+      "tags": [
+        "cr7",
+        "bsc",
+        "magiceden"
+      ]
+    }
+  ]
+}

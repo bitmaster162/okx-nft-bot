@@ -1,0 +1,26 @@
+[Unit]
+Description=OKX NFT Bot daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=okxbot
+Group=okxbot
+WorkingDirectory=/opt/okx_nft_bot_v13
+EnvironmentFile=/opt/okx_nft_bot_v13/deploy/systemd/okx-nft-bot.env
+ExecStart=/opt/okx_nft_bot_v13/.venv/bin/okx-nft-bot run-daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/okx_nft_bot_v13/data
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

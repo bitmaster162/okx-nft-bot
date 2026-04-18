@@ -1,0 +1,13 @@
+.env
+.env.*
+*.key
+*.pem
+data/
+logs/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+config/okx_cookies.json
+config/*.bak
+config/*_export.json

@@ -1,0 +1,23 @@
+{
+  "rule_packs": [
+    {
+      "name": "high_value_sales",
+      "enabled": true,
+      "event_types": ["sale"],
+      "markets": ["okx"],
+      "min_price": 1.0
+    },
+    {
+      "name": "watch_target_collection",
+      "enabled": true,
+      "event_types": ["sale", "listing"],
+      "collection_contains": ["test", "ordi"]
+    },
+    {
+      "name": "cr7_all_events",
+      "enabled": true,
+      "event_types": ["sale", "listing"],
+      "collection_contains": ["cr7"]
+    }
+  ]
+}

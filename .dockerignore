@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+data/
+*.sqlite3
+archive_analysis_pack_*.zip
