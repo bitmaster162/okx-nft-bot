@@ -2418,20 +2418,22 @@ class ParasiteHunter:
                     if len(results) > before:
                         priapi_count += 1
 
-        # Method 3: local tracking fallback — if API returned nothing but
-        # we KNOW we placed offers this session, report them so cancel works
+        # Method 3: local tracking — always merge, not only when API returned 0
+        # (K1 fix): if API returned a partial/foreign result, local tracker must
+        # still contribute its IDs so cancel sees the full picture. Without this
+        # merge, the protection logic thinks we have no offers → creates a dup.
         local_key = f"{addr}:{chain}"
         local_ids = self._local_placed_offers.get(local_key, [])
         local_count = 0
-        if local_ids and not results:
+        if local_ids:
             for oid in local_ids:
-                if oid not in seen_ids:
+                if oid and oid not in seen_ids:
                     seen_ids.add(oid)
                     results.append({"order_id": oid, "price": 0, "currency": ""})
                     local_count += 1
             if local_count:
-                log.warning("  🔎 API returned 0 but local tracker has %d offer(s) for %s — using local",
-                            local_count, addr[:14])
+                log.warning("  🔎 Local tracker added %d offer(s) for %s (api=%d, priapi=%d)",
+                            local_count, addr[:14], api_count, priapi_count)
 
         if results:
             log.info("  🔎 Found %d of our offers on %s (api=%d, priapi=%d, local=%d)",

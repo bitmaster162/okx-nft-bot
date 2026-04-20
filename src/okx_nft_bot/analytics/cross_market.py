@@ -164,6 +164,19 @@ def detect_spreads(rows: list[dict[str, Any]], *, min_spread_pct: float = 3.0, t
         eligible = [item for item in items if item.reference_price is not None and item.reference_price > 0]
         if len(eligible) < 2:
             continue
+        # A7: group by currency before comparing. Comparing BNB to ETH as raw
+        # floats gives garbage spreads (50% "arbitrage" that is actually just
+        # the FX ratio). Only compare within one currency bucket.
+        by_currency: dict[str, list[MarketSnapshot]] = {}
+        for item in eligible:
+            cur = (item.currency or "").upper().strip() or "UNKNOWN"
+            by_currency.setdefault(cur, []).append(item)
+        # Pick the bucket that has the most markets — that's the most
+        # comparable view for this collection.
+        best_bucket = max(by_currency.values(), key=len, default=[])
+        if len(best_bucket) < 2:
+            continue
+        eligible = best_bucket
         buy_side = min(eligible, key=lambda item: item.reference_price or float('inf'))
         sell_side = max(eligible, key=lambda item: item.reference_price or 0.0)
         buy_price = float(buy_side.reference_price or 0.0)

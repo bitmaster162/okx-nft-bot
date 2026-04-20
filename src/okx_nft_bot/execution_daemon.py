@@ -130,6 +130,28 @@ def main():
             except Exception as e:
                 log.error(f"[UNDERCUT] Cycle failed: {e}")
 
+        # Phase 3: Reconcile local state with exchange (K8: once per cycle;
+        # K9: iterate all active chains instead of hardcoding bsc)
+        if undercut_engine is not None:
+            governor = getattr(undercut_engine, "governor", None)
+            if governor is not None:
+                recon_chains = [
+                    c.strip().lower()
+                    for c in os.getenv("RECONCILE_CHAINS", "bsc,eth").split(",")
+                    if c.strip()
+                ]
+                for rc in recon_chains:
+                    try:
+                        rec = governor.reconcile_active_offers(chain=rc)
+                        log.info(
+                            f"[RECONCILE:{rc}] exchange_seen={rec.exchange_seen} "
+                            f"local_active={rec.local_active_seen} "
+                            f"missing={rec.local_marked_missing} "
+                            f"added={rec.local_added_from_exchange}"
+                        )
+                    except Exception as rexc:
+                        log.warning(f"[RECONCILE:{rc}] failed: {rexc}")
+
         elapsed = time.time() - t0
         log.info(f"Execution cycle {cycle} done in {elapsed:.1f}s")
 

@@ -215,6 +215,14 @@ class MassOfferEngine:
         dry_run_count = 0
         failed_count = 0
         account = self._load_buyer_account()
+        # A3: counter is read once here and incremented locally below. This is
+        # only safe if no other engine (parasite_hunter / undercutter /
+        # offer_blaster / counterbid) is submitting on the SAME wallet in
+        # parallel, and if nobody calls Seaport.incrementCounter() on-chain
+        # during the run. If either happens, all subsequent offers in this
+        # batch will be signed with a stale counter and rejected by the
+        # contract as invalid. Run MassOfferEngine as a single-engine operation
+        # and avoid manual counter bumps while it's active.
         counter = get_counter(account.address, rpc_url=rpc_url) if selected_targets else 0
         duration_seconds = max(int(resolved_duration_hours * 3600), 1)
         price_wei = to_wei(resolved_price_bnb)
