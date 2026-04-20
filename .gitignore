@@ -11,3 +11,10 @@ node_modules/
 config/okx_cookies.json
 config/*.bak
 config/*_export.json
+
+# Kimi/Cowork scratch scripts and timestamp backups
+*.bak.*
+arm_*.py
+find_*.py
+check_*.py
+stats.py
