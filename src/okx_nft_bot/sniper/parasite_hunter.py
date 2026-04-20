@@ -282,6 +282,10 @@ class ParasiteHunter:
         self.nonwl_max_usd = _env_float("PARASITE_HUNTER_NONWL_MAX_USD", 0.001)
         self.nonwl_qty = _env_int("PARASITE_HUNTER_NONWL_QTY", 10)
 
+        # ── B1: Dynamic qty = budget/price ──
+        self.budget_usd = _env_float("PARASITE_HUNTER_BUDGET_USD", 8.8)
+        self.max_qty = _env_int("PARASITE_HUNTER_MAX_QTY", 200)
+
         self.binance_whitelist = binance_whitelist
         self.buy_config = buy_config
         self._cooldowns: dict[str, float] = {}
@@ -1514,10 +1518,14 @@ class ParasiteHunter:
             cap_usd = global_cap
 
         # ── TWO-TIER SYSTEM ──
-        _cheap_threshold = self.nonwl_max_usd  # single threshold from .env ($0.54)
-        is_premium = has_collection_config and cap_usd > _cheap_threshold
-        # Collections with cap <= threshold → qty=10, otherwise qty=1
-        default_qty = 10 if (cap_usd <= _cheap_threshold) else 1
+        _cheap_threshold = self.nonwl_max_usd  # legacy, kept for backward compat
+        is_premium = has_collection_config and cap_usd > self.budget_usd
+
+        # Dynamic qty: budget_usd / price → max how many fit in budget
+        if cap_usd > self.budget_usd:
+            default_qty = 1
+        else:
+            default_qty = min(self.max_qty, max(1, int(self.budget_usd / cap_usd)))
         offer_duration_hours = 720  # 30 days
 
         if best_enemy is None:
@@ -1688,13 +1696,16 @@ class ParasiteHunter:
                     our_price = self.prices.from_usd(our_usd, our_cur)
 
         # Read quantity from collection config, or use tier default
-        # Override: if actual offer price <= threshold → qty=10
-        if our_usd <= _cheap_threshold:
-            default_qty = 10
+        # Dynamic qty: budget_usd / our_price → how many fit in budget
+        if our_usd > self.budget_usd:
+            default_qty = 1
+        else:
+            default_qty = min(self.max_qty, max(1, int(self.budget_usd / our_usd)))
+        # Manual override via config still wins
         quantity = coll_cfg.get("max_offers", default_qty)
-        # Safety: if actual offer price > threshold, force qty=1
-        if our_usd > _cheap_threshold and quantity > 1:
-            log.info("  📉 %s: offer $%.2f > $%.2f — forcing qty=1", name, our_usd, _cheap_threshold)
+        # Safety: if price > budget, cap at 1
+        if our_usd > self.budget_usd and quantity > 1:
+            log.info("  📉 %s: offer $%.2f > budget $%.2f — forcing qty=1", name, our_usd, self.budget_usd)
             quantity = 1
 
         # ── SAME-PRICE GUARD: don't cancel+replace if new price ≈ old price ──
@@ -1755,7 +1766,10 @@ class ParasiteHunter:
                             target_fb = cap_usd
                         lower_threshold = target_fb * 1.20
                         if existing_usd <= lower_threshold:
-                            _fb_want = 10 if existing_usd <= _cheap_threshold else 1
+                            if existing_usd > self.budget_usd:
+                                _fb_want = 1
+                            else:
+                                _fb_want = min(self.max_qty, max(1, int(self.budget_usd / existing_usd)))
                             if self._needs_qty_upgrade(addr, chain, existing_usd, _fb_want):
                                 log.info("  🔄 %s: fallback price OK but qty needs upgrade to %d — will re-place",
                                          name, _fb_want)
