@@ -149,9 +149,16 @@ def _rpc_request_json(
 
 def get_counter(
     offerer: str,
-    rpc_url: str = BSC_RPC,
+    rpc_url: str | None = None,
     transport: StdlibHttpTransport | None = None,
+    rpc_urls: tuple[str, ...] | list[str] | None = None,
 ) -> int:
+    """Read Seaport counter for ``offerer``.
+
+    Accepts either a single ``rpc_url`` (legacy) or a list via ``rpc_urls``.
+    When neither is provided, falls back to ``config.get_rpc_urls("bsc")``
+    so a chain of RPC endpoints is tried in order (RISK-3: failover).
+    """
     addr_clean = offerer.lower().replace("0x", "")
     calldata = GET_COUNTER_SELECTOR + addr_clean.zfill(64)
     payload = {
@@ -164,15 +171,32 @@ def get_counter(
         "id": 1,
     }
     import time as _time
-    last_err = None
-    for attempt in range(3):
-        result = _rpc_request_json(rpc_url=rpc_url, payload=payload, transport=transport)
-        if "error" not in result:
-            return int(str(result["result"]), 16)
-        last_err = result["error"]
-        if attempt < 2:
-            _time.sleep(1)
-    raise RuntimeError(f"RPC error after 3 attempts: {last_err}")
+    import random as _random
+
+    if rpc_urls:
+        urls = tuple(rpc_urls)
+    elif rpc_url:
+        urls = (rpc_url,)
+    else:
+        from okx_nft_bot.config import get_rpc_urls as _get_rpc_urls
+        urls = _get_rpc_urls("bsc") or (BSC_RPC,)
+
+    last_err: Any = None
+    for url in urls:
+        for attempt in range(3):
+            try:
+                result = _rpc_request_json(rpc_url=url, payload=payload, transport=transport)
+            except Exception as exc:
+                last_err = exc
+                if attempt < 2:
+                    _time.sleep(1 + _random.uniform(0, 0.5))
+                continue
+            if "error" not in result:
+                return int(str(result["result"]), 16)
+            last_err = result["error"]
+            if attempt < 2:
+                _time.sleep(1 + _random.uniform(0, 0.5))
+    raise RuntimeError(f"RPC error after exhausting {len(urls)} endpoint(s): {last_err}")
 
 
 def build_order_payload(

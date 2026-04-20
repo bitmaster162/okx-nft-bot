@@ -17,7 +17,7 @@ _429_BACKOFF_BASE = 2.0  # seconds: 2, 4, 8
 
 from okx_nft_bot.clients.http import HTTPStatusError, build_url
 from okx_nft_bot.clients.okx import OKXMarketplaceClient
-from okx_nft_bot.config import Settings
+from okx_nft_bot.config import Settings, get_rpc_urls
 from okx_nft_bot.normalizers.offers import NormalizedOffer
 from okx_nft_bot.providers.offers_okx import OKXOffersProvider
 from okx_nft_bot.storage.offers_store import OfferFilters, OffersStore
@@ -264,13 +264,13 @@ class OKXAPIClient:
             signature=str(signature),
         )
 
-    # RPC endpoints per chain for get_counter (Seaport contract call)
-    _CHAIN_RPCS: dict[str, str] = {
-        "bsc": "https://bsc-dataseed.binance.org/",
-        "eth": "https://ethereum-rpc.publicnode.com",
-        "polygon": "https://polygon-rpc.com/",
-        "arbitrum": "https://arb1.arbitrum.io/rpc",
-    }
+    @staticmethod
+    def _primary_rpc(chain: str) -> str:
+        """First RPC URL from the env-configured failover list (RISK-3)."""
+        urls = get_rpc_urls(chain)
+        if not urls:
+            raise RuntimeError(f"No RPC URL configured for chain {chain!r}")
+        return urls[0]
 
     # ── Two-step offer flow (priapi) ──
     # POST createCollectionOffer / createOffer → sign EIP-712 → POST submitOrder
@@ -1037,7 +1037,7 @@ class OKXAPIClient:
         from eth_account import Account
 
         chain_name = {56: "bsc", 1: "eth", 137: "polygon", 42161: "arbitrum"}.get(chain_id, "bsc")
-        rpc_url = self._CHAIN_RPCS.get(chain_name, self._CHAIN_RPCS["bsc"])
+        rpc_url = self._primary_rpc(chain_name)
         w3 = Web3(Web3.HTTPProvider(rpc_url))
 
         # Minimal ERC20 ABI — only approve()
@@ -1097,7 +1097,7 @@ class OKXAPIClient:
         from eth_account import Account
 
         chain_name = {56: "bsc", 1: "eth", 137: "polygon", 42161: "arbitrum"}.get(chain_id, "bsc")
-        rpc_url = self._CHAIN_RPCS.get(chain_name, self._CHAIN_RPCS["bsc"])
+        rpc_url = self._primary_rpc(chain_name)
         w3 = Web3(Web3.HTTPProvider(rpc_url))
 
         nft_abi = [
@@ -1394,11 +1394,6 @@ class OKXAPIClient:
         },
     ]
 
-    _RPC_URLS = {
-        "bsc": "https://bsc-dataseed.binance.org/",
-        "eth": "https://ethereum-rpc.publicnode.com",
-    }
-
     def _cancel_onchain_seaport(self, order_params: dict, chain: str) -> bool:
         """Cancel a specific Seaport order on-chain via cancel()."""
         try:
@@ -1415,7 +1410,10 @@ class OKXAPIClient:
 
         chain_lower = chain.lower()
         seaport_addr = self._SEAPORT_ADDRESSES.get(chain_lower)
-        rpc_url = self._RPC_URLS.get(chain_lower)
+        try:
+            rpc_url = self._primary_rpc(chain_lower)
+        except RuntimeError:
+            rpc_url = None
         if not seaport_addr or not rpc_url:
             log.error("_cancel_onchain: unsupported chain %s", chain)
             return False

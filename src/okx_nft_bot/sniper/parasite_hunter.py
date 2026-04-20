@@ -2642,11 +2642,7 @@ class ParasiteHunter:
         "WETH": 0.005, "DAI": 5.0,
     }
 
-    # RPC URLs per chain for balance checks
-    _CHAIN_RPC = {
-        "bsc": "https://bsc-dataseed.binance.org/",
-        "eth": "https://1rpc.io/eth",
-    }
+    # RPC URLs per chain for balance checks — populated via config.get_rpc_urls (RISK-3)
 
     # Map currency address → chain for automatic RPC selection
     _CURRENCY_CHAIN = {
@@ -2677,11 +2673,13 @@ class ParasiteHunter:
             'jsonrpc': '2.0', 'method': 'eth_call',
             'params': [{'to': currency_address, 'data': data}, 'latest'], 'id': 1,
         }).encode()
-        # Pick correct RPC based on currency address chain
+        # Pick correct RPC based on currency address chain (env-first via get_rpc_urls)
         chain = self._CURRENCY_CHAIN.get(currency_address.lower(), "bsc")
+        from okx_nft_bot.config import get_rpc_urls as _get_rpc_urls
         rpc_url = getattr(settings, f'buyer_rpc_url{"_eth" if chain == "eth" else ""}', None)
         if not rpc_url:
-            rpc_url = self._CHAIN_RPC.get(chain, 'https://bsc-dataseed.binance.org/')
+            urls = _get_rpc_urls(chain)
+            rpc_url = urls[0] if urls else 'https://bsc-dataseed.binance.org/'
         req = urllib.request.Request(rpc_url, data=payload,
                                      headers={'Content-Type': 'application/json'})
         resp = _json.loads(urllib.request.urlopen(req, timeout=5).read())

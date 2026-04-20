@@ -176,6 +176,50 @@ def validate_execution_chain(chain: str) -> str:
     return resolved
 
 
+_DEFAULT_RPC_URLS: dict[str, tuple[str, ...]] = {
+    "bsc": (
+        "https://bsc-dataseed.binance.org/",
+        "https://bsc-dataseed1.defibit.io/",
+        "https://bsc.nodereal.io",
+    ),
+    "eth": (
+        "https://ethereum-rpc.publicnode.com",
+        "https://eth.llamarpc.com",
+    ),
+    "polygon": ("https://polygon-rpc.com/",),
+    "arbitrum": ("https://arb1.arbitrum.io/rpc",),
+}
+
+
+def get_rpc_urls(chain: str) -> tuple[str, ...]:
+    """Return the ordered RPC URL list for a chain (primary first).
+
+    Reads from env ``<CHAIN>_RPC_URLS`` (comma-separated) and falls back
+    to the built-in defaults. Keeps backward compatibility with the legacy
+    ``BUYER_RPC_URL`` / ``BUYER_RPC_URL_ETH`` single-URL overrides by
+    prepending them to the list when set.
+    """
+    key = chain.lower()
+    env_list = _split_csv(os.getenv(f"{key.upper()}_RPC_URLS"))
+    legacy_single: str | None = None
+    if key == "bsc":
+        legacy_single = os.getenv("BUYER_RPC_URL")
+    elif key == "eth":
+        legacy_single = os.getenv("BUYER_RPC_URL_ETH")
+    urls: list[str] = []
+    if legacy_single:
+        urls.append(legacy_single.strip())
+    urls.extend(env_list)
+    urls.extend(_DEFAULT_RPC_URLS.get(key, ()))
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return tuple(out)
+
+
 def load_settings(profile_override: str | None = None) -> Settings:
     load_dotenv(override=False)
     profile = (profile_override or os.getenv('APP_PROFILE') or 'dev').strip().lower()

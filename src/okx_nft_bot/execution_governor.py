@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from okx_nft_bot.config import Settings, validate_execution_chain
+from okx_nft_bot.config import Settings, get_rpc_urls, validate_execution_chain
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient
 
 if TYPE_CHECKING:
@@ -22,12 +22,12 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-_CHAIN_RPCS: dict[str, str] = {
-    "bsc": "https://bsc-dataseed.binance.org/",
-    "eth": "https://ethereum-rpc.publicnode.com",
-    "polygon": "https://polygon-rpc.com/",
-    "arbitrum": "https://arb1.arbitrum.io/rpc",
-}
+def _primary_rpc_url(chain: str) -> str:
+    """Back-compat accessor: first RPC URL from the failover list."""
+    urls = get_rpc_urls(chain)
+    if not urls:
+        raise RuntimeError(f"No RPC URL configured for chain {chain!r}")
+    return urls[0]
 
 
 MIN_OFFER_PRICE_USD = _env_float("MIN_OFFER_PRICE_USD", 0.001)
@@ -166,8 +166,7 @@ class ExecutionGovernor:
         from okx_nft_bot.signing.seaport_signer import get_counter
 
         def _fetch(w: str, c: str) -> int:
-            rpc_url = _CHAIN_RPCS.get(c, _CHAIN_RPCS["bsc"])
-            return int(get_counter(w, rpc_url=rpc_url))
+            return int(get_counter(w, rpc_urls=get_rpc_urls(c)))
 
         return self.state.allocate_seaport_counter(
             wallet=wallet,
@@ -193,9 +192,16 @@ class ExecutionGovernor:
         from web3 import Web3
 
         def _fetch(w: str, c: str) -> int:
-            rpc_url = _CHAIN_RPCS.get(c, _CHAIN_RPCS["bsc"])
-            w3 = Web3(Web3.HTTPProvider(rpc_url))
-            return int(w3.eth.get_transaction_count(Web3.to_checksum_address(w), "pending"))
+            urls = get_rpc_urls(c)
+            last_err: Exception | None = None
+            for url in urls:
+                try:
+                    w3 = Web3(Web3.HTTPProvider(url))
+                    return int(w3.eth.get_transaction_count(Web3.to_checksum_address(w), "pending"))
+                except Exception as exc:
+                    last_err = exc
+                    continue
+            raise RuntimeError(f"All {len(urls)} RPC endpoints failed for chain {c}: {last_err}")
 
         return self.state.allocate_nonce(
             wallet=wallet,
