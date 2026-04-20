@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from okx_nft_bot.config import SUPPORTED_EXECUTION_CHAINS
+
 logger = logging.getLogger(__name__)
 
 
@@ -779,7 +781,7 @@ class PositionState:
                     runtime_keys_cleared.append(key)
 
             raw_reconcile_chain = runtime_map.get("last_reconcile_chain")
-            if raw_reconcile_chain is not None and raw_reconcile_chain.strip().lower() != "bsc":
+            if raw_reconcile_chain is not None and raw_reconcile_chain.strip().lower() not in SUPPORTED_EXECUTION_CHAINS:
                 notes.append(
                     f"Invalid chain for execution_runtime_state.last_reconcile_chain: {raw_reconcile_chain!r}"
                 )
