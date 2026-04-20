@@ -2588,8 +2588,25 @@ class ParasiteHunter:
                             name, len(truly_new))
                 return False
             if remaining:
-                log.info("  👻 %s: %d ghost offers still in API cache (same IDs) — ignoring, proceeding",
-                         name, len(remaining))
+                # K2: distinguish receipt-verified cancels from API-only cancels.
+                # _cancel_onchain_seaport already waits for receipt with status==1
+                # before returning True, so a recent _last_onchain_cancel_ts means
+                # at least one of these cancels is on-chain-verified. API-only
+                # cancels trust OKX's 200 response — same ids reappearing should
+                # be a stale cache but we cannot prove it without an on-chain tx.
+                if had_onchain:
+                    log.info(
+                        "  👻 %s: %d ghost offers still in API cache (same IDs) — "
+                        "on-chain cancel receipt verified, proceeding",
+                        name, len(remaining),
+                    )
+                else:
+                    log.warning(
+                        "  👻 %s: %d ghost offers still in API cache (same IDs); "
+                        "cancel was API-only, no on-chain verification — "
+                        "trusting OKX and proceeding",
+                        name, len(remaining),
+                    )
             return True
 
         # Partial cancel — do strict verification
