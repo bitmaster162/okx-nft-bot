@@ -146,6 +146,18 @@ def _optional_bool(value: str | None) -> bool:
     return value.strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def _safe_bool(env_name: str, default: bool = True) -> bool:
+    """Read a bool env var with a safe default when unset or blank.
+
+    Empty string or whitespace-only values return ``default`` (not False).
+    Prevents ``DRY_RUN=`` (blank) from silently disabling safety guards.
+    """
+    val = os.getenv(env_name)
+    if val is None or not val.strip():
+        return default
+    return _optional_bool(val)
+
+
 def _ensure_parent(p: Path) -> Path:
     """Create parent directory for a path if it doesn't exist."""
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -236,14 +248,14 @@ def load_settings(profile_override: str | None = None) -> Settings:
         buyer_wallet_address=os.getenv('BUYER_WALLET_ADDRESS') or None,
         buyer_wallet_private_key=os.getenv('BUYER_WALLET_PRIVATE_KEY') or None,
         sniper_config_path=Path(os.getenv('SNIPER_CONFIG_PATH', './config/sniper_config.json')),
-        dry_run=_optional_bool(os.getenv('DRY_RUN')) if os.getenv('DRY_RUN') is not None else True,
+        dry_run=_safe_bool('DRY_RUN', default=True),
         execution_db_path=execution_db_path,
         execution_chain=os.getenv('EXECUTION_CHAIN', 'bsc'),
         mass_offer_price_bnb=float(os.getenv('MASS_OFFER_PRICE_BNB', '0.01')),
         mass_offer_duration_hours=int(os.getenv('MASS_OFFER_DURATION_HOURS', '24')),
         mass_offer_delay_seconds=float(os.getenv('MASS_OFFER_DELAY_SECONDS', '2')),
         mass_offer_max_total=int(os.getenv('MASS_OFFER_MAX_TOTAL', '100')),
-        mass_offer_dry_run=_optional_bool(os.getenv('MASS_OFFER_DRY_RUN')) if os.getenv('MASS_OFFER_DRY_RUN') is not None else True,
+        mass_offer_dry_run=_safe_bool('MASS_OFFER_DRY_RUN', default=True),
         undercut_interval_seconds=int(os.getenv('UNDERCUT_INTERVAL_SECONDS', '30')),
         undercut_max_offer_age_hours=int(os.getenv('UNDERCUT_MAX_OFFER_AGE_HOURS', '24')),
         undercut_attack_ratio=float(os.getenv('UNDERCUT_ATTACK_RATIO', '0.75')),
