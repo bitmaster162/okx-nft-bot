@@ -932,7 +932,8 @@ class OKXAPIClient:
 
         encoded = encode_typed_data(full_message=structured)
         signed = Account.sign_message(encoded, private_key=private_key)
-        signature = "0x" + signed.signature.hex()
+        from okx_nft_bot.signing.seaport_signer import hex_with_prefix
+        signature = hex_with_prefix(signed.signature)
 
         # Extract post body template from sign_item (not sign_step)
         post_info = sign_item.get("post", sign_step.get("post", data.get("post", {})))

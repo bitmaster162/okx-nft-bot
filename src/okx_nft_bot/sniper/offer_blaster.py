@@ -603,7 +603,8 @@ class OfferBlaster:
 
         encoded = encode_typed_data(full_message=structured)
         signed = Account.sign_message(encoded, private_key=private_key)
-        return "0x" + signed.signature.hex()
+        from okx_nft_bot.signing.seaport_signer import hex_with_prefix
+        return hex_with_prefix(signed.signature)
 
     # ── Telegram alert ────────────────────────────────────────────
 

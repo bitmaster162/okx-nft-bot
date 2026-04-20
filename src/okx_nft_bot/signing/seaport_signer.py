@@ -33,6 +33,11 @@ OKX_ZONE = "0xdf2d4bffec010debd302674c9fb9cda99bb5e852"
 GET_COUNTER_SELECTOR = "0xf07ec373"
 
 
+def hex_with_prefix(b: bytes) -> str:
+    """Return bytes as a 0x-prefixed hex string. Use for signatures and byte payloads."""
+    return "0x" + b.hex()
+
+
 class ItemType(IntEnum):
     NATIVE = 0
     ERC20 = 1
@@ -363,7 +368,7 @@ def sign_order(payload: dict[str, Any], private_key: str, chain_id: int = CHAIN_
     }
     encoded = encode_typed_data(full_message=structured)
     signed = Account.sign_message(encoded, private_key=private_key)
-    return "0x" + signed.signature.hex()
+    return hex_with_prefix(signed.signature)
 
 
 def submit_order(signed_order: SignedOrder, *, dry_run: bool = True) -> dict[str, Any]:
