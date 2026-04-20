@@ -1,4 +1,4 @@
-## Известные проблемы (обновлено 2026-04-20 после Phase 1–4)
+## Известные проблемы (обновлено 2026-04-20 после Phase 1–4 + K2/K3/A9/K7)
 
 ### ✅ FIXED
 - **offer_blaster.py:269** — ETH Seaport v1.5 → v1.6 (commit 7f7dd7e)
@@ -13,6 +13,20 @@
 - **B1**: parasite_hunter dynamic qty = `min(max_qty, budget_usd/price)` (commit c5a0ca1).
 - **K1**: `_find_all_our_offers` — local tracker merged always, not only on empty API
   (commit e2c1442). Partial/foreign API results no longer hide our live offers.
+- **K3**: `_PLACE_COOLDOWN` now persists to SQLite via `PositionState.place_cooldown`
+  table (commits 0717b55 + 1c1925b). Parasite hunter hydrates
+  `_last_placed`/`_placed_qty_cache` on init and upserts after every placement —
+  container restarts no longer reset the anti-stacking guard.
+- **A9**: BSC-only chain checks centralized into `config.validate_execution_chain`
+  + `SUPPORTED_EXECUTION_CHAINS` (commit 08133d5). `execution_governor`,
+  `counterbid/engine` (×2), `undercutter/engine` (×2) and `execution_cli._ensure_bsc`
+  now delegate to the helper. Hardcoded-BNB sites (`mass_offer/engine`,
+  `signing/seaport_signer.preview_counterbid`) keep the explicit check with a
+  `# BSC-only:` comment documenting the constraint.
+- **K7**: Current master still reads `sell_settings.min_listing_price_bnb` and
+  clamps `our_sell_price` in both sell branches (`parasite_hunter.py:3146`,
+  :3315, :3329). The safety floor was never removed; the WIP stash entry
+  that would have dropped it is discarded. No code change required.
 - **K6**: `_buyer_lock` verified present at parasite_hunter.py:239/1006/1046. The WIP
   removal lived only in `stash@{0}` and was never applied — no code change needed.
 - **K8/K9**: execution_daemon now has one `[RECONCILE]` block per cycle (not two) and
@@ -29,32 +43,20 @@
 - **Q4**: r/s split WIP verified not applied — `counterbid/okx_api.py` still sends
   `r=""`, `s=""`, full signature. No rollback needed.
 
-### 🔴 CONFIRMED, NOT FIXED
+### ⚠️ PARTIAL
 
 **K2: Ghost-branch proceed при неполной он-чейн отмене**
-- parasite_hunter.py:2539-2542
-- Даёт proceed если ok_count == len(all_ours) и API видит те же order_id
-- Трактуется как stale-кеш OKX, но если реальная отмена он-чейн пошла
-  не до конца — в UI будет дубль
-- Фикс: добавить он-чейн верификацию (RPC call на canceled event) перед proceed
-- P2
+- parasite_hunter.py:2539-2542 (ghost-branch now at lines ~2570-2610)
+- `_cancel_onchain_seaport` уже ждёт receipt (status==1) перед возвратом True,
+  поэтому on-chain ветка фактически верифицирована. API-only ветка
+  (`cancel-listing` endpoint) отдаёт 200 без tx — для неё on-chain проверки нет.
+- Частичный фикс (commit bdca0e4): в ghost-branch логирование разделено —
+  INFO "receipt verified" когда `_last_onchain_cancel_ts < 30s`, WARNING
+  "cancel was API-only, no on-chain verification" иначе. Поведение proceed
+  оставлено (альтернатива — infinite ABORT loop при залипшем API-кеше).
+- Полный фикс невозможен без возврата tx hash из API-only пути; статус PARTIAL.
 
-**K3: Cooldown _PLACE_COOLDOWN теряется при рестарте**
-- parasite_hunter.py:329
-- `_last_placed` в памяти процесса, после рестарта сброс в 0
-- При рестарте контейнера (частое событие) все guards обнуляются →
-  потенциальный burst дублей сразу после рестарта
-- Фикс: персистировать `_last_placed` в SQLite или Redis
-- P2
-
-**K7: Удалён min_listing_price_bnb floor в parasite_hunter.py (WIP)**
-- Uncommitted: удалено чтение `sell_settings.min_listing_price_bnb` и обе clamp-точки
-- Теперь sell-цена опирается только на `low_price` (расчётный пол). Если
-  `low_price` миграция/стейл-данные сделают его аномально низким — листинги уйдут
-  дёшево без глобального страховочного пола
-- Статус: стэш `stash@{0}` пока не применён. Если решено sell-floor убрать насовсем
-  — его же надо выпилить из config; если оставить — откатить стэш-правку.
-- P2
+### 🔴 CONFIRMED, NOT FIXED
 
 **A3: Stale Seaport counter при множественных движках на одном кошельке**
 - `mass_offer/engine.py:218` — counter читается один раз в начале `run()`,
@@ -71,17 +73,8 @@
 - `undercutter/engine.py:207` — env-driven минимум 0.0001 BNB применяется
   только в `UndercutEngine._apply_action`.
 - `offer_blaster.py`, `mass_offer/engine.py`, `parasite_hunter.py` (strategy section) —
-  нет аналогичного guard'а. Пересекается с K7 (удалённый `min_listing_price_bnb` в
-  parasite_hunter).
+  нет аналогичного guard'а.
 - Фикс: единая min-price-floor в `ExecutionGovernor.check_live_submit_allowed`.
-- P2
-
-**A9: Хардкод `if resolved_chain != "bsc": raise ...` в 4+ местах**
-- `execution_governor.py:127`, `undercutter/engine.py:59, 357`,
-  `mass_offer/engine.py:123`
-- DRY violation. K8/K9 частично решён (reconcile теперь multi-chain), но
-  chain-check в action-path всё ещё BSC-only.
-- Фикс: `Settings.supported_execution_chains` + helper.
 - P2
 
 ### 🟠 OPEN QUESTIONS
@@ -110,6 +103,7 @@
 Из него НИЧЕГО не применено в основной ветке. Содержимое разобрано и:
 - **K5** — отвергнуто (verified via live API, commit 03cfd37).
 - **K6** — отвергнуто (лок нужен, текущая ветка его уже содержит).
+- **K7** — отвергнуто (master сохраняет `min_listing_price_bnb` safety-floor).
 - **K8** — фикс-идея верная, но форма стэша добавляла ДВА reconcile (проблема).
   Применена правильная форма (один reconcile, commit e2c1442).
 - **K9** — та же история: исправлено multi-chain вариантом в e2c1442.
