@@ -1,4 +1,4 @@
-## Известные проблемы (обновлено 2026-04-20 после Phase 1–4 + K2/K3/A9/K7)
+## Известные проблемы (обновлено 2026-04-20 после Phase 1–6 + AUDIT-V2 fixes)
 
 ### ✅ FIXED
 - **offer_blaster.py:269** — ETH Seaport v1.5 → v1.6 (commit 7f7dd7e)
@@ -42,6 +42,45 @@
   unaffected.
 - **Q4**: r/s split WIP verified not applied — `counterbid/okx_api.py` still sends
   `r=""`, `s=""`, full signature. No rollback needed.
+- **BUG-1**: ETH `last_reconcile_chain` timestamp wiped by `audit_integrity`
+  because the hardcoded `!= "bsc"` predated A9. Replaced with
+  `SUPPORTED_EXECUTION_CHAINS` check in `undercutter/state.py` (commit aa393d2).
+- **BUG-2**: `SQLiteStore`, `OffersStore`, `FraudStore` opened connections
+  without WAL → concurrent writers saw `database is locked`. All three now
+  set `PRAGMA journal_mode=WAL`, `busy_timeout=10000` on every connect and use
+  `timeout=10.0` on `sqlite3.connect` (commit 62650d2).
+- **RISK-1**: Per-process nonce cache in `buyer.py` + unguarded
+  `get_transaction_count` in `counterbid/okx_api.py` risked nonce collisions
+  between containers. Centralized in `ExecutionGovernor.allocate_nonce` with a
+  SQLite `wallet_nonce` table and BEGIN IMMEDIATE atomic allocation (commit
+  215ba2d). Mirrors the existing `allocate_seaport_counter` pattern.
+- **RISK-2**: Auto-resolved by RISK-1 — the `wallet_nonce` SQLite row is the
+  persistent source of truth, so container restart recovers state. No separate
+  commit.
+- **RISK-3**: Single-RPC paths in 4 sites (`signing/seaport_signer.get_counter`,
+  `execution_governor`, `counterbid/okx_api`, `sniper/parasite_hunter`)
+  meant one RPC outage stopped execution. Added `config.get_rpc_urls(chain)`
+  (reads `<CHAIN>_RPC_URLS` CSV + legacy `BUYER_RPC_URL*`), per-URL retry loop
+  with jittered sleep in `get_counter`, `allocate_nonce` failover (commit 18f2c5e).
+- **RISK-4**: `parasite_hunter._get_balance` called `urllib.request.urlopen`
+  directly → bypassed rate limiter → 429s on public RPCs. Added shared
+  `get_rpc_transport()` in `clients/http.py` (StdlibHttpTransport backed by a
+  shared `RateLimiter`) and routed `_get_balance` through it (commit 9d9c301).
+- **RISK-6** (mitigation): Multi-container shared-key overshoot of OKX rate.
+  Added `CONTAINER_COUNT_FOR_RATE_SPLIT` env (default 1); effective
+  `okx_rate_limit_per_sec = OKX_RATE_LIMIT_PER_SEC / CONTAINER_COUNT_FOR_RATE_SPLIT`.
+  Operators running N containers should set the env to N and set
+  `OKX_RATE_LIMIT_PER_SEC` to the total budget (commit 1d726b8). Full fix
+  (IPC-based global limiter) deferred.
+- **SMELL-1**: `"0x" + signed.signature.hex()` duplicated in 4 sites.
+  Added `hex_with_prefix(bytes)` helper in `signing/seaport_signer.py`;
+  replaced at `counterbid/okx_api.py`, `sniper/offer_blaster.py`,
+  `clients/opensea.py`, and the helper site itself (commit 209d1f8).
+- **DEBT**: stray debug scripts and backup dumps relocated out of `config/`
+  (commit 8850291): `gen_eth_config_auto.py`, `parse_and_merge_wallet.py`,
+  `parse_wallet_offers.py` → `scripts/debug/`;
+  `buy_config.json.bak`, `wallet_missing_collections.json` → `data/backups/`.
+  `config/okx_nft_bot_v13_hardened/` left frozen as historical snapshot.
 
 ### ⚠️ PARTIAL
 
@@ -58,24 +97,19 @@
 
 ### 🔴 CONFIRMED, NOT FIXED
 
+_(none from AUDIT-V2 — all P0/P1 items landed in Phase 6)_
+
+### Historical (resolved in earlier phases)
+
 **A3: Stale Seaport counter при множественных движках на одном кошельке**
-- `mass_offer/engine.py:218` — counter читается один раз в начале `run()`,
-  далее инкрементируется локально.
-- Если параллельно работают 2+ движка на одном private_key, или юзер
-  руками делает `incrementCounter()` во время прогона — все последующие
-  офферы батча получат stale counter и будут отвергнуты контрактом.
-- Частичный фикс (commit e2c1442): добавлен предупреждающий комментарий в
-  коде. Архитектурный фикс (per-offer counter read или SQLite-локальный
-  атомарный счётчик) — отдельной задачей.
-- P1 (архитектурный)
+- Resolved by central `ExecutionGovernor.allocate_seaport_counter` (commit
+  19c4bcb) — SQLite `seaport_counter` table with BEGIN IMMEDIATE atomic
+  allocation, shared between all engines on the same (wallet, chain).
 
 **A8: `UNDERCUTTER_MIN_PRICE_BNB` — safety floor только для undercutter**
-- `undercutter/engine.py:207` — env-driven минимум 0.0001 BNB применяется
-  только в `UndercutEngine._apply_action`.
-- `offer_blaster.py`, `mass_offer/engine.py`, `parasite_hunter.py` (strategy section) —
-  нет аналогичного guard'а.
-- Фикс: единая min-price-floor в `ExecutionGovernor.check_live_submit_allowed`.
-- P2
+- Resolved by `ExecutionGovernor.check_min_price` (commit 5a8c788) — single
+  floor now applied across undercutter, offer_blaster, mass_offer, and
+  parasite_hunter strategy branches.
 
 ### 🟠 OPEN QUESTIONS
 
