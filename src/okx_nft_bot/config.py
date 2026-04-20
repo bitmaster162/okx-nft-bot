@@ -253,7 +253,9 @@ def load_settings(profile_override: str | None = None) -> Settings:
         okx_page_limit=int(os.getenv('OKX_PAGE_LIMIT', '20')),
         okx_request_timeout=int(os.getenv('OKX_REQUEST_TIMEOUT', '20')),
         okx_max_retries=int(os.getenv('OKX_MAX_RETRIES', '4')),
-        okx_rate_limit_per_sec=float(os.getenv('OKX_RATE_LIMIT_PER_SEC', '3.0')),
+        okx_rate_limit_per_sec=float(os.getenv('OKX_RATE_LIMIT_PER_SEC', '3.0')) / max(
+            int(os.getenv('CONTAINER_COUNT_FOR_RATE_SPLIT', '1')), 1
+        ),
         okx_enable_details=_optional_bool(os.getenv('OKX_ENABLE_DETAILS')),
         okx_max_pages_per_run=int(os.getenv('OKX_MAX_PAGES_PER_RUN', '5')),
         okx_cursor_namespace=os.getenv('OKX_CURSOR_NAMESPACE', 'trades'),
