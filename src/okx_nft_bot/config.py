@@ -164,6 +164,18 @@ def _ensure_parent(p: Path) -> Path:
     return p
 
 
+SUPPORTED_EXECUTION_CHAINS: tuple[str, ...] = ("bsc", "eth")
+
+
+def validate_execution_chain(chain: str) -> str:
+    resolved = chain.lower()
+    if resolved not in SUPPORTED_EXECUTION_CHAINS:
+        raise ValueError(
+            f"chain {resolved!r} not in supported: {SUPPORTED_EXECUTION_CHAINS}"
+        )
+    return resolved
+
+
 def load_settings(profile_override: str | None = None) -> Settings:
     load_dotenv(override=False)
     profile = (profile_override or os.getenv('APP_PROFILE') or 'dev').strip().lower()

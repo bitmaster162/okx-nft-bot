@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from okx_nft_bot.clients.http import StdlibHttpTransport
-from okx_nft_bot.config import Settings
+from okx_nft_bot.config import Settings, validate_execution_chain
 from okx_nft_bot.counterbid.config import CounterbidConfigManager
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient
 from okx_nft_bot.execution_governor import ExecutionGovernor
@@ -55,9 +55,7 @@ class UndercutEngine:
         self.strategy = UndercutStrategy(settings, self.config_manager)
 
     def run_cycle(self, *, chain: str | None = None, refresh: bool = False) -> list[UndercutAction]:
-        resolved_chain = (chain or self.settings.execution_chain).lower()
-        if resolved_chain != "bsc":
-            raise ValueError(f"Only 'bsc' is supported in the execution track; got {resolved_chain!r}")
+        resolved_chain = validate_execution_chain(chain or self.settings.execution_chain)
         actions: list[UndercutAction] = []
         active_offers = self.state.get_active_offers(chain=resolved_chain)
 
@@ -375,9 +373,7 @@ class UndercutEngine:
         )
 
     def status(self, *, chain: str | None = None) -> dict[str, Any]:
-        resolved_chain = (chain or self.settings.execution_chain).lower()
-        if resolved_chain != "bsc":
-            raise ValueError(f"Only 'bsc' is supported in the execution track; got {resolved_chain!r}")
+        resolved_chain = validate_execution_chain(chain or self.settings.execution_chain)
         integrity = self.state.audit_integrity().to_dict()
         rate_limits = self.governor.get_rate_limit_snapshot(chain=resolved_chain, now=datetime.now(timezone.utc))
         return {

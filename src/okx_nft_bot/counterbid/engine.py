@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from okx_nft_bot.clients.http import StdlibHttpTransport
-from okx_nft_bot.config import Settings
+from okx_nft_bot.config import Settings, validate_execution_chain
 from okx_nft_bot.counterbid.config import CollectionConfig, CounterbidConfigManager
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient, OfferRefreshResult
 from okx_nft_bot.execution_governor import ExecutionGovernor
@@ -132,9 +132,7 @@ class CounterBidder:
         sign_preview: bool = False,
         limit: int = 100,
     ) -> tuple[CounterBidTask, OfferRefreshResult | None]:
-        resolved_chain = (chain or self.settings.execution_chain).lower()
-        if resolved_chain != "bsc":
-            raise ValueError(f"Only 'bsc' is supported in the execution track; got {resolved_chain!r}")
+        resolved_chain = validate_execution_chain(chain or self.settings.execution_chain)
         cfg = self.config.get_collection(collection_address)
         if not cfg:
             return (
@@ -319,9 +317,7 @@ class CounterBidder:
         sign_preview: bool = False,
         collection: str | None = None,
     ) -> BatchResult:
-        resolved_chain = (chain or self.settings.execution_chain).lower()
-        if resolved_chain != "bsc":
-            raise ValueError(f"Only 'bsc' is supported in the execution track; got {resolved_chain!r}")
+        resolved_chain = validate_execution_chain(chain or self.settings.execution_chain)
         if collection:
             task, refresh_result = self.process_single_collection(
                 collection,

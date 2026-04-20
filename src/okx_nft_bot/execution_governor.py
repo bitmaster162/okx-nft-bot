@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from okx_nft_bot.config import Settings
+from okx_nft_bot.config import Settings, validate_execution_chain
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient
 
 if TYPE_CHECKING:
@@ -187,9 +187,7 @@ class ExecutionGovernor:
         return True, ""
 
     def reconcile_active_offers(self, *, chain: str | None = None) -> ReconciliationResult:
-        resolved_chain = (chain or self.settings.execution_chain).lower()
-        if resolved_chain != "bsc":
-            raise ValueError(f"Only 'bsc' is supported in the execution track; got {resolved_chain!r}")
+        resolved_chain = validate_execution_chain(chain or self.settings.execution_chain)
 
         exchange_offers_raw = self.api_client.get_my_offers(
             chain=resolved_chain,

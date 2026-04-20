@@ -376,6 +376,7 @@ def preview_counterbid(
     rpc_url: str = BSC_RPC,
     transport: StdlibHttpTransport | None = None,
 ) -> dict[str, Any]:
+    # BSC-only: BSC_RPC default + BNB-denominated price_bnb; EIP-712 domain ties to BSC chain id
     if chain.lower() != "bsc":
         raise ValueError(f"Only 'bsc' is supported; got {chain!r}")
     if not settings.buyer_wallet_private_key or not settings.buyer_wallet_address:

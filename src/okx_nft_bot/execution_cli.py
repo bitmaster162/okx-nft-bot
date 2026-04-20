@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import asdict
 
-from okx_nft_bot.config import load_settings
+from okx_nft_bot.config import load_settings, validate_execution_chain
 from okx_nft_bot.counterbid import CounterBidder, CounterbidConfigManager
 from okx_nft_bot.execution_governor import ExecutionGovernor
 from okx_nft_bot.signing import preview_counterbid
@@ -12,10 +12,10 @@ from okx_nft_bot.undercutter import PositionState, UndercutEngine, UndercutSched
 
 
 def _ensure_bsc(chain: str) -> str:
-    resolved = chain.lower()
-    if resolved != "bsc":
-        raise SystemExit("Execution track currently supports only --chain bsc")
-    return resolved
+    try:
+        return validate_execution_chain(chain)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _load_state(settings) -> PositionState:

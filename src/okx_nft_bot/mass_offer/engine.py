@@ -119,6 +119,7 @@ class MassOfferEngine:
         max_pages: int | None = None,
         rpc_url: str = BSC_RPC,
     ) -> MassOfferRunResult:
+        # BSC-only: pricing is hardcoded BNB (mass_offer_price_bnb) and rpc_url defaults to BSC_RPC
         resolved_chain = chain.lower()
         if resolved_chain != "bsc":
             raise ValueError(f"Only 'bsc' is supported in the execution track; got {resolved_chain!r}")
