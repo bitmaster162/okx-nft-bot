@@ -1,0 +1,82 @@
+Parasite-Killer v15 — File Manifest
+====================================
+
+PROJECT STRUCTURE:
+/v15/
+├── Production Code
+│   ├── config.py                    178 lines   Configuration manager (SQLite)
+│   ├── okx_api.py                   221 lines   OKX API client + rate limiter
+│   ├── counter_bidder.py            341 lines   Counter-bidding engine + logic
+│   └── cli.py                       355 lines   CLI interface (6 commands)
+│
+├── Testing
+│   └── test_counter_bidder.py       312 lines   18 unit tests (mocked API)
+│
+├── Documentation
+│   ├── README_v15.md                450+ lines  Full documentation + guide
+│   ├── QUICKSTART.md                150+ lines  5-minute setup guide
+│   ├── BUILD_SUMMARY.md             250+ lines  Build report & manifest
+│   └── MANIFEST.txt                 (this file)
+│
+└── Configuration
+    └── requirements_v15.txt         12 lines    Dependencies
+
+TOTAL CODE: ~1,870 lines production + tests + docs
+
+KEY FEATURES:
+✓ Parasite detection (2 hardcoded wallet targets)
+✓ Auto-undercut calculation with configurable margin
+✓ Per-collection price limits (min/max BNB)
+✓ Batch processing (multiple collections in one run)
+✓ DRY-RUN safety (dry-run by default, explicit --submit to go live)
+✓ SQLite configuration storage
+✓ OKX API integration with HMAC-SHA256 auth
+✓ Rate limiting (20 req/s automatic)
+✓ Continuous monitoring loop
+✓ v14 seaport_signer integration
+✓ Comprehensive CLI (6 commands)
+✓ Full test coverage (18 tests, mocked API)
+
+SYNTAX VALIDATION:
+✓ config.py              — VALID
+✓ okx_api.py            — VALID
+✓ counter_bidder.py     — VALID
+✓ cli.py                — VALID
+✓ test_counter_bidder.py — VALID
+✓ All imports working
+✓ Core functionality verified
+
+DEPENDENCIES:
+- eth-account (EIP-712 signing)
+- requests (HTTP client)
+- curl_cffi (optional, better performance)
+- pytest (testing)
+
+ENVIRONMENT REQUIRED:
+- PRIVATE_KEY=0x...
+- OK_ACCESS_KEY=...
+- OK_ACCESS_SECRET=...
+- OK_ACCESS_PASSPHRASE=...
+
+CLI COMMANDS:
+1. add-collection        Register a new collection
+2. list-collections      Show all configured collections
+3. remove-collection     Remove a collection
+4. counterbid            Counter-bid on single collection (dry-run)
+5. counterbid-all        Counter-bid on all collections (dry-run)
+6. monitor               Continuous monitoring loop
+
+INTEGRATION:
+- v14: Imports seaport_signer.py for build_order_payload(), sign_order(), get_counter()
+- v13: Compatible with v13 offer fetching logic
+- OKX: Posts to /api/v5/mktplace/nft/markets/offers
+
+PARASITE TARGETS:
+1. 0x8389a3e684d532a3b0b4cdbb72c9c7797e6fa4f7
+2. 0xf1771cf8831393422189330a79dd896223c357a4
+
+STATUS: ✓ COMPLETE & VERIFIED
+
+See README_v15.md for full documentation.
+See QUICKSTART.md for 5-minute setup.
+See BUILD_SUMMARY.md for detailed build report.
