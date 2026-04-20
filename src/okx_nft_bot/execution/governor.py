@@ -87,9 +87,16 @@ class SafetyConfig:
     auto_circuit_breaker: bool = True
 
 
-class ExecutionGovernor:
-    """Advanced execution management with safety controls"""
-    
+class ExecutionGovernorV2Stub:
+    """Advanced execution management with safety controls.
+
+    DEPRECATED v2 stub. Not the production ``ExecutionGovernor`` — that one
+    lives in ``okx_nft_bot.execution_governor``. This class returns fake
+    tx hashes, keeps state in-memory, and only exists for the archived
+    ``*_v2`` experiment. Do not import from production code.
+    """
+
+
     def __init__(self, rate_limit_config: Optional[RateLimitConfig] = None, safety_config: Optional[SafetyConfig] = None):
         self.rate_limit_config = rate_limit_config or RateLimitConfig()
         self.safety_config = safety_config or SafetyConfig()
@@ -534,6 +541,6 @@ class ExecutionGovernor:
 
 
 # Factory function
-def create_execution_governor() -> ExecutionGovernor:
+def create_execution_governor() -> ExecutionGovernorV2Stub:
     """Create execution governor instance"""
-    return ExecutionGovernor()
+    return ExecutionGovernorV2Stub()

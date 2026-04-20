@@ -22,7 +22,7 @@ from decimal import Decimal
 from okx_nft_bot.currency import canonical_currency_symbol
 from okx_nft_bot.pnl.engine import PnLEngine
 from okx_nft_bot.decision.engine import DecisionEngine
-from okx_nft_bot.execution.governor import ExecutionGovernor
+from okx_nft_bot.execution.governor import ExecutionGovernorV2Stub
 
 log = logging.getLogger("sniper.parasite_hunter_v2")
 
@@ -118,7 +118,7 @@ class ParasiteHunterV2:
         self.config = config
         self.pnl_engine = PnLEngine()
         self.decision_engine = DecisionEngine()
-        self.execution_governor = ExecutionGovernor()
+        self.execution_governor = ExecutionGovernorV2Stub()
         self.circuit_breaker = CircuitBreaker()
         
         self.collection_metrics: Dict[str, CollectionMetrics] = {}

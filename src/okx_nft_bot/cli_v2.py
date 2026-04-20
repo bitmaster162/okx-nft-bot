@@ -26,7 +26,7 @@ from decimal import Decimal
 from okx_nft_bot.sniper.parasite_hunter_v2 import ParasiteHunterV2, ParasiteHunterConfig, create_parasite_hunter_v2
 from okx_nft_bot.pnl.engine import PnLEngine, create_pnl_engine
 from okx_nft_bot.decision.engine import DecisionEngine, create_decision_engine
-from okx_nft_bot.execution.governor import ExecutionGovernor, create_execution_governor
+from okx_nft_bot.execution.governor import ExecutionGovernorV2Stub, create_execution_governor
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class BotContext:
     def __init__(self):
         self.pnl_engine: Optional[PnLEngine] = None
         self.decision_engine: Optional[DecisionEngine] = None
-        self.execution_governor: Optional[ExecutionGovernor] = None
+        self.execution_governor: Optional[ExecutionGovernorV2Stub] = None
         self.parasite_hunter: Optional[ParasiteHunterV2] = None
         
     async def initialize(self):
