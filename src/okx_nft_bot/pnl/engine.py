@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import warnings
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Dict, List, Optional, Any
@@ -19,6 +20,13 @@ from datetime import datetime, timedelta
 import json
 
 log = logging.getLogger("pnl.engine")
+
+warnings.warn(
+    "okx_nft_bot.pnl.engine is a deprecated stub (hardcoded placeholder prices "
+    "and in-memory state). Do not use in production. See AUDIT_2026_04_19.md A2.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 
 @dataclass
@@ -87,8 +95,18 @@ class PortfolioMetrics:
 
 
 class PnLEngine:
-    """Advanced PnL tracking and analysis engine"""
-    
+    """Advanced PnL tracking and analysis engine.
+
+    DEPRECATED: This is a stub with hardcoded placeholder values.
+    - Returns Decimal("345") as BNB price (line 178)
+    - Returns Decimal("1") as current price (line 292)
+    - Returns Decimal("10000") as max exposure (line 221)
+    - Returns Decimal("0.1") as cancel_ratio (line 228)
+    - State is in-memory only (lost on restart)
+
+    DO NOT USE IN PRODUCTION. See AUDIT_2026_04_19.md A2.
+    """
+
     def __init__(self):
         self.trades: Dict[str, Trade] = {}
         self.collection_pnl: Dict[str, CollectionPnL] = {}
