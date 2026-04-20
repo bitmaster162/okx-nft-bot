@@ -170,6 +170,45 @@ class PositionState:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS place_cooldown (
+                    cache_key TEXT PRIMARY KEY,
+                    last_placed_ts REAL NOT NULL,
+                    qty INTEGER DEFAULT 0
+                )
+                """
+            )
+
+    def load_place_cooldowns(self) -> dict[str, tuple[float, int]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT cache_key, last_placed_ts, qty FROM place_cooldown"
+            ).fetchall()
+        return {str(r["cache_key"]): (float(r["last_placed_ts"]), int(r["qty"] or 0)) for r in rows}
+
+    def upsert_place_cooldown(self, *, cache_key: str, last_placed_ts: float, qty: int = 0) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO place_cooldown (cache_key, last_placed_ts, qty)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    last_placed_ts = excluded.last_placed_ts,
+                    qty = excluded.qty
+                """,
+                (cache_key, float(last_placed_ts), int(qty)),
+            )
+
+    def cleanup_stale_place_cooldowns(self, *, max_age_seconds: float = 86400.0) -> int:
+        import time as _time
+        cutoff = _time.time() - max_age_seconds
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM place_cooldown WHERE last_placed_ts < ?",
+                (cutoff,),
+            )
+        return cursor.rowcount
 
     def allocate_seaport_counter(
         self,
