@@ -176,6 +176,34 @@ class ExecutionGovernor:
             resync_after_seconds=resync_after_seconds,
         )
 
+    def allocate_nonce(
+        self,
+        wallet: str,
+        chain: str,
+        *,
+        resync_after_seconds: int = 60,
+    ) -> int:
+        """Atomic transaction nonce allocation.
+
+        Serializes nonce assignment across processes on the same wallet+chain
+        via SQLite BEGIN IMMEDIATE (see PositionState.allocate_nonce). The
+        on-chain probe uses the ``pending`` block tag so that queued
+        transactions from other tools are respected.
+        """
+        from web3 import Web3
+
+        def _fetch(w: str, c: str) -> int:
+            rpc_url = _CHAIN_RPCS.get(c, _CHAIN_RPCS["bsc"])
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            return int(w3.eth.get_transaction_count(Web3.to_checksum_address(w), "pending"))
+
+        return self.state.allocate_nonce(
+            wallet=wallet,
+            chain=chain,
+            fetch_onchain_fn=_fetch,
+            resync_after_seconds=resync_after_seconds,
+        )
+
     def check_min_price(self, price_usd: float) -> tuple[bool, str]:
         """Global floor guard for any live offer submission.
 

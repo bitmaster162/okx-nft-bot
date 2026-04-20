@@ -170,9 +170,9 @@ class OKXInstantBuyer:
 
         # Pre-init web3 connections (keep alive for speed)
         self._w3: dict[str, Any] = {}  # chain -> Web3 instance
-        self._nonce_cache: dict[str, int] = {}  # chain -> last nonce
         self._lock = threading.Lock()
         self._failed_orders: set[str] = set()  # orderIds that returned errors (stale/unavailable)
+        self._governor: Any | None = None  # lazy-initialized ExecutionGovernor for nonce allocation
 
         # Stats
         self.total_attempts = 0
@@ -190,6 +190,14 @@ class OKXInstantBuyer:
                      self.gas_multiplier, self.max_gas_gwei)
         else:
             log.info("OKXInstantBuyer: DISABLED (set AUTO_BUY_ENABLED=1 to enable)")
+
+    def _get_governor(self):
+        """Lazy-initialize ExecutionGovernor for atomic nonce allocation (RISK-1)."""
+        if self._governor is None:
+            from okx_nft_bot.config import load_settings
+            from okx_nft_bot.execution_governor import ExecutionGovernor
+            self._governor = ExecutionGovernor(settings=load_settings())
+        return self._governor
 
     def _effective_dry_run(self) -> bool:
         global_dry_run = _env_bool("DRY_RUN", True)
@@ -475,13 +483,7 @@ class OKXInstantBuyer:
             chain_cfg = CHAIN_CONFIG.get(chain, CHAIN_CONFIG.get("eth", {}))
             value_wei = int(value_str) if value_str.isdigit() else int(float(value_str) * 10**18)
 
-            with self._lock:
-                on_chain_nonce = w3.eth.get_transaction_count(
-                    Web3.to_checksum_address(self.buyer_address), "pending"
-                )
-                cached = self._nonce_cache.get(chain, 0)
-                nonce = max(on_chain_nonce, cached)
-                self._nonce_cache[chain] = nonce + 1
+            nonce = self._get_governor().allocate_nonce(self.buyer_address, chain)
 
             gas_price = w3.eth.gas_price
             max_gas_wei = int(self.max_gas_gwei * 10**9)

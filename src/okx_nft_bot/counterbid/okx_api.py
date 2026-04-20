@@ -1470,8 +1470,11 @@ class OKXAPIClient:
                 "counter": counter,
             }
 
-            # Build transaction
-            nonce = w3.eth.get_transaction_count(account.address)
+            # Build transaction — RISK-1: nonce via ExecutionGovernor (atomic across processes)
+            from okx_nft_bot.execution_governor import ExecutionGovernor
+
+            governor = ExecutionGovernor(settings=self.settings)
+            nonce = governor.allocate_nonce(account.address, chain_lower)
             tx = seaport.functions.cancel([order_components]).build_transaction({
                 "from": account.address,
                 "nonce": nonce,

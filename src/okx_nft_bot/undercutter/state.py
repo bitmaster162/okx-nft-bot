@@ -181,6 +181,17 @@ class PositionState:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wallet_nonce (
+                    wallet TEXT NOT NULL,
+                    chain TEXT NOT NULL,
+                    next_nonce INTEGER NOT NULL,
+                    last_synced_at TEXT NOT NULL,
+                    PRIMARY KEY (wallet, chain)
+                )
+                """
+            )
 
     def load_place_cooldowns(self) -> dict[str, tuple[float, int]]:
         with self._connect() as conn:
@@ -267,6 +278,79 @@ class PositionState:
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(wallet, chain) DO UPDATE SET
                         next_counter = excluded.next_counter,
+                        last_synced_at = excluded.last_synced_at
+                    """,
+                    (wallet_key, chain_key, allocated + 1, now_iso),
+                )
+                conn.commit()
+                return allocated
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def allocate_nonce(
+        self,
+        *,
+        wallet: str,
+        chain: str,
+        fetch_onchain_fn: Any,
+        resync_after_seconds: int = 60,
+    ) -> int:
+        """Atomically allocate a transaction nonce.
+
+        Uses BEGIN IMMEDIATE to serialize across processes sharing the same
+        wallet+chain. ``fetch_onchain_fn(wallet, chain)`` must return the
+        pending-tag transaction count from the RPC. We take
+        max(on_chain_pending, local_next) so that external transactions
+        (manual or from another tool) are accommodated.
+
+        Returns the nonce allocated to the caller and persists
+        ``next_nonce = returned + 1``.
+        """
+        wallet_key = wallet.lower()
+        chain_key = chain.lower()
+        now = datetime.now(timezone.utc)
+        now_iso = _fmt_dt(now)
+        with self._db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT next_nonce, last_synced_at FROM wallet_nonce WHERE wallet = ? AND chain = ?",
+                    (wallet_key, chain_key),
+                ).fetchone()
+                needs_sync = row is None
+                local_next: int | None = None
+                if row is not None:
+                    local_next = int(row["next_nonce"])
+                    try:
+                        last_synced = _parse_dt(
+                            str(row["last_synced_at"]),
+                            field_name="last_synced_at",
+                            context=f"wallet_nonce[{wallet_key}/{chain_key}]",
+                        )
+                    except InvalidTimestampError:
+                        needs_sync = True
+                    else:
+                        age = (now - last_synced).total_seconds()
+                        if age < 0 or age >= resync_after_seconds:
+                            needs_sync = True
+                if needs_sync:
+                    on_chain = int(fetch_onchain_fn(wallet_key, chain_key))
+                    allocated = max(on_chain, local_next) if local_next is not None else on_chain
+                else:
+                    allocated = int(local_next) if local_next is not None else 0
+                conn.execute(
+                    """
+                    INSERT INTO wallet_nonce (wallet, chain, next_nonce, last_synced_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(wallet, chain) DO UPDATE SET
+                        next_nonce = excluded.next_nonce,
                         last_synced_at = excluded.last_synced_at
                     """,
                     (wallet_key, chain_key, allocated + 1, now_iso),
