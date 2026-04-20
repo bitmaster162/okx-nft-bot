@@ -2666,13 +2666,12 @@ class ParasiteHunter:
         wallet = settings.buyer_wallet_address
         if not wallet:
             return 999999.0  # can't check → assume enough
-        import urllib.request
         addr_padded = wallet.lower().replace('0x', '').zfill(64)
         data = '0x70a08231' + addr_padded  # balanceOf(address)
         payload = _json.dumps({
             'jsonrpc': '2.0', 'method': 'eth_call',
             'params': [{'to': currency_address, 'data': data}, 'latest'], 'id': 1,
-        }).encode()
+        })
         # Pick correct RPC based on currency address chain (env-first via get_rpc_urls)
         chain = self._CURRENCY_CHAIN.get(currency_address.lower(), "bsc")
         from okx_nft_bot.config import get_rpc_urls as _get_rpc_urls
@@ -2680,9 +2679,12 @@ class ParasiteHunter:
         if not rpc_url:
             urls = _get_rpc_urls(chain)
             rpc_url = urls[0] if urls else 'https://bsc-dataseed.binance.org/'
-        req = urllib.request.Request(rpc_url, data=payload,
-                                     headers={'Content-Type': 'application/json'})
-        resp = _json.loads(urllib.request.urlopen(req, timeout=5).read())
+        # RISK-4: route through shared rate-limited transport instead of raw urllib
+        from okx_nft_bot.clients.http import get_rpc_transport
+        resp = get_rpc_transport().request_json(
+            method="POST", url=rpc_url,
+            headers={"Content-Type": "application/json"}, body=payload,
+        )
         raw = int(resp.get('result', '0x0'), 16)
         # USDC/USDT on ETH use 6 decimals
         decimals = 6 if currency_address.lower() in (

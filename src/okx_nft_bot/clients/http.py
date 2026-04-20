@@ -52,6 +52,39 @@ def get_okx_global_limiter(rate_per_sec: float) -> RateLimiter:
     return _okx_global_limiter
 
 
+# Shared global RPC rate limiter — all JSON-RPC callers share one limit
+# so public endpoints (bsc-dataseed, cloudflare-eth) don't 429 under load.
+_rpc_global_limiter: RateLimiter | None = None
+_rpc_global_lock = threading.Lock()
+
+
+def get_rpc_global_limiter(rate_per_sec: float = 10.0) -> RateLimiter:
+    """Get or create the shared RPC rate limiter (uses slowest rate)."""
+    global _rpc_global_limiter
+    with _rpc_global_lock:
+        if _rpc_global_limiter is None:
+            _rpc_global_limiter = RateLimiter(rate_per_sec)
+        elif rate_per_sec < _rpc_global_limiter.rate_per_sec:
+            _rpc_global_limiter = RateLimiter(rate_per_sec)
+    return _rpc_global_limiter
+
+
+# Shared global RPC transport — POST JSON-RPC through curl_cffi with retries
+_rpc_transport: StdlibHttpTransport | None = None
+_rpc_transport_lock = threading.Lock()
+
+
+def get_rpc_transport(timeout: int = 5, max_retries: int = 2, rate_per_sec: float = 10.0) -> StdlibHttpTransport:
+    """Get the shared RPC HTTP transport (hooks into the shared RPC limiter)."""
+    global _rpc_transport
+    with _rpc_transport_lock:
+        if _rpc_transport is None:
+            t = StdlibHttpTransport(timeout=timeout, max_retries=max_retries, rate_limit_per_sec=rate_per_sec)
+            t._rate_limiter = get_rpc_global_limiter(rate_per_sec)
+            _rpc_transport = t
+    return _rpc_transport
+
+
 @dataclass(slots=True)
 class StdlibHttpTransport:
     timeout: int
