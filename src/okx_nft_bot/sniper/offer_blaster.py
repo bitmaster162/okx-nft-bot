@@ -556,7 +556,7 @@ class OfferBlaster:
 
         domain = {
             "name": "Seaport",
-            "version": "1.5",
+            "version": "1.6",
             "chainId": chain_id,
             "verifyingContract": seaport_address,
         }
