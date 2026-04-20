@@ -23,7 +23,7 @@ from okx_nft_bot.mass_offer.scanner import (
 )
 from okx_nft_bot.mass_offer.tracker import MassOfferCampaign, MassOfferRecord, MassOfferTracker
 from okx_nft_bot.providers.offers_okx import OKXOffersProvider
-from okx_nft_bot.signing.seaport_signer import BSC_RPC, build_order_payload, build_per_item_offer, get_counter, sign_order
+from okx_nft_bot.signing.seaport_signer import BSC_RPC, build_order_payload, build_per_item_offer, sign_order
 from okx_nft_bot.undercutter.state import PositionState
 
 logger = logging.getLogger(__name__)
@@ -215,19 +215,13 @@ class MassOfferEngine:
         dry_run_count = 0
         failed_count = 0
         account = self._load_buyer_account()
-        # A3: counter is read once here and incremented locally below. This is
-        # only safe if no other engine (parasite_hunter / undercutter /
-        # offer_blaster / counterbid) is submitting on the SAME wallet in
-        # parallel, and if nobody calls Seaport.incrementCounter() on-chain
-        # during the run. If either happens, all subsequent offers in this
-        # batch will be signed with a stale counter and rejected by the
-        # contract as invalid. Run MassOfferEngine as a single-engine operation
-        # and avoid manual counter bumps while it's active.
-        counter = get_counter(account.address, rpc_url=rpc_url) if selected_targets else 0
         duration_seconds = max(int(resolved_duration_hours * 3600), 1)
         price_wei = to_wei(resolved_price_bnb)
 
         for index, target in enumerate(selected_targets):
+            counter = self.governor.allocate_seaport_counter(
+                account.address, resolved_chain
+            )
             result = self._submit_target(
                 campaign_id=campaign_id,
                 collection=collection,
@@ -250,9 +244,6 @@ class MassOfferEngine:
                 failed_count += 1
             elif result.status == "blocked":
                 failed_count += 1
-
-            # ── Increment counter for next offer (Seaport requires unique counter per order)
-            counter += 1
 
             if not effective_dry_run and index < len(selected_targets) - 1 and resolved_delay_seconds > 0:
                 self.sleep_fn(resolved_delay_seconds)

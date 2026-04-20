@@ -1151,11 +1151,12 @@ class OKXAPIClient:
         price_raw: str, currency_address: str, valid_time: int,
     ) -> dict[str, Any]:
         """Fallback: build Seaport order locally, sign, submit directly."""
+        from okx_nft_bot.execution_governor import ExecutionGovernor
         from okx_nft_bot.signing.seaport_signer import (
-            build_order_payload, build_per_item_offer, get_counter, sign_order,
+            build_order_payload, build_per_item_offer, sign_order,
         )
-        rpc_url = self._CHAIN_RPCS.get(chain, self._CHAIN_RPCS["bsc"])
-        counter = get_counter(account.address, rpc_url=rpc_url)
+        governor = ExecutionGovernor(settings=self.settings, api_client=self)
+        counter = governor.allocate_seaport_counter(account.address, chain)
 
         is_collection_offer = not token_id or str(token_id) in ("", "0")
         int_token_id = 0 if is_collection_offer else int(token_id)

@@ -11,6 +11,14 @@ if TYPE_CHECKING:
     from okx_nft_bot.undercutter.state import PositionState
 
 
+_CHAIN_RPCS: dict[str, str] = {
+    "bsc": "https://bsc-dataseed.binance.org/",
+    "eth": "https://ethereum-rpc.publicnode.com",
+    "polygon": "https://polygon-rpc.com/",
+    "arbitrum": "https://arb1.arbitrum.io/rpc",
+}
+
+
 @dataclass(slots=True)
 class ReconciliationResult:
     chain: str
@@ -120,6 +128,34 @@ class ExecutionGovernor:
         if snapshot["cooldown_remaining_seconds"] > 0:
             return f"submit cooldown active: {snapshot['cooldown_remaining_seconds']}s remaining"
         return None
+
+    def allocate_seaport_counter(
+        self,
+        wallet: str,
+        chain: str,
+        *,
+        resync_after_seconds: int = 3600,
+    ) -> int:
+        """Atomic Seaport counter allocation.
+
+        Returns the counter value the caller should use for the next signed
+        order. Persists the local counter in ``seaport_counter`` (execution.sqlite3)
+        so multiple engines on the same wallet do not race. On first call, or
+        when the local record is older than ``resync_after_seconds``, the value
+        is re-fetched from chain via Seaport ``getCounter``.
+        """
+        from okx_nft_bot.signing.seaport_signer import get_counter
+
+        def _fetch(w: str, c: str) -> int:
+            rpc_url = _CHAIN_RPCS.get(c, _CHAIN_RPCS["bsc"])
+            return int(get_counter(w, rpc_url=rpc_url))
+
+        return self.state.allocate_seaport_counter(
+            wallet=wallet,
+            chain=chain,
+            fetch_onchain_fn=_fetch,
+            resync_after_seconds=resync_after_seconds,
+        )
 
     def reconcile_active_offers(self, *, chain: str | None = None) -> ReconciliationResult:
         resolved_chain = (chain or self.settings.execution_chain).lower()

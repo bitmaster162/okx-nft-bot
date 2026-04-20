@@ -159,6 +159,84 @@ class PositionState:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_execution_submit_log_status_created_at ON execution_submit_log(status, created_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seaport_counter (
+                    wallet TEXT NOT NULL,
+                    chain TEXT NOT NULL,
+                    next_counter INTEGER NOT NULL,
+                    last_synced_at TEXT NOT NULL,
+                    PRIMARY KEY (wallet, chain)
+                )
+                """
+            )
+
+    def allocate_seaport_counter(
+        self,
+        *,
+        wallet: str,
+        chain: str,
+        fetch_onchain_fn: Any,
+        resync_after_seconds: int = 3600,
+    ) -> int:
+        """Atomically allocate a Seaport counter value.
+
+        Uses BEGIN IMMEDIATE to serialize across concurrent engines on the same
+        wallet. On first call (or when local record is older than
+        ``resync_after_seconds``), fetches the on-chain value via
+        ``fetch_onchain_fn(wallet, chain)``. Returns the counter value allocated
+        to the caller and persists ``next_counter = returned + 1``.
+        """
+        wallet_key = wallet.lower()
+        chain_key = chain.lower()
+        now = datetime.now(timezone.utc)
+        now_iso = _fmt_dt(now)
+        with self._db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT next_counter, last_synced_at FROM seaport_counter WHERE wallet = ? AND chain = ?",
+                    (wallet_key, chain_key),
+                ).fetchone()
+                needs_sync = row is None
+                if row is not None:
+                    try:
+                        last_synced = _parse_dt(
+                            str(row["last_synced_at"]),
+                            field_name="last_synced_at",
+                            context=f"seaport_counter[{wallet_key}/{chain_key}]",
+                        )
+                    except InvalidTimestampError:
+                        needs_sync = True
+                    else:
+                        age = (now - last_synced).total_seconds()
+                        if age < 0 or age >= resync_after_seconds:
+                            needs_sync = True
+                if needs_sync:
+                    allocated = int(fetch_onchain_fn(wallet_key, chain_key))
+                else:
+                    allocated = int(row["next_counter"])
+                conn.execute(
+                    """
+                    INSERT INTO seaport_counter (wallet, chain, next_counter, last_synced_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(wallet, chain) DO UPDATE SET
+                        next_counter = excluded.next_counter,
+                        last_synced_at = excluded.last_synced_at
+                    """,
+                    (wallet_key, chain_key, allocated + 1, now_iso),
+                )
+                conn.commit()
+                return allocated
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def upsert_active_offer(
         self,
