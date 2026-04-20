@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -11,12 +12,25 @@ if TYPE_CHECKING:
     from okx_nft_bot.undercutter.state import PositionState
 
 
+def _env_float(key: str, default: float) -> float:
+    raw = os.environ.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 _CHAIN_RPCS: dict[str, str] = {
     "bsc": "https://bsc-dataseed.binance.org/",
     "eth": "https://ethereum-rpc.publicnode.com",
     "polygon": "https://polygon-rpc.com/",
     "arbitrum": "https://arb1.arbitrum.io/rpc",
 }
+
+
+MIN_OFFER_PRICE_USD = _env_float("MIN_OFFER_PRICE_USD", 0.001)
 
 
 @dataclass(slots=True)
@@ -92,11 +106,16 @@ class ExecutionGovernor:
         collection: str,
         chain: str,
         price_bnb: float,
+        price_usd: float | None = None,
         configured_dry_run: bool | None = None,
     ) -> str | None:
         _ = action_type, collection
         if self.effective_dry_run(configured_dry_run):
             return "dry_run_enabled"
+        if price_usd is not None:
+            ok, reason = self.check_min_price(price_usd)
+            if not ok:
+                return f"min_price_guard: {reason}"
         # Block new submissions if killswitch left failed (zombie) offers
         ks_failed = self.state.get_killswitch_failed_offers(chain=chain)
         if ks_failed:
@@ -156,6 +175,16 @@ class ExecutionGovernor:
             fetch_onchain_fn=_fetch,
             resync_after_seconds=resync_after_seconds,
         )
+
+    def check_min_price(self, price_usd: float) -> tuple[bool, str]:
+        """Global floor guard for any live offer submission.
+
+        Returns (allowed, reason). ``reason`` is empty on success.
+        """
+        floor = MIN_OFFER_PRICE_USD
+        if price_usd is None or price_usd < floor:
+            return False, f"price ${float(price_usd or 0.0):.4f} < min ${floor:.4f}"
+        return True, ""
 
     def reconcile_active_offers(self, *, chain: str | None = None) -> ReconciliationResult:
         resolved_chain = (chain or self.settings.execution_chain).lower()

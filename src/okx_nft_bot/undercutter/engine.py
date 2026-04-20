@@ -266,11 +266,15 @@ class UndercutEngine:
                 )
             else:
                 try:
+                    from okx_nft_bot.prices import to_usd
+
+                    _new_price_bnb = float(action.new_price_bnb or 0.0)
                     blocked_reason = self.governor.check_live_submit_allowed(
                         action_type=logged_action_type,
                         collection=action.collection,
                         chain=action.chain,
-                        price_bnb=float(action.new_price_bnb or 0.0),
+                        price_bnb=_new_price_bnb,
+                        price_usd=to_usd(_new_price_bnb, "BNB"),
                     )
                     if blocked_reason:
                         action.executed = False

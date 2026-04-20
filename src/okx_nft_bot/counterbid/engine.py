@@ -223,11 +223,14 @@ class CounterBidder:
                         preview_payload=preview_payload,
                     )
                 else:
+                    from okx_nft_bot.prices import to_usd
+
                     blocked_reason = self.governor.check_live_submit_allowed(
                         action_type="LIVE_COUNTERBID",
                         collection=cfg.address,
                         chain=resolved_chain,
                         price_bnb=counter_price_bnb,
+                        price_usd=to_usd(counter_price_bnb, "BNB"),
                     )
                     if blocked_reason:
                         action_type = "LIVE_COUNTERBID_BLOCKED"

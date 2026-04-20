@@ -343,11 +343,16 @@ class MassOfferEngine:
             )
             return True
 
+        from okx_nft_bot.prices import to_usd
+
+        _is_wbnb = (resolved_currency or "").lower() == WBNB_ADDRESS.lower()
+        _price_usd = to_usd(price_wbnb, "BNB" if _is_wbnb else "USDT")
         blocked_reason = self.governor.check_live_submit_allowed(
             action_type="LIVE_SINGLE_OFFER",
             collection=collection_address,
             chain=resolved_chain,
             price_bnb=price_wbnb,
+            price_usd=_price_usd,
             configured_dry_run=False,
         )
         if blocked_reason:
@@ -568,11 +573,14 @@ class MassOfferEngine:
                     preview_payload=preview_payload,
                 )
 
+            from okx_nft_bot.prices import to_usd
+
             blocked_reason = self.governor.check_live_submit_allowed(
                 action_type="LIVE_MASS_OFFER",
                 collection=collection,
                 chain=chain,
                 price_bnb=price_bnb,
+                price_usd=to_usd(price_bnb, "BNB"),
                 configured_dry_run=False,
             )
             if blocked_reason:
