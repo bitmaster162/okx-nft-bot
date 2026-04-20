@@ -338,6 +338,23 @@ class ParasiteHunter:
         self._local_placed_offers: dict[str, list[str]] = {}
         # Local qty cache: "addr:chain" → qty we last placed (OKX API doesn't return real qty)
         self._placed_qty_cache: dict[str, int] = {}
+
+        # K3: hydrate cooldowns from SQLite so restarts don't re-stack offers
+        try:
+            _state = self._get_execution_state()
+            _loaded = _state.load_place_cooldowns()
+            if _loaded:
+                self._last_placed = {k: ts for k, (ts, _qty) in _loaded.items()}
+                self._placed_qty_cache = {k: qty for k, (_ts, qty) in _loaded.items() if qty}
+                log.info("Loaded %d place_cooldown entries from state DB", len(_loaded))
+            try:
+                _removed = _state.cleanup_stale_place_cooldowns(max_age_seconds=86400)
+                if _removed:
+                    log.info("Cleaned up %d stale place_cooldown entries", _removed)
+            except Exception:
+                pass
+        except Exception as exc:
+            log.warning("Failed to load place_cooldowns from DB: %s", exc)
         # Floor price cache (per-scan)
         self._floor_cache: dict[str, float] = {}
 
@@ -483,6 +500,17 @@ class ParasiteHunter:
             api_client=self._get_okx_client(),
         )
         return self._execution_governor
+
+    def _persist_place_cooldown(self, cache_key: str) -> None:
+        try:
+            state = self._get_execution_state()
+            state.upsert_place_cooldown(
+                cache_key=cache_key,
+                last_placed_ts=self._last_placed.get(cache_key, time.time()),
+                qty=self._placed_qty_cache.get(cache_key, 0),
+            )
+        except Exception as exc:
+            log.debug("Failed to persist place_cooldown for %s: %s", cache_key, exc)
 
     def _record_execution_submit_event(
         self,
@@ -1636,6 +1664,7 @@ class ParasiteHunter:
                     # ALWAYS set cooldown — even on failure (might have succeeded on-chain)
                     self._last_placed[cache_key] = time.time()
                     self._placed_qty_cache[cache_key] = quantity
+                    self._persist_place_cooldown(cache_key)
                     if ok:
                         placed += 1
                     else:
@@ -1644,6 +1673,7 @@ class ParasiteHunter:
                     log.error("  Min-offer failed %s: %s", name, exc)
                     self._last_placed[cache_key] = time.time()
                     self._placed_qty_cache[cache_key] = quantity
+                    self._persist_place_cooldown(cache_key)
                     failed += 1
 
                 if self.delay > 0:
@@ -1845,6 +1875,7 @@ class ParasiteHunter:
                 # ALWAYS set cooldown — even on failure (might have succeeded on-chain)
                 self._last_placed[cache_key] = time.time()
                 self._placed_qty_cache[cache_key] = quantity
+                self._persist_place_cooldown(cache_key)
                 if ok:
                     placed += 1
                     self._alert_undercut(
@@ -1866,6 +1897,7 @@ class ParasiteHunter:
             except Exception as exc:
                 log.error("  Undercut failed #%s: %s", offer.token_id, exc)
                 self._last_placed[cache_key] = time.time()
+                self._persist_place_cooldown(cache_key)
                 failed += 1
 
             if self.delay > 0:
