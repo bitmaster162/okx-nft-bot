@@ -109,6 +109,19 @@ class ExecutionGovernor:
         price_usd: float | None = None,
         configured_dry_run: bool | None = None,
     ) -> str | None:
+        """Gate a live submission through all rate/arm/cap checks.
+
+        CRITICAL INVARIANT — `price_bnb` must be denominated in **BNB-equivalent**,
+        never a raw token amount in another currency. The daily_bnb accumulator
+        compares it against `settings.max_bnb_per_day` (default 5 BNB ~ $3000).
+
+        If your offer is in USDT/USDC/WETH/etc, normalize via USD before calling:
+            price_bnb_equiv = (price_usd / bnb_usd_price)
+
+        Otherwise a 10 USDT offer is treated as 10 BNB (~$6000) and gets blocked,
+        which is exactly the regression that hit `parasite_hunter._submit_bsc`
+        on 2026-04-21 (see _normalize_to_bnb helper).
+        """
         _ = action_type, collection
         if self.effective_dry_run(configured_dry_run):
             return "dry_run_enabled"
@@ -141,8 +154,9 @@ class ExecutionGovernor:
             )
         if snapshot["daily_bnb"] + price_bnb > self.settings.max_bnb_per_day:
             return (
-                f"daily BNB limit hit: {snapshot['daily_bnb'] + price_bnb:.6f} > "
-                f"{self.settings.max_bnb_per_day:.6f}"
+                f"daily BNB-equivalent cap hit: spent {snapshot['daily_bnb']:.4f} + "
+                f"offer {price_bnb:.6f} = {snapshot['daily_bnb'] + price_bnb:.6f} BNB "
+                f"> cap {self.settings.max_bnb_per_day:.4f} BNB"
             )
         if snapshot["cooldown_remaining_seconds"] > 0:
             return f"submit cooldown active: {snapshot['cooldown_remaining_seconds']}s remaining"
