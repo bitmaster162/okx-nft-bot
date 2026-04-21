@@ -1602,6 +1602,26 @@ class ParasiteHunter:
             # No enemy → check if we already have an offer (avoid duplicates!)
             our_existing = self._find_our_offer(addr, chain)
             if our_existing:
+                existing_usd = self.prices.to_usd(
+                    our_existing["price"], our_existing["currency"].upper()
+                )
+                # Our existing offer might itself be bait-polluted (placed
+                # before the bait-fix).  If <2% of floor, cancel it instead
+                # of skipping — otherwise stale 0.0001 WBNB offers never
+                # get cleaned up once baseline is correctly flagged as bait.
+                floor_usd_check = self._fetch_floor_price(addr, chain)
+                if (existing_usd > 0 and floor_usd_check > 0
+                        and existing_usd < floor_usd_check * 0.02):
+                    log.warning(
+                        "  🧹 %s: our existing offer $%.4f is <2%% of floor $%.2f "
+                        "— cancelling as bait-polluted (placed before bait-fix)",
+                        name, existing_usd, floor_usd_check,
+                    )
+                    cancel_ok = self._cancel_existing_offer(addr, chain, name)
+                    if cancel_ok:
+                        return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
+                    log.warning("  🚫 %s: cancel of bait-polluted offer FAILED", name)
+                    return HuntResult(addr, name, chain, len(offers), 0, 1, 0)
                 log.info("  ✅ %s: no enemy, we already have offer (%.4f %s) — skip",
                          name, our_existing["price"], our_existing["currency"])
                 self.already_winning += 1
