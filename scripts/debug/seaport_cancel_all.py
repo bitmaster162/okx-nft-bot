@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, "/app/src")
@@ -141,11 +142,27 @@ def main():
     cost_bnb = w3.from_wei(gas_price * gas_used, "ether")
 
     if status == 1:
+        # RPC nodes can lag behind the freshly mined block; poll until the
+        # counter actually advances past `current_counter` before syncing DB.
+        time.sleep(3)
         new_counter = seaport.functions.getCounter(wallet).call()
-        print(f"\n✅ SUCCESS! Counter: {current_counter} → {new_counter}")
-        print(f"Gas used: {gas_used} ({cost_bnb:.6f} BNB)")
-        sync_db_counter(wallet, "bsc", new_counter)
-        print(f"\nAll old BSC Seaport orders INVALID. Bot will place fresh offers next cycle.")
+        for attempt in range(5):
+            if new_counter != current_counter:
+                break
+            print(f"  … counter still {new_counter} (RPC lag, retry {attempt + 1}/5)")
+            time.sleep(2)
+            new_counter = seaport.functions.getCounter(wallet).call()
+        if new_counter == current_counter:
+            print(
+                f"\n⚠ WARNING: RPC counter did not advance after 5 retries "
+                f"(still {new_counter}). TX mined OK — DB sync SKIPPED to avoid "
+                f"writing stale value. Re-run script or query another RPC to confirm."
+            )
+        else:
+            print(f"\n✅ SUCCESS! Counter: {current_counter} → {new_counter}")
+            print(f"Gas used: {gas_used} ({cost_bnb:.6f} BNB)")
+            sync_db_counter(wallet, "bsc", new_counter)
+            print(f"\nAll old BSC Seaport orders INVALID. Bot will place fresh offers next cycle.")
     else:
         print(f"\n❌ FAILED! TX reverted. Gas used: {gas_used}")
         sys.exit(1)
