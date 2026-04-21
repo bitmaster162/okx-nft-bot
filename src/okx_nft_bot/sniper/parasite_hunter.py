@@ -279,6 +279,7 @@ class ParasiteHunter:
         ]
 
         # ── Phase 2: non-WL parasite hunt settings ──
+        self.phase2_enabled = _env_bool("PARASITE_HUNTER_PHASE2_ENABLED", True)
         self.nonwl_max_usd = _env_float("PARASITE_HUNTER_NONWL_MAX_USD", 0.001)
         self.nonwl_qty = _env_int("PARASITE_HUNTER_NONWL_QTY", 10)
 
@@ -735,50 +736,54 @@ class ParasiteHunter:
             # NOTE: BSC /offers endpoint ignores maker filter, but
             #       /collection-offers endpoint WORKS with maker on BSC.
             # ══════════════════════════════════════════════
-            log.info("═══ PHASE 2: NON-WL PARASITE HUNT on %s ═══", chain.upper())
+            if not self.phase2_enabled:
+                log.info("═══ PHASE 2: NON-WL PARASITE HUNT on %s — DISABLED via PARASITE_HUNTER_PHASE2_ENABLED ═══",
+                         chain.upper())
+            else:
+                log.info("═══ PHASE 2: NON-WL PARASITE HUNT on %s ═══", chain.upper())
 
-            all_parasite = self._fetch_wallet_offers(chain)
-            nonwl_parasite = [o for o in all_parasite if o.collection_address not in self._wl_index]
+                all_parasite = self._fetch_wallet_offers(chain)
+                nonwl_parasite = [o for o in all_parasite if o.collection_address not in self._wl_index]
 
-            log.info("🕷 %s: %d parasite non-WL offers", chain.upper(), len(nonwl_parasite))
+                log.info("🕷 %s: %d parasite non-WL offers", chain.upper(), len(nonwl_parasite))
 
-            if nonwl_parasite:
-                by_nonwl: dict[str, list[ParasiteOffer]] = defaultdict(list)
-                for o in nonwl_parasite:
-                    by_nonwl[o.collection_address].append(o)
+                if nonwl_parasite:
+                    by_nonwl: dict[str, list[ParasiteOffer]] = defaultdict(list)
+                    for o in nonwl_parasite:
+                        by_nonwl[o.collection_address].append(o)
 
-                report.nonwl_collections = len(by_nonwl)
-                report.nonwl_offers_found += len(nonwl_parasite)
+                    report.nonwl_collections = len(by_nonwl)
+                    report.nonwl_offers_found += len(nonwl_parasite)
 
-                for addr, coll_offers in by_nonwl.items():
-                    has_config = addr in self.buy_config.get("collections", {})
-                    cheapest_usd = min(
-                        (self.prices.to_usd(o.price, o.currency) for o in coll_offers
-                         if o.price > 0),
-                        default=999
-                    )
-                    is_cheap = cheapest_usd <= self.nonwl_max_usd
+                    for addr, coll_offers in by_nonwl.items():
+                        has_config = addr in self.buy_config.get("collections", {})
+                        cheapest_usd = min(
+                            (self.prices.to_usd(o.price, o.currency) for o in coll_offers
+                             if o.price > 0),
+                            default=999
+                        )
+                        is_cheap = cheapest_usd <= self.nonwl_max_usd
 
-                    if not has_config and not is_cheap:
-                        log.debug("  ⏭ non-WL %s: skip (no config, min=$%.4f)",
-                                  addr[:14], cheapest_usd)
-                        continue
+                        if not has_config and not is_cheap:
+                            log.debug("  ⏭ non-WL %s: skip (no config, min=$%.4f)",
+                                      addr[:14], cheapest_usd)
+                            continue
 
-                    reason = "config" if has_config else f"cheap(${cheapest_usd:.4f})"
-                    log.info("  🎯 non-WL %s: %d offers (%s) — hunting",
-                             addr[:14], len(coll_offers), reason)
+                        reason = "config" if has_config else f"cheap(${cheapest_usd:.4f})"
+                        log.info("  🎯 non-WL %s: %d offers (%s) — hunting",
+                                 addr[:14], len(coll_offers), reason)
 
-                    limited = coll_offers[:self.nonwl_qty]
-                    report.total_offers_found += len(limited)
+                        limited = coll_offers[:self.nonwl_qty]
+                        report.total_offers_found += len(limited)
 
-                    result = self._undercut_collection(addr, limited, chain, is_wl=False)
-                    report.undercuts_placed += result.our_offers_placed
-                    report.nonwl_undercuts_placed += result.our_offers_placed
-                    report.undercuts_failed += result.our_offers_failed
-                    report.undercuts_skipped += result.our_offers_skipped
+                        result = self._undercut_collection(addr, limited, chain, is_wl=False)
+                        report.undercuts_placed += result.our_offers_placed
+                        report.nonwl_undercuts_placed += result.our_offers_placed
+                        report.undercuts_failed += result.our_offers_failed
+                        report.undercuts_skipped += result.our_offers_skipped
 
-                    if self.collection_delay > 0 and not self.dry_run:
-                        time.sleep(self.collection_delay)
+                        if self.collection_delay > 0 and not self.dry_run:
+                            time.sleep(self.collection_delay)
 
             # ══════════════════════════════════════════════
             # PHASE 2b: SELL SIDE — be the cheapest listing, but above low_price
