@@ -1387,6 +1387,13 @@ class OKXAPIClient:
             "type": "function",
         },
         {
+            "inputs": [],
+            "name": "incrementCounter",
+            "outputs": [{"name": "newCounter", "type": "uint256"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
             "inputs": [{"name": "offerer", "type": "address"}],
             "name": "getCounter",
             "outputs": [{"name": "counter", "type": "uint256"}],
@@ -1503,6 +1510,88 @@ class OKXAPIClient:
 
         except Exception as exc:
             log.error("_cancel_onchain: failed: %s", exc)
+            return False
+
+    def cancel_all_via_counter(self, chain: str = "bsc") -> bool:
+        """Batch-cancel ALL our live Seaport orders for (wallet, chain) in ONE tx.
+
+        Calls incrementCounter() on the Seaport contract — this invalidates
+        every order signed with the current counter value. Cost: ~40-45k gas,
+        regardless of how many orders get nuked. Use when there are >=2
+        orders to cancel — the flat cost beats per-order cancel() at 56k each.
+
+        CAVEAT: nuclear across collections. Any live order signed by this
+        wallet (on this chain) becomes unfillable. Only call when the scan
+        is about to re-post everything, or when you genuinely want to clear
+        the slate.
+        """
+        return self._bump_counter_onchain(chain)
+
+    def _bump_counter_onchain(self, chain: str) -> bool:
+        """Low-level: send Seaport.incrementCounter() tx on the given chain."""
+        try:
+            from web3 import Web3
+            from eth_account import Account
+        except ImportError:
+            log.error("_bump_counter_onchain: web3 or eth_account not installed")
+            return False
+
+        private_key = self.settings.buyer_wallet_private_key
+        if not private_key:
+            log.error("_bump_counter_onchain: no private key")
+            return False
+
+        chain_lower = chain.lower()
+        seaport_addr = self._SEAPORT_ADDRESSES.get(chain_lower)
+        rpc_url = self._RPC_URLS.get(chain_lower)
+        if not seaport_addr or not rpc_url:
+            log.error("_bump_counter_onchain: unsupported chain %s", chain)
+            return False
+
+        try:
+            account = Account.from_key(private_key)
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            if not w3.is_connected():
+                log.error("_bump_counter_onchain: cannot connect to %s RPC", chain)
+                return False
+
+            seaport = w3.eth.contract(
+                address=Web3.to_checksum_address(seaport_addr),
+                abi=self._SEAPORT_CANCEL_ABI,
+            )
+            old_counter = seaport.functions.getCounter(account.address).call()
+            nonce = w3.eth.get_transaction_count(account.address)
+            tx = seaport.functions.incrementCounter().build_transaction({
+                "from": account.address,
+                "nonce": nonce,
+                "gasPrice": w3.eth.gas_price,
+                "chainId": w3.eth.chain_id,
+            })
+            try:
+                gas_estimate = w3.eth.estimate_gas(tx)
+                tx["gas"] = int(gas_estimate * 1.3)
+            except Exception:
+                tx["gas"] = 80_000  # incrementCounter is typically ~40-45k + headroom
+
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            log.info(
+                "_bump_counter_onchain: TX sent %s (gas=%d) — nuking all orders at counter=%d on %s",
+                tx_hash.hex()[:16], tx["gas"], old_counter, chain,
+            )
+
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=45)
+            if receipt.get("status") == 1:
+                log.info(
+                    "bump_counter: SUCCESS on-chain TX=%s gas=%d — batch-cancelled all live orders",
+                    tx_hash.hex()[:16], receipt.get("gasUsed", 0),
+                )
+                self._last_onchain_cancel_ts = time.time()
+                return True
+            log.error("_bump_counter_onchain: TX REVERTED %s", tx_hash.hex()[:16])
+            return False
+        except Exception as exc:
+            log.error("_bump_counter_onchain: failed: %s", exc)
             return False
 
     def create_listing(

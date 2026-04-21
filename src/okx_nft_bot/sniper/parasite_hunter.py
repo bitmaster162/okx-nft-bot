@@ -1515,7 +1515,7 @@ class ParasiteHunter:
         is_premium = has_collection_config and cap_usd > _cheap_threshold
         # Collections with cap <= threshold → qty=10, otherwise qty=1
         default_qty = 10 if (cap_usd <= _cheap_threshold) else 1
-        offer_duration_hours = 720  # 30 days
+        offer_duration_hours = 1  # 1h TTL — stacked overbid model, old offers self-expire
 
         if best_enemy is None:
             # No enemy → check if we already have an offer (avoid duplicates!)
@@ -2460,8 +2460,18 @@ class ParasiteHunter:
         - No old offers exist (nothing to cancel), OR
         - ALL old offers were successfully cancelled AND verified gone.
         Returns False if any cancel failed → caller must NOT place new offer.
+
+        If env PARASITE_HUNTER_SKIP_CANCEL is truthy, returns True immediately
+        without cancelling — relies on short TTL (e.g. 1h) for old offers to
+        self-expire. This avoids all on-chain cancel gas in the overbid cycle.
         """
         if self.dry_run:
+            return True
+
+        # Stacking mode: skip cancel, let old offers expire by TTL. Zero gas.
+        import os
+        if os.getenv("PARASITE_HUNTER_SKIP_CANCEL", "").strip().lower() in ("1", "true", "yes", "on"):
+            log.debug("  🟢 %s: PARASITE_HUNTER_SKIP_CANCEL=1 — old offers will self-expire", name)
             return True
 
         # Find our offers (priapi + authenticated API + local tracker).
@@ -2476,27 +2486,66 @@ class ParasiteHunter:
         if not client:
             log.error("  🚫 %s: no OKX client — cannot cancel %d old offers", name, len(all_ours))
             return False
+
         ok_count = 0
         fail_count = 0
-        for offer in all_ours:
-            oid = offer.get("order_id", "")
-            if not oid:
-                fail_count += 1
-                continue
-            log.info("  🔄 %s: cancelling old offer %s (%.4f %s)",
-                     name, oid[:12], offer["price"], offer["currency"])
+
+        # ── Batch path: >=2 offers → one incrementCounter() nukes them all ──
+        # Flat ~40k gas vs N*56k for per-order on-chain cancel().
+        # Nuclear: invalidates all our live Seaport orders on this chain
+        # (including other collections) — scan cycle will re-post on next pass.
+        if len(all_ours) >= 2 and hasattr(client, "cancel_all_via_counter"):
+            log.info("  🔄 %s: batch-cancel via incrementCounter for %d offers (one tx)",
+                     name, len(all_ours))
             try:
-                ok = client.cancel_offer(oid, chain=chain,
-                                         order_params=offer.get("order_params"))
-                if ok:
-                    ok_count += 1
-                else:
-                    log.warning("  ⚠ Cancel FAILED for %s order %s", name, oid[:12])
-                    fail_count += 1
-                time.sleep(0.3)
+                batch_ok = client.cancel_all_via_counter(chain=chain)
             except Exception as exc:
-                log.error("  Cancel error %s order %s: %s", name, oid[:12], exc)
-                fail_count += 1
+                log.error("  batch-cancel error %s: %s", name, exc)
+                batch_ok = False
+            if batch_ok:
+                ok_count = len(all_ours)
+            else:
+                log.warning("  ⚠ %s: batch-cancel failed — falling back to per-order", name)
+                for offer in all_ours:
+                    oid = offer.get("order_id", "")
+                    if not oid:
+                        fail_count += 1
+                        continue
+                    log.info("  🔄 %s: cancelling old offer %s (%.4f %s)",
+                             name, oid[:12], offer["price"], offer["currency"])
+                    try:
+                        ok = client.cancel_offer(oid, chain=chain,
+                                                 order_params=offer.get("order_params"))
+                        if ok:
+                            ok_count += 1
+                        else:
+                            log.warning("  ⚠ Cancel FAILED for %s order %s", name, oid[:12])
+                            fail_count += 1
+                        time.sleep(0.3)
+                    except Exception as exc:
+                        log.error("  Cancel error %s order %s: %s", name, oid[:12], exc)
+                        fail_count += 1
+        else:
+            # Single-offer path — no savings from batch, use per-order cancel()
+            for offer in all_ours:
+                oid = offer.get("order_id", "")
+                if not oid:
+                    fail_count += 1
+                    continue
+                log.info("  🔄 %s: cancelling old offer %s (%.4f %s)",
+                         name, oid[:12], offer["price"], offer["currency"])
+                try:
+                    ok = client.cancel_offer(oid, chain=chain,
+                                             order_params=offer.get("order_params"))
+                    if ok:
+                        ok_count += 1
+                    else:
+                        log.warning("  ⚠ Cancel FAILED for %s order %s", name, oid[:12])
+                        fail_count += 1
+                    time.sleep(0.3)
+                except Exception as exc:
+                    log.error("  Cancel error %s order %s: %s", name, oid[:12], exc)
+                    fail_count += 1
         log.info("  🔄 %s: cancelled %d/%d old offers (failed=%d)",
                  name, ok_count, len(all_ours), fail_count)
         # Clean up local tracker for successfully cancelled offers
