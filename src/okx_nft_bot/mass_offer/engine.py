@@ -215,11 +215,18 @@ class MassOfferEngine:
         dry_run_count = 0
         failed_count = 0
         account = self._load_buyer_account()
-        counter = get_counter(account.address, rpc_url=rpc_url) if selected_targets else 0
         duration_seconds = max(int(resolved_duration_hours * 3600), 1)
         price_wei = to_wei(resolved_price_bnb)
 
         for index, target in enumerate(selected_targets):
+            # Allocate Seaport counter atomically from governor on every iteration.
+            # This serialises with any other engine on the same wallet+chain
+            # (e.g. ParasiteHunter counter-bids) via SQLite BEGIN IMMEDIATE in
+            # PositionState.allocate_seaport_counter. A local `counter += 1`
+            # would race if two processes are submitting concurrently.
+            counter = self.governor.allocate_seaport_counter(
+                account.address, resolved_chain
+            )
             result = self._submit_target(
                 campaign_id=campaign_id,
                 collection=collection,
@@ -242,9 +249,6 @@ class MassOfferEngine:
                 failed_count += 1
             elif result.status == "blocked":
                 failed_count += 1
-
-            # ── Increment counter for next offer (Seaport requires unique counter per order)
-            counter += 1
 
             if not effective_dry_run and index < len(selected_targets) - 1 and resolved_delay_seconds > 0:
                 self.sleep_fn(resolved_delay_seconds)
