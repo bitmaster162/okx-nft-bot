@@ -6,6 +6,39 @@
 (нет WETH), 233 stale BSC offers → `cancelled_stale`, 28 active осталось.
 Детальный snapshot — в `AUDIT_2026_04_19.md §11`.
 
+**🧹 BAIT-PROTECTION FOLLOW-UP (2026-04-21, deployed via `force-recreate`
+`okx-nft-bot-exec`).** Дополнительные коммиты защиты от bait-распыла:
+
+- `afbf77f` fix(parasite): detect bait offers — invert phantom filter + floor-gate
+- `e6f042e` feat(parasite): env flag to disable Phase 2 non-WL hunting (B2)
+- `358e536` fix(tool): seaport_cancel_all waits for RPC state sync after tx
+- `8b5868d` fix(parasite): universal floor/absolute guard on final placement price (covers min-offer fallback)
+- `ecde331` fix(parasite): cancel bait-polluted existing offers instead of skip
+
+### Bait-fix validation (post-recreate 2026-04-21 05:27 UTC)
+
+Первый цикл парасита после recreate отработал 5× 🧹 cleanup за 2 минуты:
+```
+🧹 Alpaca:         existing $0.0100 < 2% of floor $947.81  — cancelling
+🧹 Dodo:           existing $0.0632 < 2% of floor $278.02  — cancelling
+🧹 Pancake Squad:  existing $0.0100 < 2% of floor $1635.33 — cancelling
+🧹 Space ID (New): existing $0.0632 < 2% of floor $11.25   — cancelling
+🧹 The Bull Society: existing $0.0100 < 2% of floor $5.96  — cancelling
+```
+Active offers: 26 → 20 (−6). Газ на 5 cancels: ~$0.009 (balance 0.008713 →
+0.008699 BNB). Ноль новых `0.0001 WBNB` placements после recreate.
+
+`🪤 our price < 2% floor — SKIP` (guard из `8b5868d`) в этом цикле не
+сработал — все "проблемные" коллекции ушли в Bug 2 cleanup path до
+placement. Guard в резерве: покрывает edge case, где Bug 2 пропускает
+(например, min-offer fallback на коллекции *без* существующего своего
+оффера — Bug 2 молчит, Bug 1 блокирует submit).
+
+**Взаимодействие:** Bug 2 (`ecde331`) чистит прошлое — отменяет
+bait-polluted офферы, поставленные до bait-фикса. Bug 1 (`8b5868d`)
+защищает будущее — не даёт поставить новый bait-ценный оффер ни через
+один submit path. Два слоя защиты, оба за последнюю милю перед submit.
+
 ---
 
 
