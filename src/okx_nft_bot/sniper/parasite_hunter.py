@@ -2794,7 +2794,7 @@ class ParasiteHunter:
                 )
                 return False
 
-            ok = engine.place_single_offer(
+            ok, failure_reason = engine.place_single_offer(
                 collection_address=collection_address,
                 token_id=token_id,
                 price_wbnb=price,
@@ -2819,7 +2819,7 @@ class ParasiteHunter:
                     collection=collection_address,
                     price_bnb=price,
                     status="failed",
-                    reason="governed_submit_failed",
+                    reason=failure_reason or "governed_submit_failed",
                 )
             return ok
         except Exception as exc:
@@ -2902,7 +2902,7 @@ class ParasiteHunter:
                 )
                 return False
 
-            ok = engine.place_single_offer(
+            ok, failure_reason = engine.place_single_offer(
                 collection_address=collection_address,
                 token_id=token_id,
                 price_wbnb=price,
@@ -2927,7 +2927,7 @@ class ParasiteHunter:
                     collection=collection_address,
                     price_bnb=price,
                     status="failed",
-                    reason="governed_submit_failed",
+                    reason=failure_reason or "governed_submit_failed",
                 )
             return ok
         except Exception as exc:

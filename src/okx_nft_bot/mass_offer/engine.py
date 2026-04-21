@@ -288,22 +288,13 @@ class MassOfferEngine:
         duration_hours: int | None = None,
         dry_run: bool | None = None,
         quantity: int = 1,
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         """Place a single token-level offer.  Used by ParasiteHunter for BSC undercuts.
 
-        Args:
-            collection_address: NFT collection contract address.
-            token_id: Token ID (str or int).
-            price_wbnb: Offer price in native units (e.g. BNB for WBNB, or amount for USDT).
-            currency_address: ERC-20 token address to bid with.
-                              Defaults to WBNB if not provided.
-            chain: Blockchain (only 'bsc' supported for now).
-            duration_hours: Offer duration; defaults to settings.mass_offer_duration_hours.
-            dry_run: Override dry-run flag; defaults to settings.mass_offer_dry_run.
-            quantity: Number of items to buy in this offer (default 1).
-
         Returns:
-            True if the offer was submitted (or dry-run recorded) successfully.
+            (ok, reason). reason is None on success/dry-run; on failure it is
+            the precise cause (governor block text, api error, or
+            'no_offer_id_in_response'). Callers log the reason verbatim.
         """
         resolved_chain = chain.lower()
         resolved_duration = int(
@@ -342,7 +333,7 @@ class MassOfferEngine:
                 status="dry_run",
                 current_floor=price_wbnb,
             )
-            return True
+            return True, None
 
         from okx_nft_bot.prices import to_usd
 
@@ -363,7 +354,7 @@ class MassOfferEngine:
                 int_token_id,
                 blocked_reason,
             )
-            return False
+            return False, blocked_reason
 
         # Use OKX high-level create-offer API (same pattern as create-listing)
         try:
@@ -382,7 +373,7 @@ class MassOfferEngine:
                 "place_single_offer FAILED %s token=%s price=%.6f: %s",
                 collection_address[:14], int_token_id, price_wbnb, exc,
             )
-            return False
+            return False, f"api_error:{exc}"
 
         offer_id = result.get("offer_id")
         if offer_id:
@@ -398,13 +389,13 @@ class MassOfferEngine:
                 "place_single_offer SUCCESS %s token=%s price=%.6f offer=%s",
                 collection_address[:14], int_token_id, price_wbnb, offer_id,
             )
-            return True
+            return True, None
         else:
             logger.warning(
                 "place_single_offer FAILED %s token=%s price=%.6f — no offer_id in response",
                 collection_address[:14], int_token_id, price_wbnb,
             )
-            return False
+            return False, "no_offer_id_in_response"
 
     def status(self, *, chain: str = "bsc", limit: int = 5) -> dict[str, Any]:
         resolved_chain = chain.lower()
