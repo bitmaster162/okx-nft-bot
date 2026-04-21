@@ -186,7 +186,7 @@ class PositionState:
                 CREATE TABLE IF NOT EXISTS wallet_nonce (
                     wallet TEXT NOT NULL,
                     chain TEXT NOT NULL,
-                    next_nonce INTEGER NOT NULL,
+                    next_nonce TEXT NOT NULL,
                     last_synced_at TEXT NOT NULL,
                     PRIMARY KEY (wallet, chain)
                 )
@@ -353,7 +353,7 @@ class PositionState:
                         next_nonce = excluded.next_nonce,
                         last_synced_at = excluded.last_synced_at
                     """,
-                    (wallet_key, chain_key, allocated + 1, now_iso),
+                    (wallet_key, chain_key, str(allocated + 1), now_iso),
                 )
                 conn.commit()
                 return allocated
