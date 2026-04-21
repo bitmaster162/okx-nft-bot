@@ -2753,7 +2753,7 @@ class ParasiteHunter:
             # governor compares raw token amount directly to BNB cap.
             price_bnb_for_cap = self._normalize_to_bnb(price, cur_upper)
 
-            ok = engine.place_single_offer(
+            ok, detail = engine.place_single_offer(
                 collection_address=collection_address,
                 token_id=token_id,
                 price_wbnb=price,
@@ -2783,12 +2783,15 @@ class ParasiteHunter:
                     reason="success",
                 )
             else:
+                # Preserve the detailed failure cause from place_single_offer
+                # (rate-limit, daily-cap, api-exception, etc.) rather than the
+                # generic "governed_submit_failed" marker.
                 self._record_execution_submit_event(
                     chain="bsc",
                     collection=collection_address,
                     price_bnb=price,
                     status="failed",
-                    reason="governed_submit_failed",
+                    reason=detail or "governed_submit_failed",
                 )
             return ok
         except Exception as exc:
@@ -2875,7 +2878,7 @@ class ParasiteHunter:
             # (shared cap across chains; treating WETH as BNB is wrong too).
             price_bnb_for_cap = self._normalize_to_bnb(price, cur_upper)
 
-            ok = engine.place_single_offer(
+            ok, detail = engine.place_single_offer(
                 collection_address=collection_address,
                 token_id=token_id,
                 price_wbnb=price,
@@ -2905,12 +2908,15 @@ class ParasiteHunter:
                     reason="success",
                 )
             else:
+                # Preserve the detailed failure cause from place_single_offer
+                # (rate-limit, daily-cap, api-exception, etc.) rather than the
+                # generic "governed_submit_failed" marker.
                 self._record_execution_submit_event(
                     chain="eth",
                     collection=collection_address,
                     price_bnb=price,
                     status="failed",
-                    reason="governed_submit_failed",
+                    reason=detail or "governed_submit_failed",
                 )
             return ok
         except Exception as exc:

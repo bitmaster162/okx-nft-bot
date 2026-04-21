@@ -293,7 +293,7 @@ class MassOfferEngine:
         dry_run: bool | None = None,
         quantity: int = 1,
         price_bnb_for_cap: float | None = None,
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         """Place a single token-level offer.  Used by ParasiteHunter for BSC undercuts.
 
         Args:
@@ -313,7 +313,11 @@ class MassOfferEngine:
                 If None, falls back to price_wbnb.
 
         Returns:
-            True if the offer was submitted (or dry-run recorded) successfully.
+            (ok, detail) — ok=True if submitted (or dry-run recorded);
+            detail=None on success or a human-readable cause string on failure
+            (e.g. governor block reason, api exception). Callers should
+            propagate `detail` into submit_log.reason so operators can see
+            why a submit failed without grepping container logs.
         """
         resolved_chain = chain.lower()
         resolved_duration = int(
@@ -352,7 +356,7 @@ class MassOfferEngine:
                 status="dry_run",
                 current_floor=price_wbnb,
             )
-            return True
+            return True, None
 
         # Use BNB-equivalent for daily cap check when currency is not WBNB.
         # Falls back to price_wbnb for backward compatibility (mass_offer campaigns).
@@ -371,7 +375,7 @@ class MassOfferEngine:
                 int_token_id,
                 blocked_reason,
             )
-            return False
+            return False, blocked_reason
 
         # Use OKX high-level create-offer API (same pattern as create-listing)
         try:
@@ -390,7 +394,7 @@ class MassOfferEngine:
                 "place_single_offer FAILED %s token=%s price=%.6f: %s",
                 collection_address[:14], int_token_id, price_wbnb, exc,
             )
-            return False
+            return False, f"api_exception: {type(exc).__name__}: {exc}"
 
         offer_id = result.get("offer_id")
         if offer_id:
@@ -406,13 +410,13 @@ class MassOfferEngine:
                 "place_single_offer SUCCESS %s token=%s price=%.6f offer=%s",
                 collection_address[:14], int_token_id, price_wbnb, offer_id,
             )
-            return True
+            return True, None
         else:
             logger.warning(
                 "place_single_offer FAILED %s token=%s price=%.6f — no offer_id in response",
                 collection_address[:14], int_token_id, price_wbnb,
             )
-            return False
+            return False, "no_offer_id_in_response"
 
     def status(self, *, chain: str = "bsc", limit: int = 5) -> dict[str, Any]:
         resolved_chain = chain.lower()
