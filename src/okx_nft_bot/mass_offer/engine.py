@@ -23,7 +23,7 @@ from okx_nft_bot.mass_offer.scanner import (
 )
 from okx_nft_bot.mass_offer.tracker import MassOfferCampaign, MassOfferRecord, MassOfferTracker
 from okx_nft_bot.providers.offers_okx import OKXOffersProvider
-from okx_nft_bot.signing.seaport_signer import BSC_RPC, build_order_payload, build_per_item_offer, sign_order
+from okx_nft_bot.signing.seaport_signer import BSC_RPC, build_order_payload, build_per_item_offer, get_counter, sign_order
 from okx_nft_bot.undercutter.state import PositionState
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,6 @@ class MassOfferEngine:
         max_pages: int | None = None,
         rpc_url: str = BSC_RPC,
     ) -> MassOfferRunResult:
-        # BSC-only: pricing is hardcoded BNB (mass_offer_price_bnb) and rpc_url defaults to BSC_RPC
         resolved_chain = chain.lower()
         if resolved_chain != "bsc":
             raise ValueError(f"Only 'bsc' is supported in the execution track; got {resolved_chain!r}")
@@ -216,13 +215,11 @@ class MassOfferEngine:
         dry_run_count = 0
         failed_count = 0
         account = self._load_buyer_account()
+        counter = get_counter(account.address, rpc_url=rpc_url) if selected_targets else 0
         duration_seconds = max(int(resolved_duration_hours * 3600), 1)
         price_wei = to_wei(resolved_price_bnb)
 
         for index, target in enumerate(selected_targets):
-            counter = self.governor.allocate_seaport_counter(
-                account.address, resolved_chain
-            )
             result = self._submit_target(
                 campaign_id=campaign_id,
                 collection=collection,
@@ -245,6 +242,9 @@ class MassOfferEngine:
                 failed_count += 1
             elif result.status == "blocked":
                 failed_count += 1
+
+            # ── Increment counter for next offer (Seaport requires unique counter per order)
+            counter += 1
 
             if not effective_dry_run and index < len(selected_targets) - 1 and resolved_delay_seconds > 0:
                 self.sleep_fn(resolved_delay_seconds)
@@ -288,13 +288,28 @@ class MassOfferEngine:
         duration_hours: int | None = None,
         dry_run: bool | None = None,
         quantity: int = 1,
-    ) -> tuple[bool, str | None]:
+        price_bnb_for_cap: float | None = None,
+    ) -> bool:
         """Place a single token-level offer.  Used by ParasiteHunter for BSC undercuts.
 
+        Args:
+            collection_address: NFT collection contract address.
+            token_id: Token ID (str or int).
+            price_wbnb: Offer price in native units (e.g. BNB for WBNB, or amount for USDT).
+            currency_address: ERC-20 token address to bid with.
+                              Defaults to WBNB if not provided.
+            chain: Blockchain (only 'bsc' supported for now).
+            duration_hours: Offer duration; defaults to settings.mass_offer_duration_hours.
+            dry_run: Override dry-run flag; defaults to settings.mass_offer_dry_run.
+            quantity: Number of items to buy in this offer (default 1).
+            price_bnb_for_cap: Optional BNB-equivalent of the offer for governor
+                daily cap check. Required when currency is not WBNB/BNB (e.g.
+                USDT/USDC), otherwise the cap (max_bnb_per_day) treats the raw
+                token amount as BNB and incorrectly blocks legitimate offers.
+                If None, falls back to price_wbnb.
+
         Returns:
-            (ok, reason). reason is None on success/dry-run; on failure it is
-            the precise cause (governor block text, api error, or
-            'no_offer_id_in_response'). Callers log the reason verbatim.
+            True if the offer was submitted (or dry-run recorded) successfully.
         """
         resolved_chain = chain.lower()
         resolved_duration = int(
@@ -333,18 +348,16 @@ class MassOfferEngine:
                 status="dry_run",
                 current_floor=price_wbnb,
             )
-            return True, None
+            return True
 
-        from okx_nft_bot.prices import to_usd
-
-        _is_wbnb = (resolved_currency or "").lower() == WBNB_ADDRESS.lower()
-        _price_usd = to_usd(price_wbnb, "BNB" if _is_wbnb else "USDT")
+        # Use BNB-equivalent for daily cap check when currency is not WBNB.
+        # Falls back to price_wbnb for backward compatibility (mass_offer campaigns).
+        cap_check_price = price_bnb_for_cap if price_bnb_for_cap is not None else price_wbnb
         blocked_reason = self.governor.check_live_submit_allowed(
             action_type="LIVE_SINGLE_OFFER",
             collection=collection_address,
             chain=resolved_chain,
-            price_bnb=price_wbnb,
-            price_usd=_price_usd,
+            price_bnb=cap_check_price,
             configured_dry_run=False,
         )
         if blocked_reason:
@@ -354,7 +367,7 @@ class MassOfferEngine:
                 int_token_id,
                 blocked_reason,
             )
-            return False, blocked_reason
+            return False
 
         # Use OKX high-level create-offer API (same pattern as create-listing)
         try:
@@ -373,7 +386,7 @@ class MassOfferEngine:
                 "place_single_offer FAILED %s token=%s price=%.6f: %s",
                 collection_address[:14], int_token_id, price_wbnb, exc,
             )
-            return False, f"api_error:{exc}"
+            return False
 
         offer_id = result.get("offer_id")
         if offer_id:
@@ -389,13 +402,13 @@ class MassOfferEngine:
                 "place_single_offer SUCCESS %s token=%s price=%.6f offer=%s",
                 collection_address[:14], int_token_id, price_wbnb, offer_id,
             )
-            return True, None
+            return True
         else:
             logger.warning(
                 "place_single_offer FAILED %s token=%s price=%.6f — no offer_id in response",
                 collection_address[:14], int_token_id, price_wbnb,
             )
-            return False, "no_offer_id_in_response"
+            return False
 
     def status(self, *, chain: str = "bsc", limit: int = 5) -> dict[str, Any]:
         resolved_chain = chain.lower()
@@ -565,14 +578,11 @@ class MassOfferEngine:
                     preview_payload=preview_payload,
                 )
 
-            from okx_nft_bot.prices import to_usd
-
             blocked_reason = self.governor.check_live_submit_allowed(
                 action_type="LIVE_MASS_OFFER",
                 collection=collection,
                 chain=chain,
                 price_bnb=price_bnb,
-                price_usd=to_usd(price_bnb, "BNB"),
                 configured_dry_run=False,
             )
             if blocked_reason:

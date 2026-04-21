@@ -236,7 +236,6 @@ class ParasiteHunter:
     def __init__(self, binance_whitelist: dict[str, dict], buy_config: dict):
         self.enabled = _env_bool("PARASITE_HUNTER_ENABLED", False)
         self.dry_run = _env_bool("PARASITE_HUNTER_DRY_RUN", True)
-        self._buyer_lock = threading.Lock()  # protects _buyer.dry_run mutations
 
         # ── Parasite wallets (targets to undercut) ──
         self.target_wallets: set[str] = set()
@@ -279,14 +278,8 @@ class ParasiteHunter:
         ]
 
         # ── Phase 2: non-WL parasite hunt settings ──
-        self.phase2_enabled = _env_bool("PARASITE_HUNTER_PHASE2_ENABLED", True)
         self.nonwl_max_usd = _env_float("PARASITE_HUNTER_NONWL_MAX_USD", 0.001)
         self.nonwl_qty = _env_int("PARASITE_HUNTER_NONWL_QTY", 10)
-
-        # ── B1: Dynamic qty = budget/price ──
-        self.budget_usd = _env_float("PARASITE_HUNTER_BUDGET_USD", 8.8)
-        self.max_qty = _env_int("PARASITE_HUNTER_MAX_QTY", 200)
-        self.min_place_usd = _env_float("MIN_PLACE_USD", 0.05)
 
         self.binance_whitelist = binance_whitelist
         self.buy_config = buy_config
@@ -340,23 +333,6 @@ class ParasiteHunter:
         self._local_placed_offers: dict[str, list[str]] = {}
         # Local qty cache: "addr:chain" → qty we last placed (OKX API doesn't return real qty)
         self._placed_qty_cache: dict[str, int] = {}
-
-        # K3: hydrate cooldowns from SQLite so restarts don't re-stack offers
-        try:
-            _state = self._get_execution_state()
-            _loaded = _state.load_place_cooldowns()
-            if _loaded:
-                self._last_placed = {k: ts for k, (ts, _qty) in _loaded.items()}
-                self._placed_qty_cache = {k: qty for k, (_ts, qty) in _loaded.items() if qty}
-                log.info("Loaded %d place_cooldown entries from state DB", len(_loaded))
-            try:
-                _removed = _state.cleanup_stale_place_cooldowns(max_age_seconds=86400)
-                if _removed:
-                    log.info("Cleaned up %d stale place_cooldown entries", _removed)
-            except Exception:
-                pass
-        except Exception as exc:
-            log.warning("Failed to load place_cooldowns from DB: %s", exc)
         # Floor price cache (per-scan)
         self._floor_cache: dict[str, float] = {}
 
@@ -502,17 +478,6 @@ class ParasiteHunter:
             api_client=self._get_okx_client(),
         )
         return self._execution_governor
-
-    def _persist_place_cooldown(self, cache_key: str) -> None:
-        try:
-            state = self._get_execution_state()
-            state.upsert_place_cooldown(
-                cache_key=cache_key,
-                last_placed_ts=self._last_placed.get(cache_key, time.time()),
-                qty=self._placed_qty_cache.get(cache_key, 0),
-            )
-        except Exception as exc:
-            log.debug("Failed to persist place_cooldown for %s: %s", cache_key, exc)
 
     def _record_execution_submit_event(
         self,
@@ -737,54 +702,50 @@ class ParasiteHunter:
             # NOTE: BSC /offers endpoint ignores maker filter, but
             #       /collection-offers endpoint WORKS with maker on BSC.
             # ══════════════════════════════════════════════
-            if not self.phase2_enabled:
-                log.info("═══ PHASE 2: NON-WL PARASITE HUNT on %s — DISABLED via PARASITE_HUNTER_PHASE2_ENABLED ═══",
-                         chain.upper())
-            else:
-                log.info("═══ PHASE 2: NON-WL PARASITE HUNT on %s ═══", chain.upper())
+            log.info("═══ PHASE 2: NON-WL PARASITE HUNT on %s ═══", chain.upper())
 
-                all_parasite = self._fetch_wallet_offers(chain)
-                nonwl_parasite = [o for o in all_parasite if o.collection_address not in self._wl_index]
+            all_parasite = self._fetch_wallet_offers(chain)
+            nonwl_parasite = [o for o in all_parasite if o.collection_address not in self._wl_index]
 
-                log.info("🕷 %s: %d parasite non-WL offers", chain.upper(), len(nonwl_parasite))
+            log.info("🕷 %s: %d parasite non-WL offers", chain.upper(), len(nonwl_parasite))
 
-                if nonwl_parasite:
-                    by_nonwl: dict[str, list[ParasiteOffer]] = defaultdict(list)
-                    for o in nonwl_parasite:
-                        by_nonwl[o.collection_address].append(o)
+            if nonwl_parasite:
+                by_nonwl: dict[str, list[ParasiteOffer]] = defaultdict(list)
+                for o in nonwl_parasite:
+                    by_nonwl[o.collection_address].append(o)
 
-                    report.nonwl_collections = len(by_nonwl)
-                    report.nonwl_offers_found += len(nonwl_parasite)
+                report.nonwl_collections = len(by_nonwl)
+                report.nonwl_offers_found += len(nonwl_parasite)
 
-                    for addr, coll_offers in by_nonwl.items():
-                        has_config = addr in self.buy_config.get("collections", {})
-                        cheapest_usd = min(
-                            (self.prices.to_usd(o.price, o.currency) for o in coll_offers
-                             if o.price > 0),
-                            default=999
-                        )
-                        is_cheap = cheapest_usd <= self.nonwl_max_usd
+                for addr, coll_offers in by_nonwl.items():
+                    has_config = addr in self.buy_config.get("collections", {})
+                    cheapest_usd = min(
+                        (self.prices.to_usd(o.price, o.currency) for o in coll_offers
+                         if o.price > 0),
+                        default=999
+                    )
+                    is_cheap = cheapest_usd <= self.nonwl_max_usd
 
-                        if not has_config and not is_cheap:
-                            log.debug("  ⏭ non-WL %s: skip (no config, min=$%.4f)",
-                                      addr[:14], cheapest_usd)
-                            continue
+                    if not has_config and not is_cheap:
+                        log.debug("  ⏭ non-WL %s: skip (no config, min=$%.4f)",
+                                  addr[:14], cheapest_usd)
+                        continue
 
-                        reason = "config" if has_config else f"cheap(${cheapest_usd:.4f})"
-                        log.info("  🎯 non-WL %s: %d offers (%s) — hunting",
-                                 addr[:14], len(coll_offers), reason)
+                    reason = "config" if has_config else f"cheap(${cheapest_usd:.4f})"
+                    log.info("  🎯 non-WL %s: %d offers (%s) — hunting",
+                             addr[:14], len(coll_offers), reason)
 
-                        limited = coll_offers[:self.nonwl_qty]
-                        report.total_offers_found += len(limited)
+                    limited = coll_offers[:self.nonwl_qty]
+                    report.total_offers_found += len(limited)
 
-                        result = self._undercut_collection(addr, limited, chain, is_wl=False)
-                        report.undercuts_placed += result.our_offers_placed
-                        report.nonwl_undercuts_placed += result.our_offers_placed
-                        report.undercuts_failed += result.our_offers_failed
-                        report.undercuts_skipped += result.our_offers_skipped
+                    result = self._undercut_collection(addr, limited, chain, is_wl=False)
+                    report.undercuts_placed += result.our_offers_placed
+                    report.nonwl_undercuts_placed += result.our_offers_placed
+                    report.undercuts_failed += result.our_offers_failed
+                    report.undercuts_skipped += result.our_offers_skipped
 
-                        if self.collection_delay > 0 and not self.dry_run:
-                            time.sleep(self.collection_delay)
+                    if self.collection_delay > 0 and not self.dry_run:
+                        time.sleep(self.collection_delay)
 
             # ══════════════════════════════════════════════
             # PHASE 2b: SELL SIDE — be the cheapest listing, but above low_price
@@ -1036,11 +997,10 @@ class ParasiteHunter:
             report.cfg_buy_attempts += 1
 
             # Force dry_run for Phase 3c if AUTO_BUY_CONFIG_DRY_RUN=1
-            # Thread-safe override of buyer's dry_run flag
-            with self._buyer_lock:
-                original_dry_run = self._buyer.dry_run
-                if self._cfg_buy_dry_run:
-                    self._buyer.dry_run = True
+            # We temporarily override buyer's dry_run flag
+            original_dry_run = self._buyer.dry_run
+            if self._cfg_buy_dry_run:
+                self._buyer.dry_run = True
 
             try:
                 result = self._buyer.try_buy(
@@ -1076,9 +1036,8 @@ class ParasiteHunter:
             except Exception as exc:
                 log.error("Phase 3c buy error on %s: %s", name, exc)
             finally:
-                # Restore original dry_run (thread-safe)
-                with self._buyer_lock:
-                    self._buyer.dry_run = original_dry_run
+                # Restore original dry_run
+                self._buyer.dry_run = original_dry_run
 
             # Rate limit delay
             if self.collection_delay > 0:
@@ -1472,20 +1431,6 @@ class ParasiteHunter:
                 best_enemy = offer
                 best_enemy_usd = offer_usd
 
-        # Baseline quality gate: if the surviving baseline is <2% of the
-        # collection floor, it's almost certainly a bait order (spammer
-        # collection-offer with $0 intent). Discard it so either real_top
-        # below or min-offer mode sets the price — never let bait anchor us.
-        if best_enemy_usd > 0:
-            floor_usd_for_gate = self._fetch_floor_price(addr, chain)
-            if floor_usd_for_gate > 0 and best_enemy_usd < floor_usd_for_gate * 0.02:
-                log.warning(
-                    "  🪤 %s: baseline $%.4f is <2%% of floor $%.2f — discarding as bait",
-                    name, best_enemy_usd, floor_usd_for_gate,
-                )
-                best_enemy = None
-                best_enemy_usd = 0.0
-
         # Also check the REAL top ENEMY offer on the collection (may be from
         # a non-tracked wallet).  _fetch_best_offer_maker now returns
         # the best ENEMY (excluding our/friend wallets) directly.
@@ -1497,33 +1442,11 @@ class ParasiteHunter:
             log.info("  🗑 %s: skipping phantom real_top $%.2f (>2x cap $%.2f) maker=%s",
                      name, rt_usd, phantom_ceiling / 2, (rt_enemy.get("maker", "?"))[:14])
             rt_usd = 0
-        # Relative outlier between tracked baseline and real_top has two
-        # interpretations:
-        #   A) real_top is a stale phantom ($999 ghost from API)
-        #   B) tracked baseline is bait undervaluing the market
-        # Heuristic: treat baseline as bait when it's implausibly small —
-        # absolute <$0.05 OR <1% of floor. In that case clear best_enemy so
-        # the substitution branch below promotes real_top into best_enemy.
-        # Otherwise keep the original "real_top is a phantom" behaviour.
+        # Relative outlier check for real_top vs best tracked enemy
         if rt_usd > 0 and best_enemy_usd > 0 and rt_usd > best_enemy_usd * 5:
-            floor_usd_for_bait = self._fetch_floor_price(addr, chain)
-            bait_by_abs = best_enemy_usd < 0.05
-            bait_by_floor = (
-                floor_usd_for_bait > 0
-                and best_enemy_usd < floor_usd_for_bait * 0.01
-            )
-            if bait_by_abs or bait_by_floor:
-                log.warning(
-                    "  🪤 %s: BAIT suspected — tracked $%.4f, real_top $%.2f "
-                    "(floor=$%.2f) — promoting real_top",
-                    name, best_enemy_usd, rt_usd, floor_usd_for_bait,
-                )
-                best_enemy = None
-                best_enemy_usd = 0.0
-            else:
-                log.info("  🗑 %s: skipping phantom real_top $%.2f (>5x tracked $%.2f) maker=%s",
-                         name, rt_usd, best_enemy_usd, (rt_enemy.get("maker", "?"))[:14])
-                rt_usd = 0
+            log.info("  🗑 %s: skipping phantom real_top $%.2f (>5x tracked $%.2f) maker=%s",
+                     name, rt_usd, best_enemy_usd, (rt_enemy.get("maker", "?"))[:14])
+            rt_usd = 0
         if rt_usd > best_enemy_usd:
             rt_price = rt_enemy["price"]
             rt_cur = rt_enemy["currency"]
@@ -1588,40 +1511,16 @@ class ParasiteHunter:
             cap_usd = global_cap
 
         # ── TWO-TIER SYSTEM ──
-        _cheap_threshold = self.nonwl_max_usd  # legacy, kept for backward compat
-        is_premium = has_collection_config and cap_usd > self.budget_usd
-
-        # Dynamic qty: budget_usd / price → max how many fit in budget
-        if cap_usd > self.budget_usd:
-            default_qty = 1
-        else:
-            default_qty = min(self.max_qty, max(1, int(self.budget_usd / cap_usd)))
+        _cheap_threshold = self.nonwl_max_usd  # single threshold from .env ($0.54)
+        is_premium = has_collection_config and cap_usd > _cheap_threshold
+        # Collections with cap <= threshold → qty=10, otherwise qty=1
+        default_qty = 10 if (cap_usd <= _cheap_threshold) else 1
         offer_duration_hours = 720  # 30 days
 
         if best_enemy is None:
             # No enemy → check if we already have an offer (avoid duplicates!)
             our_existing = self._find_our_offer(addr, chain)
             if our_existing:
-                existing_usd = self.prices.to_usd(
-                    our_existing["price"], our_existing["currency"].upper()
-                )
-                # Our existing offer might itself be bait-polluted (placed
-                # before the bait-fix).  If <2% of floor, cancel it instead
-                # of skipping — otherwise stale 0.0001 WBNB offers never
-                # get cleaned up once baseline is correctly flagged as bait.
-                floor_usd_check = self._fetch_floor_price(addr, chain)
-                if (existing_usd > 0 and floor_usd_check > 0
-                        and existing_usd < floor_usd_check * 0.02):
-                    log.warning(
-                        "  🧹 %s: our existing offer $%.4f is <2%% of floor $%.2f "
-                        "— cancelling as bait-polluted (placed before bait-fix)",
-                        name, existing_usd, floor_usd_check,
-                    )
-                    cancel_ok = self._cancel_existing_offer(addr, chain, name)
-                    if cancel_ok:
-                        return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-                    log.warning("  🚫 %s: cancel of bait-polluted offer FAILED", name)
-                    return HuntResult(addr, name, chain, len(offers), 0, 1, 0)
                 log.info("  ✅ %s: no enemy, we already have offer (%.4f %s) — skip",
                          name, our_existing["price"], our_existing["currency"])
                 self.already_winning += 1
@@ -1700,8 +1599,6 @@ class ParasiteHunter:
 
         # ── No-enemy path: place offer with qty ──
         if best_enemy is None:
-            if not self._passes_final_price_guard(our_usd, floor_usd, name):
-                return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
             # quantity already set above
             if self.dry_run:
                 placed += 1
@@ -1728,7 +1625,6 @@ class ParasiteHunter:
                     # ALWAYS set cooldown — even on failure (might have succeeded on-chain)
                     self._last_placed[cache_key] = time.time()
                     self._placed_qty_cache[cache_key] = quantity
-                    self._persist_place_cooldown(cache_key)
                     if ok:
                         placed += 1
                     else:
@@ -1737,7 +1633,6 @@ class ParasiteHunter:
                     log.error("  Min-offer failed %s: %s", name, exc)
                     self._last_placed[cache_key] = time.time()
                     self._placed_qty_cache[cache_key] = quantity
-                    self._persist_place_cooldown(cache_key)
                     failed += 1
 
                 if self.delay > 0:
@@ -1790,16 +1685,13 @@ class ParasiteHunter:
                     our_price = self.prices.from_usd(our_usd, our_cur)
 
         # Read quantity from collection config, or use tier default
-        # Dynamic qty: budget_usd / our_price → how many fit in budget
-        if our_usd > self.budget_usd:
-            default_qty = 1
-        else:
-            default_qty = min(self.max_qty, max(1, int(self.budget_usd / our_usd)))
-        # Manual override via config still wins
+        # Override: if actual offer price <= threshold → qty=10
+        if our_usd <= _cheap_threshold:
+            default_qty = 10
         quantity = coll_cfg.get("max_offers", default_qty)
-        # Safety: if price > budget, cap at 1
-        if our_usd > self.budget_usd and quantity > 1:
-            log.info("  📉 %s: offer $%.2f > budget $%.2f — forcing qty=1", name, our_usd, self.budget_usd)
+        # Safety: if actual offer price > threshold, force qty=1
+        if our_usd > _cheap_threshold and quantity > 1:
+            log.info("  📉 %s: offer $%.2f > $%.2f — forcing qty=1", name, our_usd, _cheap_threshold)
             quantity = 1
 
         # ── SAME-PRICE GUARD: don't cancel+replace if new price ≈ old price ──
@@ -1860,10 +1752,7 @@ class ParasiteHunter:
                             target_fb = cap_usd
                         lower_threshold = target_fb * 1.20
                         if existing_usd <= lower_threshold:
-                            if existing_usd > self.budget_usd:
-                                _fb_want = 1
-                            else:
-                                _fb_want = min(self.max_qty, max(1, int(self.budget_usd / existing_usd)))
+                            _fb_want = 10 if existing_usd <= _cheap_threshold else 1
                             if self._needs_qty_upgrade(addr, chain, existing_usd, _fb_want):
                                 log.info("  🔄 %s: fallback price OK but qty needs upgrade to %d — will re-place",
                                          name, _fb_want)
@@ -1905,8 +1794,6 @@ class ParasiteHunter:
                     return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
         # We are NOT #1 → cancel ALL old offers, then place new one above enemy
-        if not self._passes_final_price_guard(our_usd, floor_usd, name):
-            return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
         cancel_ok = self._cancel_existing_offer(addr, chain, name)
         if not cancel_ok:
             log.warning("  🚫 %s: cancel failed — ABORT new offer to prevent stacking", name)
@@ -1941,7 +1828,6 @@ class ParasiteHunter:
                 # ALWAYS set cooldown — even on failure (might have succeeded on-chain)
                 self._last_placed[cache_key] = time.time()
                 self._placed_qty_cache[cache_key] = quantity
-                self._persist_place_cooldown(cache_key)
                 if ok:
                     placed += 1
                     self._alert_undercut(
@@ -1963,7 +1849,6 @@ class ParasiteHunter:
             except Exception as exc:
                 log.error("  Undercut failed #%s: %s", offer.token_id, exc)
                 self._last_placed[cache_key] = time.time()
-                self._persist_place_cooldown(cache_key)
                 failed += 1
 
             if self.delay > 0:
@@ -2516,22 +2401,20 @@ class ParasiteHunter:
                     if len(results) > before:
                         priapi_count += 1
 
-        # Method 3: local tracking — always merge, not only when API returned 0
-        # (K1 fix): if API returned a partial/foreign result, local tracker must
-        # still contribute its IDs so cancel sees the full picture. Without this
-        # merge, the protection logic thinks we have no offers → creates a dup.
+        # Method 3: local tracking fallback — if API returned nothing but
+        # we KNOW we placed offers this session, report them so cancel works
         local_key = f"{addr}:{chain}"
         local_ids = self._local_placed_offers.get(local_key, [])
         local_count = 0
-        if local_ids:
+        if local_ids and not results:
             for oid in local_ids:
-                if oid and oid not in seen_ids:
+                if oid not in seen_ids:
                     seen_ids.add(oid)
                     results.append({"order_id": oid, "price": 0, "currency": ""})
                     local_count += 1
             if local_count:
-                log.warning("  🔎 Local tracker added %d offer(s) for %s (api=%d, priapi=%d)",
-                            local_count, addr[:14], api_count, priapi_count)
+                log.warning("  🔎 API returned 0 but local tracker has %d offer(s) for %s — using local",
+                            local_count, addr[:14])
 
         if results:
             log.info("  🔎 Found %d of our offers on %s (api=%d, priapi=%d, local=%d)",
@@ -2654,25 +2537,8 @@ class ParasiteHunter:
                             name, len(truly_new))
                 return False
             if remaining:
-                # K2: distinguish receipt-verified cancels from API-only cancels.
-                # _cancel_onchain_seaport already waits for receipt with status==1
-                # before returning True, so a recent _last_onchain_cancel_ts means
-                # at least one of these cancels is on-chain-verified. API-only
-                # cancels trust OKX's 200 response — same ids reappearing should
-                # be a stale cache but we cannot prove it without an on-chain tx.
-                if had_onchain:
-                    log.info(
-                        "  👻 %s: %d ghost offers still in API cache (same IDs) — "
-                        "on-chain cancel receipt verified, proceeding",
-                        name, len(remaining),
-                    )
-                else:
-                    log.warning(
-                        "  👻 %s: %d ghost offers still in API cache (same IDs); "
-                        "cancel was API-only, no on-chain verification — "
-                        "trusting OKX and proceeding",
-                        name, len(remaining),
-                    )
+                log.info("  👻 %s: %d ghost offers still in API cache (same IDs) — ignoring, proceeding",
+                         name, len(remaining))
             return True
 
         # Partial cancel — do strict verification
@@ -2683,30 +2549,6 @@ class ParasiteHunter:
                         name, len(remaining))
             return False
 
-        return True
-
-    def _passes_final_price_guard(
-        self, our_usd: float, floor_usd: float, name: str
-    ) -> bool:
-        """Last-mile sanity guard before submit.
-
-        Catches bait-distorted prices that slipped through upstream gates
-        (e.g. Phase 1 found an enemy, outlier-filter removed it, code
-        fell through to min-offer mode). Applied uniformly to min-offer,
-        undercut and enemy-present paths.
-        """
-        if our_usd < self.min_place_usd:
-            log.warning(
-                "  🪤 %s: our price $%.4f < absolute min $%.2f — SKIP",
-                name, our_usd, self.min_place_usd,
-            )
-            return False
-        if floor_usd > 0 and our_usd < floor_usd * 0.02:
-            log.warning(
-                "  🪤 %s: our price $%.4f < 2%% of floor $%.2f — SKIP (bait-distorted)",
-                name, our_usd, floor_usd,
-            )
-            return False
         return True
 
     def _submit_undercut(self, collection_address: str, token_id: str,
@@ -2732,7 +2574,11 @@ class ParasiteHunter:
         "WETH": 0.005, "DAI": 5.0,
     }
 
-    # RPC URLs per chain for balance checks — populated via config.get_rpc_urls (RISK-3)
+    # RPC URLs per chain for balance checks
+    _CHAIN_RPC = {
+        "bsc": "https://bsc-dataseed.binance.org/",
+        "eth": "https://1rpc.io/eth",
+    }
 
     # Map currency address → chain for automatic RPC selection
     _CURRENCY_CHAIN = {
@@ -2756,25 +2602,21 @@ class ParasiteHunter:
         wallet = settings.buyer_wallet_address
         if not wallet:
             return 999999.0  # can't check → assume enough
+        import urllib.request
         addr_padded = wallet.lower().replace('0x', '').zfill(64)
         data = '0x70a08231' + addr_padded  # balanceOf(address)
         payload = _json.dumps({
             'jsonrpc': '2.0', 'method': 'eth_call',
             'params': [{'to': currency_address, 'data': data}, 'latest'], 'id': 1,
-        })
-        # Pick correct RPC based on currency address chain (env-first via get_rpc_urls)
+        }).encode()
+        # Pick correct RPC based on currency address chain
         chain = self._CURRENCY_CHAIN.get(currency_address.lower(), "bsc")
-        from okx_nft_bot.config import get_rpc_urls as _get_rpc_urls
         rpc_url = getattr(settings, f'buyer_rpc_url{"_eth" if chain == "eth" else ""}', None)
         if not rpc_url:
-            urls = _get_rpc_urls(chain)
-            rpc_url = urls[0] if urls else 'https://bsc-dataseed.binance.org/'
-        # RISK-4: route through shared rate-limited transport instead of raw urllib
-        from okx_nft_bot.clients.http import get_rpc_transport
-        resp = get_rpc_transport().request_json(
-            method="POST", url=rpc_url,
-            headers={"Content-Type": "application/json"}, body=payload,
-        )
+            rpc_url = self._CHAIN_RPC.get(chain, 'https://bsc-dataseed.binance.org/')
+        req = urllib.request.Request(rpc_url, data=payload,
+                                     headers={'Content-Type': 'application/json'})
+        resp = _json.loads(urllib.request.urlopen(req, timeout=5).read())
         raw = int(resp.get('result', '0x0'), 16)
         # USDC/USDT on ETH use 6 decimals
         decimals = 6 if currency_address.lower() in (
@@ -2830,6 +2672,28 @@ class ParasiteHunter:
             log.debug("Balance check failed (proceeding anyway): %s", exc)
             return True
 
+    def _normalize_to_bnb(self, price: float, currency: str) -> float:
+        """Convert a price in any currency to BNB-equivalent via USD.
+
+        Used to give the execution governor a comparable number for its
+        daily_bnb cap (max_bnb_per_day). Without normalization a $10 USDT
+        offer would be seen as "10 BNB" (~$6000) and get blocked.
+
+        Falls back to raw price if USD conversion fails — safe default since
+        a 5 BNB cap is very permissive for raw numbers anyway.
+        """
+        cur = currency.upper()
+        if cur in ("WBNB", "BNB"):
+            return price
+        try:
+            price_usd = self.prices.to_usd(price, cur)
+            bnb_usd = self.prices.get_usd_price("WBNB")
+            if bnb_usd > 0 and price_usd > 0:
+                return price_usd / bnb_usd
+        except Exception as exc:
+            log.debug("BNB-equivalent normalization failed for %s: %s", cur, exc)
+        return price
+
     def _submit_bsc(self, collection_address: str, token_id: str,
                     price: float, currency: str = "WBNB",
                     quantity: int = 1, duration_hours: int = 720) -> bool:
@@ -2884,7 +2748,12 @@ class ParasiteHunter:
                 )
                 return False
 
-            ok, failure_reason = engine.place_single_offer(
+            # Normalize price to BNB-equivalent for governor daily_bnb cap.
+            # max_bnb_per_day=5 otherwise blocks any USDT offer > $5 because
+            # governor compares raw token amount directly to BNB cap.
+            price_bnb_for_cap = self._normalize_to_bnb(price, cur_upper)
+
+            ok = engine.place_single_offer(
                 collection_address=collection_address,
                 token_id=token_id,
                 price_wbnb=price,
@@ -2893,6 +2762,7 @@ class ParasiteHunter:
                 duration_hours=duration_hours,
                 dry_run=False,
                 quantity=quantity,
+                price_bnb_for_cap=price_bnb_for_cap,
             )
             if ok:
                 key = f"{collection_address.lower()}:bsc"
@@ -2903,13 +2773,22 @@ class ParasiteHunter:
                         self._local_placed_offers.setdefault(key, []).append(matches[-1])
                 except Exception as exc:
                     log.debug("BSC local offer tracking refresh failed: %s", exc)
+                # Record submit_log success so governor daily_bnb cap tracker works.
+                # Use price_bnb_for_cap (BNB-equivalent) not raw token price.
+                self._record_execution_submit_event(
+                    chain="bsc",
+                    collection=collection_address,
+                    price_bnb=price_bnb_for_cap,
+                    status="submitted",
+                    reason="success",
+                )
             else:
                 self._record_execution_submit_event(
                     chain="bsc",
                     collection=collection_address,
                     price_bnb=price,
                     status="failed",
-                    reason=failure_reason or "governed_submit_failed",
+                    reason="governed_submit_failed",
                 )
             return ok
         except Exception as exc:
@@ -2992,7 +2871,11 @@ class ParasiteHunter:
                 )
                 return False
 
-            ok, failure_reason = engine.place_single_offer(
+            # Normalize price to BNB-equivalent for governor daily_bnb cap
+            # (shared cap across chains; treating WETH as BNB is wrong too).
+            price_bnb_for_cap = self._normalize_to_bnb(price, cur_upper)
+
+            ok = engine.place_single_offer(
                 collection_address=collection_address,
                 token_id=token_id,
                 price_wbnb=price,
@@ -3001,6 +2884,7 @@ class ParasiteHunter:
                 duration_hours=duration_hours,
                 dry_run=False,
                 quantity=quantity,
+                price_bnb_for_cap=price_bnb_for_cap,
             )
             if ok:
                 key = f"{collection_address.lower()}:eth"
@@ -3011,13 +2895,22 @@ class ParasiteHunter:
                         self._local_placed_offers.setdefault(key, []).append(matches[-1])
                 except Exception as exc:
                     log.debug("ETH local offer tracking refresh failed: %s", exc)
+                # Record submit_log success so governor daily_bnb cap tracker works.
+                # Use price_bnb_for_cap (BNB-equivalent) not raw token price.
+                self._record_execution_submit_event(
+                    chain="eth",
+                    collection=collection_address,
+                    price_bnb=price_bnb_for_cap,
+                    status="submitted",
+                    reason="success",
+                )
             else:
                 self._record_execution_submit_event(
                     chain="eth",
                     collection=collection_address,
                     price_bnb=price,
                     status="failed",
-                    reason=failure_reason or "governed_submit_failed",
+                    reason="governed_submit_failed",
                 )
             return ok
         except Exception as exc:
@@ -3282,7 +3175,6 @@ class ParasiteHunter:
 
         collections_cfg = self.buy_config.get("collections", {})
         sell_bps = self.buy_config.get("sell_settings", {}).get("undercut_step_bps", 50)
-        min_listing_price = self.buy_config.get("sell_settings", {}).get("min_listing_price_bnb", 0)
         placed = 0
 
         # Get our NFT inventory
@@ -3450,11 +3342,6 @@ class ParasiteHunter:
             if cheapest_enemy_price is None:
                 # No enemy listings → list at safe default or low_price (whichever higher)
                 our_sell_price = max(low_price, _SELL_DEFAULT_PRICE) if not has_config else low_price
-                # Enforce global minimum listing price
-                if min_listing_price > 0 and our_sell_price < min_listing_price:
-                    log.info("  SELL %s: price %.6f < min_listing_price %.6f → clamped",
-                             col_addr[:14], our_sell_price, min_listing_price)
-                    our_sell_price = min_listing_price
                 log.info("  SELL %s: no enemy listings → price=%.6f (low_price=%.6f)",
                          col_addr[:14], our_sell_price, low_price)
             else:
@@ -3464,11 +3351,6 @@ class ParasiteHunter:
                 # Floor at low_price — never sell below what we'd buy at
                 if our_sell_price < low_price:
                     our_sell_price = low_price
-                # Enforce global minimum listing price
-                if min_listing_price > 0 and our_sell_price < min_listing_price:
-                    log.info("  SELL %s: price %.6f < min_listing_price %.6f → clamped",
-                             col_addr[:14], our_sell_price, min_listing_price)
-                    our_sell_price = min_listing_price
                 log.info("  SELL %s: enemy_cheapest=%.6f → our=%.6f (floor=%.6f)",
                          col_addr[:14], cheapest_enemy_price, our_sell_price, low_price)
 
