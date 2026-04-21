@@ -1466,6 +1466,20 @@ class ParasiteHunter:
                 best_enemy = offer
                 best_enemy_usd = offer_usd
 
+        # Baseline quality gate: if the surviving baseline is <2% of the
+        # collection floor, it's almost certainly a bait order (spammer
+        # collection-offer with $0 intent). Discard it so either real_top
+        # below or min-offer mode sets the price — never let bait anchor us.
+        if best_enemy_usd > 0:
+            floor_usd_for_gate = self._fetch_floor_price(addr, chain)
+            if floor_usd_for_gate > 0 and best_enemy_usd < floor_usd_for_gate * 0.02:
+                log.warning(
+                    "  🪤 %s: baseline $%.4f is <2%% of floor $%.2f — discarding as bait",
+                    name, best_enemy_usd, floor_usd_for_gate,
+                )
+                best_enemy = None
+                best_enemy_usd = 0.0
+
         # Also check the REAL top ENEMY offer on the collection (may be from
         # a non-tracked wallet).  _fetch_best_offer_maker now returns
         # the best ENEMY (excluding our/friend wallets) directly.
@@ -1477,11 +1491,33 @@ class ParasiteHunter:
             log.info("  🗑 %s: skipping phantom real_top $%.2f (>2x cap $%.2f) maker=%s",
                      name, rt_usd, phantom_ceiling / 2, (rt_enemy.get("maker", "?"))[:14])
             rt_usd = 0
-        # Relative outlier check for real_top vs best tracked enemy
+        # Relative outlier between tracked baseline and real_top has two
+        # interpretations:
+        #   A) real_top is a stale phantom ($999 ghost from API)
+        #   B) tracked baseline is bait undervaluing the market
+        # Heuristic: treat baseline as bait when it's implausibly small —
+        # absolute <$0.05 OR <1% of floor. In that case clear best_enemy so
+        # the substitution branch below promotes real_top into best_enemy.
+        # Otherwise keep the original "real_top is a phantom" behaviour.
         if rt_usd > 0 and best_enemy_usd > 0 and rt_usd > best_enemy_usd * 5:
-            log.info("  🗑 %s: skipping phantom real_top $%.2f (>5x tracked $%.2f) maker=%s",
-                     name, rt_usd, best_enemy_usd, (rt_enemy.get("maker", "?"))[:14])
-            rt_usd = 0
+            floor_usd_for_bait = self._fetch_floor_price(addr, chain)
+            bait_by_abs = best_enemy_usd < 0.05
+            bait_by_floor = (
+                floor_usd_for_bait > 0
+                and best_enemy_usd < floor_usd_for_bait * 0.01
+            )
+            if bait_by_abs or bait_by_floor:
+                log.warning(
+                    "  🪤 %s: BAIT suspected — tracked $%.4f, real_top $%.2f "
+                    "(floor=$%.2f) — promoting real_top",
+                    name, best_enemy_usd, rt_usd, floor_usd_for_bait,
+                )
+                best_enemy = None
+                best_enemy_usd = 0.0
+            else:
+                log.info("  🗑 %s: skipping phantom real_top $%.2f (>5x tracked $%.2f) maker=%s",
+                         name, rt_usd, best_enemy_usd, (rt_enemy.get("maker", "?"))[:14])
+                rt_usd = 0
         if rt_usd > best_enemy_usd:
             rt_price = rt_enemy["price"]
             rt_cur = rt_enemy["currency"]
