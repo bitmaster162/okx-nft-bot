@@ -1,4 +1,14 @@
-## Известные проблемы (обновлено 2026-04-20 после Phase 1–6 + AUDIT-V2 fixes)
+## Известные проблемы (обновлено 2026-04-21, deployed to prod)
+
+**🚀 DEPLOYED TO PROD ON 2026-04-21.** 27 коммитов сессии (период 2026-04-20)
+применены через `docker compose restart` трёх контейнеров. Live-check
+подтвердил: все healthy, 429 retry работает, ETH parasite_hunter отключен
+(нет WETH), 233 stale BSC offers → `cancelled_stale`, 28 active осталось.
+Детальный snapshot — в `AUDIT_2026_04_19.md §11`.
+
+---
+
+
 
 ### ✅ FIXED
 - **offer_blaster.py:269** — ETH Seaport v1.5 → v1.6 (commit 7f7dd7e)
@@ -129,6 +139,22 @@ _(none from AUDIT-V2 — all P0/P1 items landed in Phase 6)_
 - Оба попали в PARASITE_WALLETS — видимо ошибочно для этих
 - Нужна логика: если две pair-wallet из списка часто матчатся между собой
   на одной коллекции → флаг wash, не конкурировать там
+
+**Q5: CR7 collection retries stuck at attempt:1** (watch-item, 2026-04-21)
+- `collection/detail?slug=the-cr7-nft-collection-8` — 3 запроса подряд за 5с,
+  все `attempt:1 status:429`. Возможно retry-strategy не инкрементит
+  `attempt` counter, либо этот endpoint вызывается с хардкод-slug
+- Low priority — наблюдение, не критично. Функционально retry всё равно
+  проходит успешно в пределах цикла.
+
+---
+
+## Операционные constraints (на 2026-04-21)
+
+- **Балансы кошелька:** WBNB ≈ $11, USDT ≈ $0.18
+- **WETH отсутствует** → ETH parasite_hunter отключен через `PARASITE_HUNTER_CHAINS=bsc`
+- **Miss-click buy** проигрывает конкурентам по скорости execution.
+  Требует отдельной стратегии (gas bump / direct RPC path / приоритетный nonce).
 
 ---
 
