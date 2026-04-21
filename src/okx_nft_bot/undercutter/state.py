@@ -166,7 +166,7 @@ class PositionState:
                 CREATE TABLE IF NOT EXISTS seaport_counter (
                     wallet TEXT NOT NULL,
                     chain TEXT NOT NULL,
-                    next_counter INTEGER NOT NULL,
+                    next_counter TEXT NOT NULL,
                     last_synced_at TEXT NOT NULL,
                     PRIMARY KEY (wallet, chain)
                 )
@@ -280,7 +280,7 @@ class PositionState:
                         next_counter = excluded.next_counter,
                         last_synced_at = excluded.last_synced_at
                     """,
-                    (wallet_key, chain_key, allocated + 1, now_iso),
+                    (wallet_key, chain_key, str(allocated + 1), now_iso),
                 )
                 conn.commit()
                 return allocated

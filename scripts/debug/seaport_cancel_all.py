@@ -47,7 +47,7 @@ def sync_db_counter(wallet: str, chain: str, new_counter: int) -> None:
                 next_counter = excluded.next_counter,
                 last_synced_at = excluded.last_synced_at
             """,
-            (wallet.lower(), chain, new_counter, now),
+            (wallet.lower(), chain, str(new_counter), now),
         )
         conn.commit()
         print(f"  ✓ seaport_counter table synced: {chain}/{wallet[:10]}... next_counter={new_counter}")
