@@ -103,3 +103,9 @@ Killswitch (`state.set_force_dry_run(True)`) — отдельный контур
 - `src/okx_nft_bot/undercutter/state.py:637` — `PositionState.arm_live()`
 - `src/okx_nft_bot/mass_offer/engine.py:280` — `place_single_offer()` (точка блокировки)
 - `src/okx_nft_bot/sniper/parasite_hunter.py:2797` — вызывающая сторона BSC-submit
+
+---
+
+## История изменений
+
+- **2026-04-21**: `PARASITE_HUNTER_OFFER_CURRENCIES` сужен до `WBNB,USDT,BUSD` (BSC-native only). Удалены `WETH,USDC,DAI` — ETH-ликвидность не фондирована, попытки офферов в этих валютах генерировали ~92% шума в `execution_submit_log` (~20k `insufficient_balance:WETH` за 2ч). Применяется при следующем рестарте `okx-nft-bot-exec`.
