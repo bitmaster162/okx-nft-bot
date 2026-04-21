@@ -286,6 +286,7 @@ class ParasiteHunter:
         # ── B1: Dynamic qty = budget/price ──
         self.budget_usd = _env_float("PARASITE_HUNTER_BUDGET_USD", 8.8)
         self.max_qty = _env_int("PARASITE_HUNTER_MAX_QTY", 200)
+        self.min_place_usd = _env_float("MIN_PLACE_USD", 0.05)
 
         self.binance_whitelist = binance_whitelist
         self.buy_config = buy_config
@@ -1679,6 +1680,8 @@ class ParasiteHunter:
 
         # ── No-enemy path: place offer with qty ──
         if best_enemy is None:
+            if not self._passes_final_price_guard(our_usd, floor_usd, name):
+                return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
             # quantity already set above
             if self.dry_run:
                 placed += 1
@@ -1882,6 +1885,8 @@ class ParasiteHunter:
                     return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
         # We are NOT #1 → cancel ALL old offers, then place new one above enemy
+        if not self._passes_final_price_guard(our_usd, floor_usd, name):
+            return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
         cancel_ok = self._cancel_existing_offer(addr, chain, name)
         if not cancel_ok:
             log.warning("  🚫 %s: cancel failed — ABORT new offer to prevent stacking", name)
@@ -2658,6 +2663,30 @@ class ParasiteHunter:
                         name, len(remaining))
             return False
 
+        return True
+
+    def _passes_final_price_guard(
+        self, our_usd: float, floor_usd: float, name: str
+    ) -> bool:
+        """Last-mile sanity guard before submit.
+
+        Catches bait-distorted prices that slipped through upstream gates
+        (e.g. Phase 1 found an enemy, outlier-filter removed it, code
+        fell through to min-offer mode). Applied uniformly to min-offer,
+        undercut and enemy-present paths.
+        """
+        if our_usd < self.min_place_usd:
+            log.warning(
+                "  🪤 %s: our price $%.4f < absolute min $%.2f — SKIP",
+                name, our_usd, self.min_place_usd,
+            )
+            return False
+        if floor_usd > 0 and our_usd < floor_usd * 0.02:
+            log.warning(
+                "  🪤 %s: our price $%.4f < 2%% of floor $%.2f — SKIP (bait-distorted)",
+                name, our_usd, floor_usd,
+            )
+            return False
         return True
 
     def _submit_undercut(self, collection_address: str, token_id: str,
