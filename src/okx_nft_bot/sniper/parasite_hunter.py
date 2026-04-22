@@ -1735,12 +1735,16 @@ class ParasiteHunter:
                 # but fallback is WBNB — must switch!)
                 our_cur = self._pick_currency(parasite_cur, cfg_cur, chain_currencies, chain_native)
                 log.info("  🔄 %s: fallback our_cur=%s (enemy_cur=%s)", name, our_cur, parasite_cur)
-                # Recalculate our outbid price in CORRECT currency
-                our_price = offer.price * min_step_mult
-                our_usd = self.prices.to_usd(our_price, our_cur)
-                if our_usd > cap_usd:
-                    our_usd = cap_usd
-                    our_price = self.prices.from_usd(our_usd, our_cur)
+                # Recalculate via USD — parasite_cur may differ from our_cur.
+                # BUG (fixed): previously `our_price = offer.price * min_step_mult`
+                # then `to_usd(our_price, our_cur)` mis-interpreted the
+                # parasite-currency amount as our_cur (e.g. 0.0001 WBNB treated
+                # as 0.0001 USDT → $0.0001 offers). Now go through USD.
+                target_usd = parasite_usd * min_step_mult
+                if target_usd > cap_usd:
+                    target_usd = cap_usd
+                our_price = self.prices.from_usd(target_usd, our_cur)
+                our_usd = target_usd
                 # Re-check SMART OFFER CHECK for the fallback enemy
                 if our_existing:
                     existing_usd = self.prices.to_usd(
