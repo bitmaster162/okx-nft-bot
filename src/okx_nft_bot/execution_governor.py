@@ -167,7 +167,7 @@ class ExecutionGovernor:
         wallet: str,
         chain: str,
         *,
-        resync_after_seconds: int = 3600,
+        resync_after_seconds: int = 60,
     ) -> int:
         """Atomic Seaport counter allocation.
 
@@ -175,7 +175,8 @@ class ExecutionGovernor:
         order. Persists the local counter in ``seaport_counter`` (execution.sqlite3)
         so multiple engines on the same wallet do not race. On first call, or
         when the local record is older than ``resync_after_seconds``, the value
-        is re-fetched from chain via Seaport ``getCounter``.
+        is re-fetched from chain via Seaport ``getCounter``. The counter is
+        NOT incremented per order — see state.allocate_seaport_counter docstring.
         """
         from okx_nft_bot.signing.seaport_signer import get_counter
 

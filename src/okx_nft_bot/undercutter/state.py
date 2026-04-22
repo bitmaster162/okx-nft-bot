@@ -229,15 +229,24 @@ class PositionState:
         wallet: str,
         chain: str,
         fetch_onchain_fn: Any,
-        resync_after_seconds: int = 3600,
+        resync_after_seconds: int = 60,
     ) -> int:
         """Atomically allocate a Seaport counter value.
 
-        Uses BEGIN IMMEDIATE to serialize across concurrent engines on the same
-        wallet. On first call (or when local record is older than
-        ``resync_after_seconds``), fetches the on-chain value via
-        ``fetch_onchain_fn(wallet, chain)``. Returns the counter value allocated
-        to the caller and persists ``next_counter = returned + 1``.
+        Seaport counter semantics: this is a BULK-CANCEL EPOCH, not a per-order
+        nonce. Every order signed at epoch N remains valid until the offerer
+        calls ``incrementCounter()`` on-chain (which bumps the epoch and
+        invalidates all prior orders in one tx). At fulfill time, Seaport
+        derives ``orderHash`` using the CURRENT ON-CHAIN counter — signing
+        with a locally-incremented value produces a signature that cannot be
+        recovered on-chain (InvalidSigner revert).
+
+        Therefore: we must always return the current on-chain value (cached
+        briefly for performance), and we must NOT bump the DB counter per
+        allocation. The DB is refreshed only when (a) first call, (b) the
+        cache is older than ``resync_after_seconds``, or (c) an on-chain
+        ``incrementCounter()`` tx succeeds (caller's responsibility to force
+        a resync by updating last_synced_at to epoch 0).
         """
         wallet_key = wallet.lower()
         chain_key = chain.lower()
@@ -280,7 +289,7 @@ class PositionState:
                         next_counter = excluded.next_counter,
                         last_synced_at = excluded.last_synced_at
                     """,
-                    (wallet_key, chain_key, str(allocated + 1), now_iso),
+                    (wallet_key, chain_key, str(allocated), now_iso),
                 )
                 conn.commit()
                 return allocated

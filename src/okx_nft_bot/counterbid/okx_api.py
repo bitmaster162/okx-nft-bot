@@ -1062,7 +1062,10 @@ class OKXAPIClient:
         account = Account.from_key(private_key)
         max_uint256 = 2**256 - 1
 
-        nonce = w3.eth.get_transaction_count(account.address)
+        # RISK-1: atomic nonce allocation via ExecutionGovernor
+        from okx_nft_bot.execution_governor import ExecutionGovernor
+        _governor = ExecutionGovernor(settings=self.settings)
+        nonce = _governor.allocate_nonce(account.address, chain_name)
         gas_price = w3.eth.gas_price
 
         tx = token_contract.functions.approve(
@@ -1119,7 +1122,10 @@ class OKXAPIClient:
             abi=nft_abi,
         )
         account = Account.from_key(private_key)
-        nonce = w3.eth.get_transaction_count(account.address)
+        # RISK-1: atomic nonce allocation via ExecutionGovernor
+        from okx_nft_bot.execution_governor import ExecutionGovernor
+        _governor = ExecutionGovernor(settings=self.settings)
+        nonce = _governor.allocate_nonce(account.address, chain_name)
         gas_price = w3.eth.gas_price
 
         tx = nft_contract.functions.setApprovalForAll(
@@ -1543,7 +1549,10 @@ class OKXAPIClient:
 
         chain_lower = chain.lower()
         seaport_addr = self._SEAPORT_ADDRESSES.get(chain_lower)
-        rpc_url = self._RPC_URLS.get(chain_lower)
+        try:
+            rpc_url = self._primary_rpc(chain_lower)
+        except RuntimeError:
+            rpc_url = None
         if not seaport_addr or not rpc_url:
             log.error("_bump_counter_onchain: unsupported chain %s", chain)
             return False
@@ -1560,7 +1569,10 @@ class OKXAPIClient:
                 abi=self._SEAPORT_CANCEL_ABI,
             )
             old_counter = seaport.functions.getCounter(account.address).call()
-            nonce = w3.eth.get_transaction_count(account.address)
+            # RISK-1: atomic nonce allocation via ExecutionGovernor
+            from okx_nft_bot.execution_governor import ExecutionGovernor
+            governor = ExecutionGovernor(settings=self.settings)
+            nonce = governor.allocate_nonce(account.address, chain_lower)
             tx = seaport.functions.incrementCounter().build_transaction({
                 "from": account.address,
                 "nonce": nonce,
@@ -1587,6 +1599,21 @@ class OKXAPIClient:
                     tx_hash.hex()[:16], receipt.get("gasUsed", 0),
                 )
                 self._last_onchain_cancel_ts = time.time()
+                # Force Seaport counter cache to resync on next allocation —
+                # on-chain counter just jumped, stale DB value would cause
+                # signatures to be invalid until 60s resync window elapses.
+                try:
+                    import sqlite3 as _sql
+                    with _sql.connect(governor.state.db_path, timeout=10) as _c:
+                        _c.execute(
+                            "UPDATE seaport_counter SET last_synced_at = ? "
+                            "WHERE wallet = ? AND chain = ?",
+                            ("1970-01-01T00:00:00+00:00",
+                             account.address.lower(), chain_lower),
+                        )
+                        _c.commit()
+                except Exception as _e:
+                    log.warning("bump_counter: failed to invalidate counter cache: %s", _e)
                 return True
             log.error("_bump_counter_onchain: TX REVERTED %s", tx_hash.hex()[:16])
             return False
