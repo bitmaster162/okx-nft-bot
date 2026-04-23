@@ -1444,11 +1444,23 @@ class OKXAPIClient:
                 abi=self._SEAPORT_CANCEL_ABI,
             )
 
-            # Get current counter
-            counter = seaport.functions.getCounter(account.address).call()
-
-            # Build OrderComponents from protocolData.parameters
+            # Use the counter the order was SIGNED with (from protocolData);
+            # falling back to the current on-chain counter only if missing.
+            # Seaport.cancel() derives orderHash from order.counter directly, so
+            # using the current counter here silently targets the wrong hash when
+            # the wallet's counter has been bumped since signing (CRITICAL bug).
             params = order_params
+            signed_counter_raw = params.get("counter")
+            if signed_counter_raw is None:
+                counter = seaport.functions.getCounter(account.address).call()
+                log.warning(
+                    "_cancel_onchain: protocolData missing counter — "
+                    "falling back to current on-chain counter %d",
+                    counter,
+                )
+            else:
+                counter = int(signed_counter_raw)
+
             order_components = {
                 "offerer": Web3.to_checksum_address(params["offerer"]),
                 "zone": Web3.to_checksum_address(params.get("zone", "0x" + "0" * 40)),
