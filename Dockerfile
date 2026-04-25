@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir . && \
 
 USER appuser
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 CMD ["okx-nft-bot", "healthcheck"]
+HEALTHCHECK --interval=60s --timeout=15s --start-period=60s --retries=3 CMD ["okx-nft-bot", "healthcheck"]
 
 ENTRYPOINT ["okx-nft-bot"]
 CMD ["run-daemon"]
