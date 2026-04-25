@@ -1,5 +1,5 @@
 """
-Real-time Sales Stream Daemon — Parasite-Killer v17+
+Real-time Sales Stream Daemon — Rival-Undercutter v17+
 
 Continuously polls OKX, OpenSea, and MagicEden for NFT sales/trades,
 normalizes them into a unified format, and writes to SQLite.
@@ -19,7 +19,7 @@ Env vars (from .env):
     SALES_DB_PATH=./data/sales_stream.sqlite3
     SALES_POLL_INTERVAL=30
     SALES_MARKETS=okx,opensea,magiceden
-    PARASITE_WALLETS=0x...,0x...
+    RIVAL_WALLETS=0x...,0x...
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (optional, for alerts)
 """
 
@@ -87,8 +87,8 @@ _debug_handler = RotatingFileHandler(
 _debug_handler.setLevel(logging.INFO)
 _debug_handler.setFormatter(logging.Formatter(
     "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-# Only capture parasite_hunter, counterbid, mass_offer logs
-for _logger_name in ("sniper.parasite_hunter", "counterbid.okx_api", "okx_nft_bot.mass_offer.engine"):
+# Only capture counter_bidder, counterbid, mass_offer logs
+for _logger_name in ("sniper.counter_bidder", "counterbid.okx_api", "okx_nft_bot.mass_offer.engine"):
     logging.getLogger(_logger_name).addHandler(_debug_handler)
 
 log = logging.getLogger("sales_stream")
@@ -144,8 +144,8 @@ class SaleEvent:
     tx_hash: str
     block_number: int | None
     timestamp: str              # ISO 8601 UTC
-    is_parasite_seller: bool    # seller is in PARASITE_WALLETS
-    is_parasite_buyer: bool     # buyer is in PARASITE_WALLETS
+    is_rival_seller: bool    # seller is in RIVAL_WALLETS
+    is_rival_buyer: bool     # buyer is in RIVAL_WALLETS
     trade_type: str             # buy | listing | offer | unknown
     raw_json: str               # original API response for this event
 
@@ -182,8 +182,8 @@ class SalesDatabase:
                     tx_hash TEXT NOT NULL,
                     block_number INTEGER,
                     timestamp TEXT NOT NULL,
-                    is_parasite_seller INTEGER NOT NULL DEFAULT 0,
-                    is_parasite_buyer INTEGER NOT NULL DEFAULT 0,
+                    is_rival_seller INTEGER NOT NULL DEFAULT 0,
+                    is_rival_buyer INTEGER NOT NULL DEFAULT 0,
                     trade_type TEXT NOT NULL DEFAULT 'покупка',
                     raw_json TEXT,
                     ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -196,7 +196,7 @@ class SalesDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_sales_collection ON sales(collection_address, timestamp)"
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_sales_parasite ON sales(is_parasite_seller, is_parasite_buyer)"
+                "CREATE INDEX IF NOT EXISTS idx_sales_rival ON sales(is_rival_seller, is_rival_buyer)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sales_seller ON sales(seller)"
@@ -231,13 +231,13 @@ class SalesDatabase:
                             event_id, market, chain, collection_address, collection_name,
                             token_id, price, price_usd, currency, seller, buyer,
                             tx_hash, block_number, timestamp,
-                            is_parasite_seller, is_parasite_buyer, trade_type, raw_json
+                            is_rival_seller, is_rival_buyer, trade_type, raw_json
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         e.event_id, e.market, e.chain, e.collection_address,
                         e.collection_name, e.token_id, e.price, e.price_usd,
                         e.currency, e.seller, e.buyer, e.tx_hash, e.block_number,
-                        e.timestamp, int(e.is_parasite_seller), int(e.is_parasite_buyer),
+                        e.timestamp, int(e.is_rival_seller), int(e.is_rival_buyer),
                         e.trade_type, e.raw_json,
                     ))
                     if conn.execute("SELECT changes()").fetchone()[0] > 0:
@@ -269,8 +269,8 @@ class SalesDatabase:
             by_market = dict(conn.execute(
                 "SELECT market, COUNT(*) FROM sales GROUP BY market"
             ).fetchall())
-            parasite_sales = conn.execute(
-                "SELECT COUNT(*) FROM sales WHERE is_parasite_seller = 1 OR is_parasite_buyer = 1"
+            rival_sales = conn.execute(
+                "SELECT COUNT(*) FROM sales WHERE is_rival_seller = 1 OR is_rival_buyer = 1"
             ).fetchone()[0]
             latest = conn.execute(
                 "SELECT market, MAX(timestamp) FROM sales GROUP BY market"
@@ -278,7 +278,7 @@ class SalesDatabase:
         return {
             "total_sales": total,
             "by_market": by_market,
-            "parasite_involved": parasite_sales,
+            "rival_involved": rival_sales,
             "latest_by_market": dict(latest),
         }
 
@@ -509,7 +509,7 @@ class OKXSalesClient:
             return "офф"
         return type_name or "трейд"
 
-    def normalize(self, trade: dict, parasite_wallets: set[str]) -> SaleEvent:
+    def normalize(self, trade: dict, rival_wallets: set[str]) -> SaleEvent:
         """Normalize a trade dict from either priapi or v5 endpoint."""
         # priapi fields:  fromAddr / toAddr / tradedTime / collAddr / collName / nftId / tradePrice / txHash
         # v5 fields:      fromAddress / toAddress / createDate / collectionAddress / collectionName / tokenId / price / txId
@@ -566,8 +566,8 @@ class OKXSalesClient:
             tx_hash=tx,
             block_number=int(trade["blockNumber"]) if trade.get("blockNumber") else None,
             timestamp=ts,
-            is_parasite_seller=seller in parasite_wallets,
-            is_parasite_buyer=buyer in parasite_wallets,
+            is_rival_seller=seller in rival_wallets,
+            is_rival_buyer=buyer in rival_wallets,
             trade_type=self._parse_trade_type(trade),
             raw_json=json.dumps(trade, ensure_ascii=False),
         )
@@ -612,7 +612,7 @@ class OpenSeaSalesClient:
             log.error("OpenSea sales fetch failed: %s", exc)
             return [], None
 
-    def normalize(self, event: dict, parasite_wallets: set[str]) -> SaleEvent:
+    def normalize(self, event: dict, rival_wallets: set[str]) -> SaleEvent:
         seller = (event.get("seller") or event.get("from_address") or "").lower()
         buyer = (event.get("winner_account", {}).get("address") or
                  event.get("to_address") or "").lower()
@@ -644,8 +644,8 @@ class OpenSeaSalesClient:
             tx_hash=event.get("transaction") or "",
             block_number=None,
             timestamp=ts,
-            is_parasite_seller=seller in parasite_wallets,
-            is_parasite_buyer=buyer in parasite_wallets,
+            is_rival_seller=seller in rival_wallets,
+            is_rival_buyer=buyer in rival_wallets,
             trade_type="покупка",
             raw_json=json.dumps(event, ensure_ascii=False),
         )
@@ -705,7 +705,7 @@ class MagicEdenSalesClient:
             log.error("MagicEden sales fetch failed for %s: %s", contract, exc)
             return [], None
 
-    def normalize(self, sale: dict, parasite_wallets: set[str]) -> SaleEvent:
+    def normalize(self, sale: dict, rival_wallets: set[str]) -> SaleEvent:
         seller = (sale.get("from") or "").lower()
         buyer = (sale.get("to") or "").lower()
         price_raw = sale.get("price", {})
@@ -738,8 +738,8 @@ class MagicEdenSalesClient:
             tx_hash=sale.get("txHash") or "",
             block_number=int(sale["block"]) if sale.get("block") else None,
             timestamp=ts,
-            is_parasite_seller=seller in parasite_wallets,
-            is_parasite_buyer=buyer in parasite_wallets,
+            is_rival_seller=seller in rival_wallets,
+            is_rival_buyer=buyer in rival_wallets,
             trade_type="покупка",
             raw_json=json.dumps(sale, ensure_ascii=False),
         )
@@ -748,7 +748,7 @@ class MagicEdenSalesClient:
 # ─── Telegram Alerter ──────────────────────────────────────────
 
 class TelegramAlerter:
-    """Send alerts when parasite activity is detected in sales."""
+    """Send alerts when rival activity is detected in sales."""
 
     _TYPE_ICONS = {
         "\u043f\u043e\u043a\u0443\u043f\u043a\u0430": "\U0001f6d2",
@@ -761,13 +761,13 @@ class TelegramAlerter:
         self.chat_id = chat_id
         self.enabled = bool(bot_token and chat_id)
 
-    def alert_parasite_sale(self, event: SaleEvent):
+    def alert_rival_sale(self, event: SaleEvent):
         if not self.enabled:
             return
-        role = "SELLER" if event.is_parasite_seller else "BUYER"
-        address = event.seller if event.is_parasite_seller else event.buyer
+        role = "SELLER" if event.is_rival_seller else "BUYER"
+        address = event.seller if event.is_rival_seller else event.buyer
         msg = (
-            f"🚨 <b>Parasite {role} Detected</b>\n"
+            f"🚨 <b>Rival {role} Detected</b>\n"
             f"Market: {event.market.upper()}\n"
             f"Collection: {event.collection_name}\n"
             f"Token: #{event.token_id}\n"
@@ -834,7 +834,7 @@ class TelegramAlerter:
         except Exception as exc:
             log.warning("Telegram binance alert failed: %s", exc)
 
-    def send_summary(self, cycle: int, total_trades: int, parasite_count: int,
+    def send_summary(self, cycle: int, total_trades: int, rival_count: int,
                      chains_active: int, by_chain: dict[str, int]):
         """Send periodic summary to Telegram."""
         if not self.enabled:
@@ -843,13 +843,13 @@ class TelegramAlerter:
             f"  {chain.upper()}: {count}" for chain, count in sorted(by_chain.items())
         ) or "  (none)"
         emoji = "🟢" if total_trades > 0 else "🔴"
-        parasite_emoji = "🚨" if parasite_count > 0 else "✅"
+        rival_emoji = "🚨" if rival_count > 0 else "✅"
         msg = (
             f"{emoji} <b>Sales Stream Summary</b> (cycle {cycle})\n"
             f"Trades this cycle: {total_trades}\n"
             f"Chains active: {chains_active}\n"
             f"By chain:\n{chain_lines}\n"
-            f"{parasite_emoji} Parasite hits: {parasite_count}"
+            f"{rival_emoji} Rival hits: {rival_count}"
         )
         try:
             http.post(
@@ -879,7 +879,7 @@ class SalesStreamDaemon:
                  markets_csv: str | None = None, registry_path: str | None = None):
         _db_path = db_path or os.getenv("SALES_DB_PATH", "./data/sales_stream.sqlite3")
         self.db = SalesDatabase(_db_path)
-        self.parasite_wallets = self._load_parasite_wallets()
+        self.rival_wallets = self._load_rival_wallets()
         self.interval = interval or int(os.getenv("SALES_POLL_INTERVAL", "30"))
         self.markets = (markets_csv or os.getenv("SALES_MARKETS", "okx,opensea,magiceden")).lower().split(",")
 
@@ -977,27 +977,27 @@ class SalesStreamDaemon:
         except Exception as exc:
             log.warning("OfferBlaster init failed: %s", exc)
 
-        # Parasite Hunter — undercut parasite offers on Binance WL
-        self.parasite_hunter = None
-        if os.getenv("PARASITE_HUNTER_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        # Rival Scanner — undercut rival offers on Binance WL
+        self.counter_bidder = None
+        if os.getenv("COUNTERBID_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
             try:
-                from okx_nft_bot.sniper.parasite_hunter import ParasiteHunter
-                self.parasite_hunter = ParasiteHunter(self.binance_whitelist, self.buy_config)
+                from okx_nft_bot.sniper.counter_bidder import CounterBidder
+                self.counter_bidder = CounterBidder(self.binance_whitelist, self.buy_config)
             except ImportError:
-                log.debug("ParasiteHunter not available")
+                log.debug("CounterBidder not available")
             except Exception as exc:
-                log.warning("ParasiteHunter init failed: %s", exc)
+                log.warning("CounterBidder init failed: %s", exc)
 
         okx_cols = [c for c in self.collections if c["market"] == "okx"]
         me_cols = [c for c in self.collections if c["market"] == "magiceden"]
         os_cols = [c for c in self.collections if c["market"] == "opensea"]
         okx_mode = "playwright-priapi" if (self._pw_stream and self._pw_stream.is_running) else "v5-per-collection"
         log.info(
-            "Sales Stream Daemon init: markets=%s, interval=%ds, parasites=%d, "
+            "Sales Stream Daemon init: markets=%s, interval=%ds, rivals=%d, "
             "collections: okx=%d, magiceden=%d, opensea=%d, okx_mode=%s, http=%s, "
             "binance_wl=%d",
             list(self.clients.keys()), self.interval,
-            len(self.parasite_wallets),
+            len(self.rival_wallets),
             len(okx_cols), len(me_cols), len(os_cols),
             okx_mode, HTTP_ENGINE, len(self.binance_whitelist),
         )
@@ -1028,8 +1028,8 @@ class SalesStreamDaemon:
             log.error("Failed to load registry %s: %s", path, exc)
             return []
 
-    def _load_parasite_wallets(self) -> set[str]:
-        raw = os.getenv("PARASITE_WALLETS", "")
+    def _load_rival_wallets(self) -> set[str]:
+        raw = os.getenv("RIVAL_WALLETS", "")
         return {w.strip().lower() for w in raw.split(",") if w.strip()}
 
     def _load_binance_whitelist(self) -> dict[str, dict]:
@@ -1147,7 +1147,7 @@ class SalesStreamDaemon:
         if self._pw_stream and self._pw_stream.is_running:
             raw_trades = self._pw_stream.drain_trades()
             if raw_trades:
-                events = [client.normalize(t, self.parasite_wallets) for t in raw_trades]
+                events = [client.normalize(t, self.rival_wallets) for t in raw_trades]
                 # Filter out blacklisted collections
                 if self.collection_blacklist:
                     before = len(events)
@@ -1199,7 +1199,7 @@ class SalesStreamDaemon:
                 log.info("OKX rate-limited for %s, retrying in %ds...", addr[:10], wait)
                 time.sleep(wait)
 
-            events = [client.normalize(t, self.parasite_wallets) for t in trades]
+            events = [client.normalize(t, self.rival_wallets) for t in trades]
             all_events.extend(events)
             if next_cursor:
                 self.db.set_cursor(cursor_key, next_cursor)
@@ -1212,7 +1212,7 @@ class SalesStreamDaemon:
         # OpenSea events API can work globally — poll once with cursor
         cursor = self.db.get_cursor("opensea")
         raw_events, next_cursor = client.fetch_recent_sales(after=cursor, limit=50)
-        events = [client.normalize(e, self.parasite_wallets) for e in raw_events]
+        events = [client.normalize(e, self.rival_wallets) for e in raw_events]
         if next_cursor:
             self.db.set_cursor("opensea", next_cursor)
         return events
@@ -1230,7 +1230,7 @@ class SalesStreamDaemon:
             sales, next_cont = client.fetch_recent_sales(
                 contract=addr, continuation=cursor, limit=50,
             )
-            events = [client.normalize(s, self.parasite_wallets) for s in sales]
+            events = [client.normalize(s, self.rival_wallets) for s in sales]
             all_events.extend(events)
             if next_cont:
                 self.db.set_cursor(cursor_key, next_cont)
@@ -1244,13 +1244,13 @@ class SalesStreamDaemon:
         Returns {
             'by_market': {market: new_count},
             'by_chain': {chain: count},
-            'parasite_count': int,
+            'rival_count': int,
             'total': int,
         }
         """
         by_market: dict[str, int] = {}
         by_chain: dict[str, int] = {}
-        parasite_count = 0
+        rival_count = 0
 
         pollers = {
             "okx": self.poll_okx,
@@ -1276,25 +1276,25 @@ class SalesStreamDaemon:
                 for e in events:
                     by_chain[e.chain] = by_chain.get(e.chain, 0) + 1
 
-                # Alert on parasite activity
+                # Alert on rival activity
                 for e in events:
-                    if e.is_parasite_seller or e.is_parasite_buyer:
-                        parasite_count += 1
-                        self.alerter.alert_parasite_sale(e)
+                    if e.is_rival_seller or e.is_rival_buyer:
+                        rival_count += 1
+                        self.alerter.alert_rival_sale(e)
                         log.info(
-                            "🚨 PARASITE %s on %s [%s]: %s #%s @ %.4f %s",
-                            "SELL" if e.is_parasite_seller else "BUY",
+                            "🚨 RIVAL %s on %s [%s]: %s #%s @ %.4f %s",
+                            "SELL" if e.is_rival_seller else "BUY",
                             market.upper(), e.chain.upper(),
                             e.collection_name,
                             e.token_id, e.price, e.currency,
                         )
-                        # Trigger parasite hunter on this collection
-                        if self.parasite_hunter and self.binance_whitelist.get(e.collection_address.lower()):
+                        # Trigger rival scanner on this collection
+                        if self.counter_bidder and self.binance_whitelist.get(e.collection_address.lower()):
                             try:
-                                self.parasite_hunter.hunt_collection(
+                                self.counter_bidder.hunt_collection(
                                     e.collection_address, e.collection_name, e.chain)
                             except Exception as hunt_exc:
-                                log.error("Parasite hunt failed for %s: %s",
+                                log.error("Rival hunt failed for %s: %s",
                                           e.collection_name, hunt_exc)
 
                 # Alert on Binance-whitelisted collection trades + auto-buy
@@ -1378,7 +1378,7 @@ class SalesStreamDaemon:
         return {
             "by_market": by_market,
             "by_chain": by_chain,
-            "parasite_count": parasite_count,
+            "rival_count": rival_count,
             "total": total,
         }
 
@@ -1387,7 +1387,7 @@ class SalesStreamDaemon:
         cycle = 0
         summary_interval = int(os.getenv("TELEGRAM_SUMMARY_INTERVAL", "20"))  # send summary every N cycles
         cumulative_trades = 0
-        cumulative_parasites = 0
+        cumulative_rivals = 0
         cumulative_by_chain: dict[str, int] = {}
 
         log.info("Starting Sales Stream Daemon (interval=%ds, max_cycles=%s, summary_every=%d cycles)",
@@ -1396,9 +1396,9 @@ class SalesStreamDaemon:
         # Send startup message to Telegram
         self.alerter.send_summary(0, 0, 0, 0, {})
 
-        # Start ParasiteHunter background scanner
-        if self.parasite_hunter:
-            self.parasite_hunter.start_background_scan()
+        # Start CounterBidder background scanner
+        if self.counter_bidder:
+            self.counter_bidder.start_background_scan()
 
         while True:
             cycle += 1
@@ -1406,7 +1406,7 @@ class SalesStreamDaemon:
                 results = self.run_once()
                 total_new = results["total"]
                 cumulative_trades += total_new
-                cumulative_parasites += results["parasite_count"]
+                cumulative_rivals += results["rival_count"]
                 for chain, cnt in results["by_chain"].items():
                     cumulative_by_chain[chain] = cumulative_by_chain.get(chain, 0) + cnt
 
@@ -1417,12 +1417,12 @@ class SalesStreamDaemon:
                 # Send periodic summary to Telegram
                 if cycle % summary_interval == 0:
                     self.alerter.send_summary(
-                        cycle, cumulative_trades, cumulative_parasites,
+                        cycle, cumulative_trades, cumulative_rivals,
                         len(cumulative_by_chain), cumulative_by_chain,
                     )
                     # Reset counters
                     cumulative_trades = 0
-                    cumulative_parasites = 0
+                    cumulative_rivals = 0
                     cumulative_by_chain = {}
 
             except Exception as exc:

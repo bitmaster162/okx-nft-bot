@@ -1,36 +1,14 @@
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from okx_nft_bot.config import Settings, get_rpc_urls, validate_execution_chain
+from okx_nft_bot.config import Settings
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient
 
 if TYPE_CHECKING:
     from okx_nft_bot.undercutter.state import PositionState
-
-
-def _env_float(key: str, default: float) -> float:
-    raw = os.environ.get(key)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _primary_rpc_url(chain: str) -> str:
-    """Back-compat accessor: first RPC URL from the failover list."""
-    urls = get_rpc_urls(chain)
-    if not urls:
-        raise RuntimeError(f"No RPC URL configured for chain {chain!r}")
-    return urls[0]
-
-
-MIN_OFFER_PRICE_USD = _env_float("MIN_OFFER_PRICE_USD", 0.001)
 
 
 @dataclass(slots=True)
@@ -106,7 +84,6 @@ class ExecutionGovernor:
         collection: str,
         chain: str,
         price_bnb: float,
-        price_usd: float | None = None,
         configured_dry_run: bool | None = None,
     ) -> str | None:
         """Gate a live submission through all rate/arm/cap checks.
@@ -119,16 +96,12 @@ class ExecutionGovernor:
             price_bnb_equiv = (price_usd / bnb_usd_price)
 
         Otherwise a 10 USDT offer is treated as 10 BNB (~$6000) and gets blocked,
-        which is exactly the regression that hit `counter_bidder._submit_bsc`
+        which is exactly the regression that hit `parasite_hunter._submit_bsc`
         on 2026-04-21 (see _normalize_to_bnb helper).
         """
         _ = action_type, collection
         if self.effective_dry_run(configured_dry_run):
             return "dry_run_enabled"
-        if price_usd is not None:
-            ok, reason = self.check_min_price(price_usd)
-            if not ok:
-                return f"min_price_guard: {reason}"
         # Block new submissions if killswitch left failed (zombie) offers
         ks_failed = self.state.get_killswitch_failed_offers(chain=chain)
         if ks_failed:
@@ -162,81 +135,10 @@ class ExecutionGovernor:
             return f"submit cooldown active: {snapshot['cooldown_remaining_seconds']}s remaining"
         return None
 
-    def allocate_seaport_counter(
-        self,
-        wallet: str,
-        chain: str,
-        *,
-        resync_after_seconds: int = 60,
-    ) -> int:
-        """Atomic Seaport counter allocation.
-
-        Returns the counter value the caller should use for the next signed
-        order. Persists the local counter in ``seaport_counter`` (execution.sqlite3)
-        so multiple engines on the same wallet do not race. On first call, or
-        when the local record is older than ``resync_after_seconds``, the value
-        is re-fetched from chain via Seaport ``getCounter``. The counter is
-        NOT incremented per order — see state.allocate_seaport_counter docstring.
-        """
-        from okx_nft_bot.signing.seaport_signer import get_counter
-
-        def _fetch(w: str, c: str) -> int:
-            return int(get_counter(w, rpc_urls=get_rpc_urls(c)))
-
-        return self.state.allocate_seaport_counter(
-            wallet=wallet,
-            chain=chain,
-            fetch_onchain_fn=_fetch,
-            resync_after_seconds=resync_after_seconds,
-        )
-
-    def allocate_nonce(
-        self,
-        wallet: str,
-        chain: str,
-        *,
-        resync_after_seconds: int = 60,
-    ) -> int:
-        """Atomic transaction nonce allocation.
-
-        Serializes nonce assignment across processes on the same wallet+chain
-        via SQLite BEGIN IMMEDIATE (see PositionState.allocate_nonce). The
-        on-chain probe uses the ``pending`` block tag so that queued
-        transactions from other tools are respected.
-        """
-        from web3 import Web3
-
-        def _fetch(w: str, c: str) -> int:
-            urls = get_rpc_urls(c)
-            last_err: Exception | None = None
-            for url in urls:
-                try:
-                    w3 = Web3(Web3.HTTPProvider(url))
-                    return int(w3.eth.get_transaction_count(Web3.to_checksum_address(w), "pending"))
-                except Exception as exc:
-                    last_err = exc
-                    continue
-            raise RuntimeError(f"All {len(urls)} RPC endpoints failed for chain {c}: {last_err}")
-
-        return self.state.allocate_nonce(
-            wallet=wallet,
-            chain=chain,
-            fetch_onchain_fn=_fetch,
-            resync_after_seconds=resync_after_seconds,
-        )
-
-    def check_min_price(self, price_usd: float) -> tuple[bool, str]:
-        """Global floor guard for any live offer submission.
-
-        Returns (allowed, reason). ``reason`` is empty on success.
-        """
-        floor = MIN_OFFER_PRICE_USD
-        if price_usd is None or price_usd < floor:
-            return False, f"price ${float(price_usd or 0.0):.4f} < min ${floor:.4f}"
-        return True, ""
-
     def reconcile_active_offers(self, *, chain: str | None = None) -> ReconciliationResult:
-        resolved_chain = validate_execution_chain(chain or self.settings.execution_chain)
+        resolved_chain = (chain or self.settings.execution_chain).lower()
+        if resolved_chain != "bsc":
+            raise ValueError(f"Only 'bsc' is supported in the execution track; got {resolved_chain!r}")
 
         exchange_offers_raw = self.api_client.get_my_offers(
             chain=resolved_chain,
@@ -368,15 +270,4 @@ class ExecutionGovernor:
             price = float(raw)
         except (ValueError, TypeError):
             return None
-        if price < 0:
-            return None
-        # OKX /get_my_offers returns price as a wei-denominated string
-        # (e.g. "111655499999999990" == 0.11166 native units).  Legacy
-        # callers of this helper passed already-decimal floats; apply a
-        # threshold heuristic so both shapes are coerced to native units.
-        # Any real-world NFT offer denominated in wei exceeds 1e10 (even
-        # 1e-8 BNB = 1e10 wei); any ether-denominated offer stays well
-        # below 1e10 (1e10 BNB is economically impossible).
-        if price >= 1e10:
-            price = price / 1e18
-        return price
+        return price if price >= 0 else None

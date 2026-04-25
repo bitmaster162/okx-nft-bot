@@ -75,8 +75,8 @@ class Settings:
     app_profile: str = 'dev'
     profiles_dir: Path = Path('./deploy/profiles')
     backup_dir: Path = Path('./data/backups')
-    # v13+v15: Parasite wallet addresses for counter-bidding detection
-    parasite_wallets: tuple[str, ...] = ()
+    # v13+v15: Rival wallet addresses for counter-bidding detection
+    rival_wallets: tuple[str, ...] = ()
     offers_db_path: Path = Path('./data/offers.sqlite3')
     offers_max_pages_per_run: int = 5
     binance_whitelist_path: Path = Path('./data/binance_whitelist.json')
@@ -298,7 +298,7 @@ def load_settings(profile_override: str | None = None) -> Settings:
         app_profile=profile,
         profiles_dir=profiles_dir,
         backup_dir=backup_dir,
-        parasite_wallets=_split_csv(os.getenv('PARASITE_WALLETS')),
+        rival_wallets=_split_csv(os.getenv('RIVAL_WALLETS')),
         offers_db_path=_ensure_parent(Path(os.getenv('OFFERS_DB_PATH', './data/offers.sqlite3'))),
         offers_max_pages_per_run=int(os.getenv('OFFERS_MAX_PAGES_PER_RUN', '5')),
         binance_whitelist_path=Path(os.getenv('BINANCE_WHITELIST_PATH', './data/binance_whitelist.json')),

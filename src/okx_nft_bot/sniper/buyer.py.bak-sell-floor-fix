@@ -183,21 +183,13 @@ class OKXInstantBuyer:
         self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
 
-        # UNCONDITIONAL web3 init — counter_bidder's Phase 3 creates its own
-        # OKXInstantBuyer and gates buy activity via its own `_buy_enabled`
-        # (from buy_config), not via the AUTO_BUY_ENABLED env flag. If we skip
-        # _init_web3() when AUTO_BUY_ENABLED is unset, every buy attempt by
-        # counter_bidder fails with "Web3 not connected for chain bsc"
-        # regardless of whether the buy was authorised. See feedback memory
-        # "WL-first rule" + 24h log scan showing ~600 Web3-not-connected
-        # errors in a pre-patch window.
-        self._init_web3()
         if self.enabled:
+            self._init_web3()
             log.info("OKXInstantBuyer: ENABLED, effective_dry_run=%s, wallet=%s, gas_mult=%.1f, max_gas=%d gwei",
                      self._effective_dry_run(), self.buyer_address[:10] + "..." if self.buyer_address else "NONE",
                      self.gas_multiplier, self.max_gas_gwei)
         else:
-            log.info("OKXInstantBuyer: DISABLED via env (set AUTO_BUY_ENABLED=1); web3 still initialised for counter_bidder use")
+            log.info("OKXInstantBuyer: DISABLED (set AUTO_BUY_ENABLED=1 to enable)")
 
     def _get_governor(self):
         """Lazy-initialize ExecutionGovernor for atomic nonce allocation (RISK-1)."""
@@ -589,13 +581,6 @@ class OKXInstantBuyer:
     def _alert_buy_attempt(self, attempt: BuyAttempt):
         """Send buy attempt result to Telegram."""
         if not self.tg_token or not self.tg_chat:
-            return
-
-        # Skip TG for in-memory dedup short-circuits: _failed_orders cache
-        # re-emits the same "already failed (stale/unavailable)" error every
-        # cycle the zombie listing is re-discovered; we still log it but don't
-        # spam Telegram with duplicates.
-        if attempt.error and "already failed (stale" in attempt.error:
             return
 
         chain_cfg = CHAIN_CONFIG.get(attempt.chain, {})

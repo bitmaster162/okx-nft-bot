@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class OKXOffersProvider:
     """Read-only provider that fetches NFT offers from OKX marketplace.
 
-    Can be scoped to specific maker addresses (e.g. parasite wallets) or
+    Can be scoped to specific maker addresses (e.g. rival wallets) or
     a specific collection. No write/submit paths exist in this class.
     """
 

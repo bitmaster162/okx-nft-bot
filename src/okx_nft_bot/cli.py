@@ -143,10 +143,10 @@ def cmd_poll_telegram_once() -> int:
     transport = StdlibHttpTransport(timeout=settings.okx_request_timeout, max_retries=settings.okx_max_retries, rate_limit_per_sec=settings.okx_rate_limit_per_sec)
     client = TelegramBotClient(bot_token=settings.telegram_bot_token, transport=transport)
 
-    def _load_parasite_hunter():
+    def _load_counter_bidder():
         from pathlib import Path
         import os as _os
-        from okx_nft_bot.sniper.parasite_hunter import ParasiteHunter
+        from okx_nft_bot.sniper.counter_bidder import CounterBidder
 
         wl_path = Path(_os.getenv("BINANCE_WHITELIST_PATH", "./data/binance_whitelist.json"))
         buy_path = Path(_os.getenv("BUY_CONFIG_PATH", "./config/buy_config.json"))
@@ -155,7 +155,7 @@ def cmd_poll_telegram_once() -> int:
             wl_data = json.loads(wl_path.read_text())
             wl = {item["contract_address"].lower(): item for item in wl_data if item.get("contract_address")}
         buy_cfg = json.loads(buy_path.read_text()) if buy_path.exists() else {}
-        return ParasiteHunter(wl, buy_cfg)
+        return CounterBidder(wl, buy_cfg)
 
     processor = TelegramCommandProcessor(
         settings=settings,
@@ -163,7 +163,7 @@ def cmd_poll_telegram_once() -> int:
         registry=registry,
         runner=runner,
         client=client,
-        parasite_hunter_loader=_load_parasite_hunter,
+        counter_bidder_loader=_load_counter_bidder,
     )
     result = processor.poll_once()
     write_runtime_metrics(settings, store, extra={'daemon_status': 'telegram_poll', 'last_command': 'poll-telegram-once'})

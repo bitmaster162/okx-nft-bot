@@ -2560,9 +2560,7 @@
       "_reverted_at": "20260425-154655",
       "_reverted_reason": "Robert: blucamon cap should stay low — collection trades at $0.001",
       "_disabled_at": "20260425-170156",
-      "_disabled_reason": "Robert 2026-04-25: bot sold our inventory at low price; offering more = buying back our own losses",
-      "_blacklist_at": "20260425-193808",
-      "_blacklist_reason": "Robert 2026-04-25"
+      "_disabled_reason": "Robert 2026-04-25: bot sold our inventory at low price; offering more = buying back our own losses"
     },
     "0x0a8901b0e25deb55a87524f0cc164e9644020eba": {
       "name": "Pancake Squad",
@@ -2750,14 +2748,11 @@
     },
     "0x9ddc83be1e5254669bdb366941c746a86194d61b": {
       "name": "0x9ddc83be1e52",
-      "max_offer_price": 0.003925,
-      "max_buy_price": 0.003925,
+      "max_offer_price": 0.002158,
+      "max_buy_price": 0.002158,
       "currency": "WBNB",
-      "low_price": 0.004318,
-      "enabled": true,
-      "_target_usdt": 2.5,
-      "_updated_at": "20260425-200726",
-      "_reason": "raise to beat parasite $2.23"
+      "low_price": 0.002374,
+      "enabled": true
     },
     "0xe4a618c7e7ad3fad8e6c76baf12875f6b4a98f9c": {
       "name": "0xe4a618c7e7ad",
@@ -2825,14 +2820,11 @@
     },
     "0xc742d00736deb5d85dd11dba8c31b43b5a581d55": {
       "name": "0xc742d00736de",
-      "max_offer_price": 0.00314,
-      "max_buy_price": 0.00314,
+      "max_offer_price": 0.002338,
+      "max_buy_price": 0.002338,
       "currency": "WBNB",
-      "low_price": 0.003454,
-      "enabled": true,
-      "_target_usdt": 2.0,
-      "_updated_at": "20260425-200726",
-      "_reason": "raise to beat parasite $1.72"
+      "low_price": 0.002572,
+      "enabled": true
     },
     "0x48a3c48b3cf3de00412a53181dc250b68e78318c": {
       "name": "0x48a3c48b3cf3",
@@ -4551,69 +4543,6 @@
       "_added_at": "20260425-185219",
       "_added_reason": "WL audit 2026-04-25: bulk-add WL_BUT_NO_CAP at $0.7 USDT (Robert directive)",
       "okx_slug": "yooshi-family-nft"
-    },
-    "0x102a35917e9f2ff08ffc5dc4fe3e5a400e4f33a7": {
-      "name": "CR7 NFT (BLACKLISTED)",
-      "currency": "USDT",
-      "max_offer_price": 0.001,
-      "max_buy_price": 0.001,
-      "low_price": 0.0011,
-      "enabled": false,
-      "_blacklist_reason": "Robert 2026-04-25: bot was filling above floor here; explicit blacklist",
-      "_added_at": "20260425-191945"
-    },
-    "0xe3b1d32e43ce8d658368e2cbff95d57ef39be8a6": {
-      "name": "Space ID (BLACKLISTED)",
-      "currency": "USDT",
-      "max_offer_price": 0.001,
-      "max_buy_price": 0.001,
-      "low_price": 0.0011,
-      "enabled": false,
-      "_blacklist_reason": "Robert 2026-04-25 — Phase 2 should not hunt here"
-    },
-    "0xdb3a8fb8bacd8ccece587344f3e704abe27f7581": {
-      "name": "Mystery Box Maye Musk",
-      "currency": "USDT",
-      "enabled": true,
-      "max_offer_price": 1.5,
-      "max_buy_price": 1.5,
-      "low_price": 1.65,
-      "_target_usdt": 1.5,
-      "_updated_at": "20260425-201931",
-      "_reason": "parasite top $1.15, raise to outbid"
-    },
-    "0x84eadf01bd0bcd90bd8eed1c610b24be1bc01260": {
-      "name": "Bi·Mech",
-      "currency": "WBNB",
-      "enabled": true,
-      "max_offer_price": 0.017268,
-      "max_buy_price": 0.017268,
-      "low_price": 0.018995,
-      "_target_usdt": 11.0,
-      "_updated_at": "20260425-203605",
-      "_reason": "Robert: raise to $11 to beat parasite $5.71 + clear 20%-guard"
-    },
-    "0x6dfbb01ecb7991366cd8acc4d18dcc67bbe345ba": {
-      "name": "Reefers by CoralApp",
-      "currency": "USDT",
-      "max_offer_price": 1.3,
-      "max_buy_price": 1.3,
-      "low_price": 1.43,
-      "enabled": true,
-      "_added_reason": "Robert 2026-04-25: WL-capture cap raise",
-      "_target_usdt": 1.3,
-      "_added_at": "20260425-210758"
-    },
-    "0xebfbfd7c41b123500fb16b71c43b400c12b08be0": {
-      "name": "Monsta Party",
-      "currency": "USDT",
-      "max_offer_price": 2.8,
-      "max_buy_price": 2.8,
-      "low_price": 3.08,
-      "enabled": true,
-      "_added_reason": "Robert 2026-04-25: WL-capture cap raise",
-      "_target_usdt": 2.8,
-      "_added_at": "20260425-210758"
     }
   }
 }

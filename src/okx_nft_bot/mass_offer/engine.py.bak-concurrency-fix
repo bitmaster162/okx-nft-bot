@@ -215,18 +215,11 @@ class MassOfferEngine:
         dry_run_count = 0
         failed_count = 0
         account = self._load_buyer_account()
+        counter = get_counter(account.address, rpc_url=rpc_url) if selected_targets else 0
         duration_seconds = max(int(resolved_duration_hours * 3600), 1)
         price_wei = to_wei(resolved_price_bnb)
 
         for index, target in enumerate(selected_targets):
-            # Allocate Seaport counter atomically from governor on every iteration.
-            # This serialises with any other engine on the same wallet+chain
-            # (e.g. CounterBidder counter-bids) via SQLite BEGIN IMMEDIATE in
-            # PositionState.allocate_seaport_counter. A local `counter += 1`
-            # would race if two processes are submitting concurrently.
-            counter = self.governor.allocate_seaport_counter(
-                account.address, resolved_chain
-            )
             result = self._submit_target(
                 campaign_id=campaign_id,
                 collection=collection,
@@ -249,6 +242,9 @@ class MassOfferEngine:
                 failed_count += 1
             elif result.status == "blocked":
                 failed_count += 1
+
+            # ── Increment counter for next offer (Seaport requires unique counter per order)
+            counter += 1
 
             if not effective_dry_run and index < len(selected_targets) - 1 and resolved_delay_seconds > 0:
                 self.sleep_fn(resolved_delay_seconds)
@@ -293,8 +289,8 @@ class MassOfferEngine:
         dry_run: bool | None = None,
         quantity: int = 1,
         price_bnb_for_cap: float | None = None,
-    ) -> tuple[bool, str | None]:
-        """Place a single token-level offer.  Used by CounterBidder for BSC undercuts.
+    ) -> bool:
+        """Place a single token-level offer.  Used by ParasiteHunter for BSC undercuts.
 
         Args:
             collection_address: NFT collection contract address.
@@ -313,11 +309,7 @@ class MassOfferEngine:
                 If None, falls back to price_wbnb.
 
         Returns:
-            (ok, detail) — ok=True if submitted (or dry-run recorded);
-            detail=None on success or a human-readable cause string on failure
-            (e.g. governor block reason, api exception). Callers should
-            propagate `detail` into submit_log.reason so operators can see
-            why a submit failed without grepping container logs.
+            True if the offer was submitted (or dry-run recorded) successfully.
         """
         resolved_chain = chain.lower()
         resolved_duration = int(
@@ -356,7 +348,7 @@ class MassOfferEngine:
                 status="dry_run",
                 current_floor=price_wbnb,
             )
-            return True, None
+            return True
 
         # Use BNB-equivalent for daily cap check when currency is not WBNB.
         # Falls back to price_wbnb for backward compatibility (mass_offer campaigns).
@@ -375,7 +367,7 @@ class MassOfferEngine:
                 int_token_id,
                 blocked_reason,
             )
-            return False, blocked_reason
+            return False
 
         # Use OKX high-level create-offer API (same pattern as create-listing)
         try:
@@ -394,7 +386,7 @@ class MassOfferEngine:
                 "place_single_offer FAILED %s token=%s price=%.6f: %s",
                 collection_address[:14], int_token_id, price_wbnb, exc,
             )
-            return False, f"api_exception: {type(exc).__name__}: {exc}"
+            return False
 
         offer_id = result.get("offer_id")
         if offer_id:
@@ -410,13 +402,13 @@ class MassOfferEngine:
                 "place_single_offer SUCCESS %s token=%s price=%.6f offer=%s",
                 collection_address[:14], int_token_id, price_wbnb, offer_id,
             )
-            return True, None
+            return True
         else:
             logger.warning(
                 "place_single_offer FAILED %s token=%s price=%.6f — no offer_id in response",
                 collection_address[:14], int_token_id, price_wbnb,
             )
-            return False, "no_offer_id_in_response"
+            return False
 
     def status(self, *, chain: str = "bsc", limit: int = 5) -> dict[str, Any]:
         resolved_chain = chain.lower()

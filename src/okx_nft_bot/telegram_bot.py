@@ -81,7 +81,7 @@ class TelegramCommandProcessor:
         registry: CollectionRegistry,
         runner: MultiCollectionRunner,
         client: TelegramBotClient,
-        parasite_hunter_loader: Callable[[], object] | None = None,
+        counter_bidder_loader: Callable[[], object] | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -89,8 +89,8 @@ class TelegramCommandProcessor:
         self.runner = runner
         self.client = client
         self.namespace = 'telegram_bot'
-        self.parasite_hunter = None  # set externally by sales_stream or cli
-        self._parasite_hunter_loader = parasite_hunter_loader
+        self.counter_bidder = None  # set externally by sales_stream or cli
+        self._counter_bidder_loader = counter_bidder_loader
 
     def poll_once(self) -> dict[str, int]:
         offset = self._load_offset()
@@ -188,15 +188,15 @@ class TelegramCommandProcessor:
             return self._reset_cursor_command(args)
         if command == '/sales':
             return self._sales_stats_text()
-        if command == '/parasitesales':
+        if command == '/rivalsales':
             limit = int(args[0]) if args and args[0].isdigit() else 10
-            return self._parasite_sales_text(limit=limit)
-        if command == '/parasite':
-            return self._parasite_status_text()
-        if command == '/parasitescan':
-            return self._parasite_scan_command()
-        if command == '/parasitelive':
-            return self._parasite_live_toggle(args)
+            return self._rival_sales_text(limit=limit)
+        if command == '/rival':
+            return self._rival_status_text()
+        if command == '/rivalscan':
+            return self._rival_scan_command()
+        if command == '/rivallive':
+            return self._rival_live_toggle(args)
         if command == '/health':
             return self._health_text()
         if command == '/writemetrics':
@@ -223,19 +223,19 @@ class TelegramCommandProcessor:
             return self._restore_command(args)
         return 'Unknown command. Use /help'
 
-    def _get_parasite_hunter(self):
-        if self.parasite_hunter is not None:
-            return self.parasite_hunter
-        if self._parasite_hunter_loader is None:
+    def _get_counter_bidder(self):
+        if self.counter_bidder is not None:
+            return self.counter_bidder
+        if self._counter_bidder_loader is None:
             return None
         try:
-            self.parasite_hunter = self._parasite_hunter_loader()
+            self.counter_bidder = self._counter_bidder_loader()
         except Exception as exc:
-            logger.warning("ParasiteHunter lazy init failed: %s", exc)
-            self._parasite_hunter_loader = None
+            logger.warning("CounterBidder lazy init failed: %s", exc)
+            self._counter_bidder_loader = None
             return None
-        self._parasite_hunter_loader = None
-        return self.parasite_hunter
+        self._counter_bidder_loader = None
+        return self.counter_bidder
 
     def _help_text(self) -> str:
         return (
@@ -243,7 +243,7 @@ class TelegramCommandProcessor:
             '/status - bot status\n'
             '/collections - active registry\n'
             '/offers <okx|opensea> [collection_or_slug] [limit] - stored offers by market\n'
-            '/counterrun <collection> - dry-run parasite scan for one execution collection\n'
+            '/counterrun <collection> - dry-run rival scan for one execution collection\n'
             '/counterconfig <collection> <min_price> <max_price> [margin] - save execution config\n'
             '/massoffer <collection> <price> [rarity_filter] - run unlisted-only per-item offers\n'
             '/massofferstatus - show latest mass-offer campaigns\n'
@@ -258,10 +258,10 @@ class TelegramCommandProcessor:
             '/rankings [limit] - collection ranking\n'
             '/sendalerts [min_pct] [limit] - deliver analytics report\n'
             '/sales - sales stream stats (all markets)\n'
-            '/parasitesales [n] - recent parasite-involved sales\n'
-            '/parasite - parasite hunter status & last scan\n'
-            '/parasitescan - trigger immediate parasite scan\n'
-            '/parasitelive on|off - toggle DRY_RUN/LIVE mode\n'
+            '/rivalsales [n] - recent rival-involved sales\n'
+            '/rival - rival scanner status & last scan\n'
+            '/rivalscan - trigger immediate rival scan\n'
+            '/rivallive on|off - toggle DRY_RUN/LIVE mode\n'
             '/latest [n] - latest stored events\n'
             '/run <collection|all> [trades|listings] - trigger cycle\n'
             '/resetcursor <collection> [trades|listings] - clear cursor\n'
@@ -512,8 +512,8 @@ class TelegramCommandProcessor:
         hourly = state.get_hourly_submit_count(now=now, chain=self.settings.execution_chain)
         active_count = len(state.get_active_offers(chain=self.settings.execution_chain))
         tracked_count = state.get_tracked_collections_count(chain=self.settings.execution_chain)
-        parasites = self._parasite_detected_count()
-        parasites_text = str(parasites) if parasites is not None else 'N/A'
+        rivals = self._rival_detected_count()
+        rivals_text = str(rivals) if rivals is not None else 'N/A'
         reconcile_at = runtime.get('last_reconcile_at', 'never')
         if arm_state['armed']:
             arm_text = f"yes ({arm_state['minutes_remaining']}m left)"
@@ -537,7 +537,7 @@ class TelegramCommandProcessor:
             f'Reconciled:    {reconcile_at}\n'
             '------------------\n'
             f'Collections:   {tracked_count} tracked\n'
-            f'Parasites:     {parasites_text} detected'
+            f'Rivals:     {rivals_text} detected'
         )
 
     def _arm_live_command(self, args: list[str]) -> str:
@@ -706,10 +706,10 @@ class TelegramCommandProcessor:
             f'zombies={len(failed)} (marked killswitch_failed, need manual cancel)'
         )
 
-    def _parasite_detected_count(self) -> int | None:
-        if not self.settings.parasite_wallets:
+    def _rival_detected_count(self) -> int | None:
+        if not self.settings.rival_wallets:
             return None
-        makers = [wallet.lower() for wallet in self.settings.parasite_wallets if wallet]
+        makers = [wallet.lower() for wallet in self.settings.rival_wallets if wallet]
         if not makers:
             return None
         placeholders = ','.join('?' for _ in makers)
@@ -727,7 +727,7 @@ class TelegramCommandProcessor:
                     ['okx', self.settings.execution_chain.lower(), *makers],
                 ).fetchone()
         except sqlite3.OperationalError as exc:
-            logger.warning("Dashboard parasite count unavailable: %s", exc)
+            logger.warning("Dashboard rival count unavailable: %s", exc)
             return None
         return int(row[0] or 0) if row is not None else 0
 
@@ -738,12 +738,12 @@ class TelegramCommandProcessor:
             f'collection={task.collection}',
             f'chain={task.chain}',
             f'valid={task.valid}',
-            f'parasite_offer_bnb={task.parasite_offer_bnb:.6f}',
+            f'rival_offer_bnb={task.rival_offer_bnb:.6f}',
             f'counter_price_bnb={task.counter_price_bnb:.6f}',
             f'reason={task.reason}',
         ]
-        if task.parasite_maker:
-            lines.append(f'parasite_maker={task.parasite_maker}')
+        if task.rival_maker:
+            lines.append(f'rival_maker={task.rival_maker}')
         if task.error:
             lines.append(f'error={task.error}')
         return '\n'.join(lines)
@@ -976,14 +976,14 @@ class TelegramCommandProcessor:
             lines.append(f'Total sales: {s["total_sales"]}')
             for market, count in s.get('by_market', {}).items():
                 lines.append(f'  {market.upper()}: {count}')
-            lines.append(f'Parasite-involved: {s.get("parasite_involved", 0)}')
+            lines.append(f'Rival-involved: {s.get("rival_involved", 0)}')
             for market, ts in s.get('latest_by_market', {}).items():
                 lines.append(f'  Latest {market.upper()}: {ts}')
             return '\n'.join(lines)
         except Exception as exc:
             return f'Sales stats error: {exc}'
 
-    def _parasite_sales_text(self, *, limit: int = 10) -> str:
+    def _rival_sales_text(self, *, limit: int = 10) -> str:
         try:
             from okx_nft_bot.sales_stream import SalesDatabase
             import os as _os
@@ -991,30 +991,30 @@ class TelegramCommandProcessor:
             with db._connect() as conn:
                 rows = conn.execute(
                     'SELECT collection_name, price, currency, chain, trade_type, ts '
-                    'FROM sales WHERE is_parasite_buyer=1 OR is_parasite_seller=1 '
+                    'FROM sales WHERE is_rival_buyer=1 OR is_rival_seller=1 '
                     'ORDER BY ts DESC LIMIT ?', (limit,)
                 ).fetchall()
             if not rows:
-                return 'No parasite sales found'
-            lines = [f'🔴 Parasite sales (last {limit}):']
+                return 'No rival sales found'
+            lines = [f'🔴 Rival sales (last {limit}):']
             for r in rows:
                 name, price, cur, chain, ttype, ts = r
                 lines.append(f'  {name[:25]} | {price:.4f} {cur} | {chain} | {ttype} | {ts}')
             return '\n'.join(lines)
         except Exception as exc:
-            return f'Parasite sales error: {exc}'
+            return f'Rival sales error: {exc}'
 
-    def _parasite_status_text(self) -> str:
-        """Return parasite hunter status for /parasite command."""
-        hunter = self._get_parasite_hunter()
-        if not hunter:
-            return '🎯 ParasiteHunter: not initialized'
+    def _rival_status_text(self) -> str:
+        """Return rival scanner status for /rival command."""
+        scanner = self._get_counter_bidder()
+        if not scanner:
+            return '🎯 CounterBidder: not initialized'
         try:
-            status = hunter.get_status()
+            status = scanner.get_status()
             mode = 'DRY RUN' if status['dry_run'] else 'LIVE'
             enabled = '✅' if status['enabled'] else '❌'
             lines = [
-                f'🎯 ParasiteHunter v4 {enabled} ({mode})',
+                f'🎯 CounterBidder v4 {enabled} ({mode})',
                 f'Targets: {status["target_wallets"]} wallets',
                 f'Scans: {status["total_scans"]}',
                 f'Already winning: {status["already_winning"]}',
@@ -1031,19 +1031,19 @@ class TelegramCommandProcessor:
                              f'{scan["duration_sec"]:.1f}s')
             return '\n'.join(lines)
         except Exception as exc:
-            return f'ParasiteHunter status error: {exc}'
+            return f'CounterBidder status error: {exc}'
 
-    def _parasite_scan_command(self) -> str:
-        """Trigger immediate parasite scan via /parasitescan."""
-        hunter = self._get_parasite_hunter()
-        if not hunter:
-            return '🎯 ParasiteHunter: not initialized'
-        if not hunter.enabled:
-            return '🎯 ParasiteHunter: disabled (set PARASITE_HUNTER_ENABLED=1)'
+    def _rival_scan_command(self) -> str:
+        """Trigger immediate rival scan via /rivalscan."""
+        scanner = self._get_counter_bidder()
+        if not scanner:
+            return '🎯 CounterBidder: not initialized'
+        if not scanner.enabled:
+            return '🎯 CounterBidder: disabled (set COUNTERBID_ENABLED=1)'
         try:
-            report = hunter.scan_wallet()
-            hunter.last_report = report
-            hunter.total_scans += 1
+            report = scanner.scan_wallet()
+            scanner.last_report = report
+            scanner.total_scans += 1
             return (
                 f'🎯 Scan complete in {report.scan_duration_sec:.1f}s\n'
                 f'WL: {report.wl_offers_found} offers, {report.wl_undercuts_placed} undercuts\n'
@@ -1053,33 +1053,33 @@ class TelegramCommandProcessor:
         except Exception as exc:
             return f'Scan failed: {exc}'
 
-    def _parasite_live_toggle(self, args: list[str]) -> str:
-        """Toggle DRY_RUN/LIVE mode via /parasitelive on|off.
+    def _rival_live_toggle(self, args: list[str]) -> str:
+        """Toggle DRY_RUN/LIVE mode via /rivallive on|off.
 
         Going LIVE now respects the execution governor: force_dry_run
         and killswitch_failed offers block the switch.
         """
-        hunter = self._get_parasite_hunter()
-        if not hunter:
-            return '🎯 ParasiteHunter: not initialized'
+        scanner = self._get_counter_bidder()
+        if not scanner:
+            return '🎯 CounterBidder: not initialized'
         arg = (args[0].strip().lower() if args else "")
         if arg == 'on':
-            hunter.dry_run = True
+            scanner.dry_run = True
             return (
-                '🎯 BLOCKED: ParasiteHunter live mode is deprecated and stays DRY-RUN.\n'
+                '🎯 BLOCKED: CounterBidder live mode is deprecated and stays DRY-RUN.\n'
                 'Use okx-nft-exec / counterbid / undercutter for guarded live execution.'
             )
         elif arg == 'off':
-            hunter.dry_run = True
-            return '🎯 ParasiteHunter: DRY RUN mode (safe)'
+            scanner.dry_run = True
+            return '🎯 CounterBidder: DRY RUN mode (safe)'
         else:
-            mode = 'LIVE' if not hunter.dry_run else 'DRY RUN'
+            mode = 'LIVE' if not scanner.dry_run else 'DRY RUN'
             force_dry = ''
             try:
                 state = PositionState(self.settings.execution_db_path)
                 if state.is_force_dry_run():
                     force_dry = '\nforce_dry_run=ON (governor override)'
             except Exception as exc:
-                logger.warning("ParasiteHunter mode status lookup failed: %s", exc)
-            return f'🎯 Current mode: {mode}{force_dry}\nUsage: /parasitelive on|off'
+                logger.warning("CounterBidder mode status lookup failed: %s", exc)
+            return f'🎯 Current mode: {mode}{force_dry}\nUsage: /rivallive on|off'
    

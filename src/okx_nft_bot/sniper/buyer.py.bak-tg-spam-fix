@@ -591,13 +591,6 @@ class OKXInstantBuyer:
         if not self.tg_token or not self.tg_chat:
             return
 
-        # Skip TG for in-memory dedup short-circuits: _failed_orders cache
-        # re-emits the same "already failed (stale/unavailable)" error every
-        # cycle the zombie listing is re-discovered; we still log it but don't
-        # spam Telegram with duplicates.
-        if attempt.error and "already failed (stale" in attempt.error:
-            return
-
         chain_cfg = CHAIN_CONFIG.get(attempt.chain, {})
         explorer = chain_cfg.get("explorer", "")
 

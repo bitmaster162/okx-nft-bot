@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Execution Daemon — runs undercutter + parasite hunter continuously.
+Execution Daemon — runs undercutter + rival scanner continuously.
 
 Runs as a third Docker container alongside okx-nft-bot (idle scheduler)
 and okx-nft-bot-telegram (TG commands).
 
 Cycle:
-  1. Parasite Hunter scan (WL capture + parasite undercut + missclick check)
+  1. Rival Scanner scan (WL capture + rival undercut + missclick check)
   2. Undercutter cycle (manage own listings/offers)
   3. Sleep SCAN_INTERVAL seconds
   4. Repeat
@@ -14,7 +14,7 @@ Cycle:
 Env vars (from .env):
   EXECUTION_DAEMON_ENABLED=1
   EXECUTION_SCAN_INTERVAL=300  # seconds between full cycles
-  PARASITE_HUNTER_ENABLED=1
+  COUNTERBID_ENABLED=1
   UNDERCUTTER_ENABLED=1
   DRY_RUN=0
 """
@@ -52,7 +52,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def main():
     scan_interval = int(os.getenv("EXECUTION_SCAN_INTERVAL", "300"))
-    parasite_enabled = _env_bool("PARASITE_HUNTER_ENABLED", True)
+    rival_enabled = _env_bool("COUNTERBID_ENABLED", True)
     undercut_enabled = _env_bool("UNDERCUTTER_ENABLED", True)
     daemon_enabled = _env_bool("EXECUTION_DAEMON_ENABLED", True)
 
@@ -61,7 +61,7 @@ def main():
         sys.exit(0)
 
     log.info("=== Execution Daemon starting ===")
-    log.info(f"Scan interval: {scan_interval}s, Parasite: {parasite_enabled}, "
+    log.info(f"Scan interval: {scan_interval}s, Rival: {rival_enabled}, "
              f"Undercutter: {undercut_enabled}")
 
     # Lazy imports — heavy deps, only load what's needed
@@ -70,11 +70,11 @@ def main():
     from okx_nft_bot.config import load_settings
     settings = load_settings()
 
-    # Init parasite hunter (needs binance_whitelist + buy_config)
-    hunter = None
-    if parasite_enabled:
+    # Init rival scanner (needs binance_whitelist + buy_config)
+    scanner = None
+    if rival_enabled:
         try:
-            from okx_nft_bot.sniper.parasite_hunter import ParasiteHunter
+            from okx_nft_bot.sniper.counter_bidder import CounterBidder
 
             wl_path = Path(os.getenv("BINANCE_WHITELIST_PATH", "./data/binance_whitelist.json"))
             buy_path = Path(os.getenv("BUY_CONFIG_PATH", "./config/buy_config.json"))
@@ -85,11 +85,11 @@ def main():
                       for item in wl_data if item.get("contract_address")}
             buy_cfg = _json.loads(buy_path.read_text()) if buy_path.exists() else {}
 
-            hunter = ParasiteHunter(wl, buy_cfg)
-            log.info(f"ParasiteHunter initialized: dry_run={hunter.dry_run}, "
-                     f"chains={hunter.chains}, wl={len(wl)} collections")
+            scanner = CounterBidder(wl, buy_cfg)
+            log.info(f"CounterBidder initialized: dry_run={scanner.dry_run}, "
+                     f"chains={scanner.chains}, wl={len(wl)} collections")
         except Exception as e:
-            log.error(f"Failed to init ParasiteHunter: {e}", exc_info=True)
+            log.error(f"Failed to init CounterBidder: {e}", exc_info=True)
 
     # Init undercutter
     undercut_engine = None
@@ -107,17 +107,17 @@ def main():
         t0 = time.time()
         log.info(f"--- Execution cycle {cycle} ---")
 
-        # Phase 1: Parasite Hunter
-        if hunter:
+        # Phase 1: Rival Scanner
+        if scanner:
             try:
-                log.info("[PARASITE] Starting scan...")
-                report = hunter.scan_wallet()
-                log.info(f"[PARASITE] Scan complete: "
+                log.info("[RIVAL] Starting scan...")
+                report = scanner.scan_wallet()
+                log.info(f"[RIVAL] Scan complete: "
                          f"collections_scanned={getattr(report, 'collections_scanned', '?')}, "
                          f"offers_placed={getattr(report, 'offers_placed', '?')}, "
                          f"offers_skipped={getattr(report, 'offers_skipped', '?')}")
             except Exception as e:
-                log.error(f"[PARASITE] Scan failed: {e}")
+                log.error(f"[RIVAL] Scan failed: {e}")
 
         # Phase 2: Undercutter
         if undercut_engine:

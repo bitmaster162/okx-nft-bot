@@ -20,7 +20,7 @@ from okx_nft_bot.config import Settings
 from okx_nft_bot.wei_utils import to_wei
 
 CHAIN_ID = 56
-# Seaport 1.6 on BSC — used by OKX marketplace (protocolAddress from live parasite offers)
+# Seaport 1.6 on BSC — used by OKX marketplace (protocolAddress from live rival offers)
 SEAPORT_ADDRESS = "0x0000000000000068F116a894984e2DB1123eB395"
 WBNB_ADDRESS = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 # OKX conduit key — from live offers on OKX marketplace

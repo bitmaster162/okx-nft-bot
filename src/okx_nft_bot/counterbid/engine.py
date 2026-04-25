@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 class CounterBidTask:
     collection: str
     chain: str
-    parasite_offer_bnb: float
+    rival_offer_bnb: float
     counter_price_bnb: float
     reason: str
     valid: bool
     error: str | None = None
-    parasite_maker: str | None = None
+    rival_maker: str | None = None
     preview_payload: dict[str, Any] | None = None
     action_type: str = "SCAN"
     submit_result: dict[str, Any] | None = None
@@ -73,25 +73,25 @@ class CounterBidder:
         self.okx = okx_client or OKXAPIClient(settings=settings)
         self.state = PositionState(settings.execution_db_path)
         self.governor = ExecutionGovernor(settings=settings, state=self.state, api_client=self.okx)
-        self.parasite_wallets = {wallet.lower() for wallet in settings.parasite_wallets}
+        self.rival_wallets = {wallet.lower() for wallet in settings.rival_wallets}
 
-    def detect_parasite_offers(self, offers: list[NormalizedOffer]) -> NormalizedOffer | None:
-        parasite_offers = [offer for offer in offers if (offer.maker or "").lower() in self.parasite_wallets]
-        if not parasite_offers:
+    def detect_rival_offers(self, offers: list[NormalizedOffer]) -> NormalizedOffer | None:
+        rival_offers = [offer for offer in offers if (offer.maker or "").lower() in self.rival_wallets]
+        if not rival_offers:
             return None
-        return max(parasite_offers, key=lambda offer: float(offer.price or 0.0))
+        return max(rival_offers, key=lambda offer: float(offer.price or 0.0))
 
     def calculate_counter_price(
         self,
         collection_config: CollectionConfig,
-        parasite_offer_bnb: float,
+        rival_offer_bnb: float,
     ) -> tuple[float, str]:
-        if parasite_offer_bnb > 0:
-            proposed = parasite_offer_bnb + collection_config.margin_bnb
-            reason = f"Parasite {parasite_offer_bnb:.6f} + margin {collection_config.margin_bnb:.6f}"
+        if rival_offer_bnb > 0:
+            proposed = rival_offer_bnb + collection_config.margin_bnb
+            reason = f"Rival {rival_offer_bnb:.6f} + margin {collection_config.margin_bnb:.6f}"
         else:
             proposed = collection_config.min_price_bnb
-            reason = f"No parasite; min price {collection_config.min_price_bnb:.6f}"
+            reason = f"No rival; min price {collection_config.min_price_bnb:.6f}"
 
         if proposed < collection_config.min_price_bnb:
             proposed = collection_config.min_price_bnb
@@ -105,14 +105,14 @@ class CounterBidder:
         self,
         collection_config: CollectionConfig,
         counter_price_bnb: float,
-        parasite_offer_bnb: float,
+        rival_offer_bnb: float,
     ) -> tuple[bool, str | None]:
         if counter_price_bnb < collection_config.min_price_bnb:
             return False, f"Counter price {counter_price_bnb:.6f} < min {collection_config.min_price_bnb:.6f}"
         if counter_price_bnb > collection_config.max_price_bnb:
             return False, f"Counter price {counter_price_bnb:.6f} > max {collection_config.max_price_bnb:.6f}"
-        if parasite_offer_bnb > 0 and counter_price_bnb <= parasite_offer_bnb:
-            return False, f"Counter {counter_price_bnb:.6f} not above parasite {parasite_offer_bnb:.6f}"
+        if rival_offer_bnb > 0 and counter_price_bnb <= rival_offer_bnb:
+            return False, f"Counter {counter_price_bnb:.6f} not above rival {rival_offer_bnb:.6f}"
         return True, None
 
     def build_signed_counter_bid(self, *, collection: str, price_bnb: float, chain: str) -> dict[str, Any]:
@@ -139,7 +139,7 @@ class CounterBidder:
                 CounterBidTask(
                     collection=collection_address,
                     chain=resolved_chain,
-                    parasite_offer_bnb=0.0,
+                    rival_offer_bnb=0.0,
                     counter_price_bnb=0.0,
                     reason="No config",
                     valid=False,
@@ -152,7 +152,7 @@ class CounterBidder:
                 CounterBidTask(
                     collection=cfg.address,
                     chain=resolved_chain,
-                    parasite_offer_bnb=0.0,
+                    rival_offer_bnb=0.0,
                     counter_price_bnb=0.0,
                     reason="Disabled",
                     valid=False,
@@ -180,7 +180,7 @@ class CounterBidder:
                 CounterBidTask(
                     collection=cfg.address,
                     chain=resolved_chain,
-                    parasite_offer_bnb=0.0,
+                    rival_offer_bnb=0.0,
                     counter_price_bnb=0.0,
                     reason="Fetch failed",
                     valid=False,
@@ -189,10 +189,10 @@ class CounterBidder:
                 refresh_result,
             )
 
-        parasite_offer = self.detect_parasite_offers(offers)
-        parasite_price_bnb = float(parasite_offer.price or 0.0) if parasite_offer else 0.0
-        counter_price_bnb, reason = self.calculate_counter_price(cfg, parasite_price_bnb)
-        is_valid, error = self.validate_counter_bid(cfg, counter_price_bnb, parasite_price_bnb)
+        rival_offer = self.detect_rival_offers(offers)
+        rival_price_bnb = float(rival_offer.price or 0.0) if rival_offer else 0.0
+        counter_price_bnb, reason = self.calculate_counter_price(cfg, rival_price_bnb)
+        is_valid, error = self.validate_counter_bid(cfg, counter_price_bnb, rival_price_bnb)
 
         preview_payload: dict[str, Any] | None = None
         submit_result: dict[str, Any] | None = None
@@ -217,7 +217,7 @@ class CounterBidder:
                         chain=resolved_chain,
                         price_bnb=counter_price_bnb,
                         status="active",
-                        current_floor=parasite_price_bnb if parasite_price_bnb > 0 else None,
+                        current_floor=rival_price_bnb if rival_price_bnb > 0 else None,
                         preview_payload=preview_payload,
                     )
                 else:
@@ -260,7 +260,7 @@ class CounterBidder:
                             chain=resolved_chain,
                             price_bnb=counter_price_bnb,
                             status="active",
-                            current_floor=parasite_price_bnb if parasite_price_bnb > 0 else None,
+                            current_floor=rival_price_bnb if rival_price_bnb > 0 else None,
                             preview_payload=preview_payload,
                         )
                         self.state.record_submit_event(
@@ -297,12 +297,12 @@ class CounterBidder:
         task = CounterBidTask(
             collection=cfg.address,
             chain=resolved_chain,
-            parasite_offer_bnb=parasite_price_bnb,
+            rival_offer_bnb=rival_price_bnb,
             counter_price_bnb=counter_price_bnb,
             reason=reason,
             valid=is_valid,
             error=error,
-            parasite_maker=(parasite_offer.maker if parasite_offer else None),
+            rival_maker=(rival_offer.maker if rival_offer else None),
             preview_payload=preview_payload,
             action_type=action_type,
             submit_result=submit_result,
@@ -362,7 +362,7 @@ class CounterBidder:
             "forced_dry_run": self.state.is_force_dry_run(),
             "live_arm": self.governor.get_live_arm_state(now=datetime.now(timezone.utc)),
             "integrity": integrity,
-            "parasite_wallets": sorted(self.parasite_wallets),
+            "rival_wallets": sorted(self.rival_wallets),
             "collections": [asdict(config) for config in self.config.list_collections(chain=resolved_chain)],
             "rate_limits": {
                 **rate_limits,

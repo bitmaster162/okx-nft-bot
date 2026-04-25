@@ -178,7 +178,7 @@ class OKXAPIClient:
 
     @classmethod
     def register_project_id(cls, collection_address: str, chain: str, project_id: str | int) -> None:
-        """Cache a known address → project ID mapping (call from counter_bidder during scanning)."""
+        """Cache a known address → project ID mapping (call from parasite_hunter during scanning)."""
         key = (chain.lower(), collection_address.lower())
         pid = str(project_id)
         if pid and pid.isdigit() and pid != "0":
@@ -1062,10 +1062,7 @@ class OKXAPIClient:
         account = Account.from_key(private_key)
         max_uint256 = 2**256 - 1
 
-        # RISK-1: atomic nonce allocation via ExecutionGovernor
-        from okx_nft_bot.execution_governor import ExecutionGovernor
-        _governor = ExecutionGovernor(settings=self.settings)
-        nonce = _governor.allocate_nonce(account.address, chain_name)
+        nonce = w3.eth.get_transaction_count(account.address)
         gas_price = w3.eth.gas_price
 
         tx = token_contract.functions.approve(
@@ -1122,10 +1119,7 @@ class OKXAPIClient:
             abi=nft_abi,
         )
         account = Account.from_key(private_key)
-        # RISK-1: atomic nonce allocation via ExecutionGovernor
-        from okx_nft_bot.execution_governor import ExecutionGovernor
-        _governor = ExecutionGovernor(settings=self.settings)
-        nonce = _governor.allocate_nonce(account.address, chain_name)
+        nonce = w3.eth.get_transaction_count(account.address)
         gas_price = w3.eth.gas_price
 
         tx = nft_contract.functions.setApprovalForAll(
@@ -1393,13 +1387,6 @@ class OKXAPIClient:
             "type": "function",
         },
         {
-            "inputs": [],
-            "name": "incrementCounter",
-            "outputs": [{"name": "newCounter", "type": "uint256"}],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
             "inputs": [{"name": "offerer", "type": "address"}],
             "name": "getCounter",
             "outputs": [{"name": "counter", "type": "uint256"}],
@@ -1444,23 +1431,11 @@ class OKXAPIClient:
                 abi=self._SEAPORT_CANCEL_ABI,
             )
 
-            # Use the counter the order was SIGNED with (from protocolData);
-            # falling back to the current on-chain counter only if missing.
-            # Seaport.cancel() derives orderHash from order.counter directly, so
-            # using the current counter here silently targets the wrong hash when
-            # the wallet's counter has been bumped since signing (CRITICAL bug).
-            params = order_params
-            signed_counter_raw = params.get("counter")
-            if signed_counter_raw is None:
-                counter = seaport.functions.getCounter(account.address).call()
-                log.warning(
-                    "_cancel_onchain: protocolData missing counter — "
-                    "falling back to current on-chain counter %d",
-                    counter,
-                )
-            else:
-                counter = int(signed_counter_raw)
+            # Get current counter
+            counter = seaport.functions.getCounter(account.address).call()
 
+            # Build OrderComponents from protocolData.parameters
+            params = order_params
             order_components = {
                 "offerer": Web3.to_checksum_address(params["offerer"]),
                 "zone": Web3.to_checksum_address(params.get("zone", "0x" + "0" * 40)),
@@ -1528,109 +1503,6 @@ class OKXAPIClient:
 
         except Exception as exc:
             log.error("_cancel_onchain: failed: %s", exc)
-            return False
-
-    def cancel_all_via_counter(self, chain: str = "bsc") -> bool:
-        """Batch-cancel ALL our live Seaport orders for (wallet, chain) in ONE tx.
-
-        Calls incrementCounter() on the Seaport contract — this invalidates
-        every order signed with the current counter value. Cost: ~40-45k gas,
-        regardless of how many orders get nuked. Use when there are >=2
-        orders to cancel — the flat cost beats per-order cancel() at 56k each.
-
-        CAVEAT: nuclear across collections. Any live order signed by this
-        wallet (on this chain) becomes unfillable. Only call when the scan
-        is about to re-post everything, or when you genuinely want to clear
-        the slate.
-        """
-        return self._bump_counter_onchain(chain)
-
-    def _bump_counter_onchain(self, chain: str) -> bool:
-        """Low-level: send Seaport.incrementCounter() tx on the given chain."""
-        try:
-            from web3 import Web3
-            from eth_account import Account
-        except ImportError:
-            log.error("_bump_counter_onchain: web3 or eth_account not installed")
-            return False
-
-        private_key = self.settings.buyer_wallet_private_key
-        if not private_key:
-            log.error("_bump_counter_onchain: no private key")
-            return False
-
-        chain_lower = chain.lower()
-        seaport_addr = self._SEAPORT_ADDRESSES.get(chain_lower)
-        try:
-            rpc_url = self._primary_rpc(chain_lower)
-        except RuntimeError:
-            rpc_url = None
-        if not seaport_addr or not rpc_url:
-            log.error("_bump_counter_onchain: unsupported chain %s", chain)
-            return False
-
-        try:
-            account = Account.from_key(private_key)
-            w3 = Web3(Web3.HTTPProvider(rpc_url))
-            if not w3.is_connected():
-                log.error("_bump_counter_onchain: cannot connect to %s RPC", chain)
-                return False
-
-            seaport = w3.eth.contract(
-                address=Web3.to_checksum_address(seaport_addr),
-                abi=self._SEAPORT_CANCEL_ABI,
-            )
-            old_counter = seaport.functions.getCounter(account.address).call()
-            # RISK-1: atomic nonce allocation via ExecutionGovernor
-            from okx_nft_bot.execution_governor import ExecutionGovernor
-            governor = ExecutionGovernor(settings=self.settings)
-            nonce = governor.allocate_nonce(account.address, chain_lower)
-            tx = seaport.functions.incrementCounter().build_transaction({
-                "from": account.address,
-                "nonce": nonce,
-                "gasPrice": w3.eth.gas_price,
-                "chainId": w3.eth.chain_id,
-            })
-            try:
-                gas_estimate = w3.eth.estimate_gas(tx)
-                tx["gas"] = int(gas_estimate * 1.3)
-            except Exception:
-                tx["gas"] = 80_000  # incrementCounter is typically ~40-45k + headroom
-
-            signed_tx = account.sign_transaction(tx)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            log.info(
-                "_bump_counter_onchain: TX sent %s (gas=%d) — nuking all orders at counter=%d on %s",
-                tx_hash.hex()[:16], tx["gas"], old_counter, chain,
-            )
-
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=45)
-            if receipt.get("status") == 1:
-                log.info(
-                    "bump_counter: SUCCESS on-chain TX=%s gas=%d — batch-cancelled all live orders",
-                    tx_hash.hex()[:16], receipt.get("gasUsed", 0),
-                )
-                self._last_onchain_cancel_ts = time.time()
-                # Force Seaport counter cache to resync on next allocation —
-                # on-chain counter just jumped, stale DB value would cause
-                # signatures to be invalid until 60s resync window elapses.
-                try:
-                    import sqlite3 as _sql
-                    with _sql.connect(governor.state.db_path, timeout=10) as _c:
-                        _c.execute(
-                            "UPDATE seaport_counter SET last_synced_at = ? "
-                            "WHERE wallet = ? AND chain = ?",
-                            ("1970-01-01T00:00:00+00:00",
-                             account.address.lower(), chain_lower),
-                        )
-                        _c.commit()
-                except Exception as _e:
-                    log.warning("bump_counter: failed to invalidate counter cache: %s", _e)
-                return True
-            log.error("_bump_counter_onchain: TX REVERTED %s", tx_hash.hex()[:16])
-            return False
-        except Exception as exc:
-            log.error("_bump_counter_onchain: failed: %s", exc)
             return False
 
     def create_listing(
