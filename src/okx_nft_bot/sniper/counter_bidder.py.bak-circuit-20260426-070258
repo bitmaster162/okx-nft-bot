@@ -2492,37 +2492,6 @@ class CounterBidder:
         except Exception:
             return None
 
-    def _circuit_breaker_check(self, collection_address: str) -> tuple[bool, str]:
-        """Check if collection is in circuit-breaker mode (5+ consecutive no_offer_id fails in last hour).
-        Returns (skip, reason)."""
-        try:
-            import sqlite3
-            from okx_nft_bot.config import load_settings
-            settings = load_settings()
-            db_path = getattr(settings, "execution_db_path", "data/execution.sqlite3")
-            con = sqlite3.connect(db_path)
-            cur = con.cursor()
-            # Get last 10 submits for this collection in last hour
-            cur.execute("""SELECT status, reason FROM execution_submit_log
-                WHERE collection=? AND created_at > datetime('now','-1 hour')
-                ORDER BY id DESC LIMIT 10""", (collection_address.lower(),))
-            rows = cur.fetchall()
-            con.close()
-            if not rows:
-                return (False, "")
-            # Count consecutive no_offer_id from most recent
-            consec = 0
-            for status, reason in rows:
-                if reason and "no_offer_id" in reason:
-                    consec += 1
-                else:
-                    break  # non-no_offer_id breaks streak
-            if consec >= 5:
-                return (True, f"circuit_breaker:{consec} consecutive no_offer_id")
-            return (False, "")
-        except Exception:
-            return (False, "")
-
     def _check_okx_quota(self, threshold: int = 25) -> tuple[bool, int]:
         """Returns (under_threshold, current_in_flight).
         OKX silently drops new offers once active+exchange_missing exceeds ~30-40.
@@ -2986,18 +2955,9 @@ class CounterBidder:
                     quantity: int = 1, duration_hours: int = 720) -> bool:
         """Submit BSC offers through the governed execution path."""
         try:
-            # ── PATCH 2026-04-26: Circuit breaker for no_offer_id collections ──
-            _cb_skip, _cb_reason = self._circuit_breaker_check(collection_address)
-            if _cb_skip:
-                log.warning("BSC submit BLOCKED %s: %s — saving rate limit slot",
-                            collection_address[:14], _cb_reason)
-                self._record_execution_submit_event(
-                    chain="bsc", collection=collection_address, price_bnb=price,
-                    status="blocked", reason=_cb_reason,
-                )
-                return False
-            
             # ── PATCH 2026-04-26: OKX quota guard ──
+            # Prevent silent drift by blocking submits when in-flight >= threshold.
+            # Threshold: COUNTERBID_QUOTA_THRESHOLD env (default 25).
             _quota_threshold = _env_int("COUNTERBID_QUOTA_THRESHOLD", 25)
             _quota_ok, _in_flight = self._check_okx_quota(_quota_threshold)
             if not _quota_ok:
