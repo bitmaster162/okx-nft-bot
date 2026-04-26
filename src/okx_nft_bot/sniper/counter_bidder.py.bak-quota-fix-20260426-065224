@@ -2505,9 +2505,7 @@ class CounterBidder:
             db_path = getattr(settings, "execution_db_path", "data/execution.sqlite3")
             con = sqlite3.connect(db_path)
             cur = con.cursor()
-            # FIX 2026-04-26: count only 'active' — exchange_missing already drifted,
-            # they don't consume actual OKX quota. Otherwise guard locks bot forever.
-            cur.execute("SELECT COUNT(*) FROM active_offers WHERE status='active'")
+            cur.execute("SELECT COUNT(*) FROM active_offers WHERE status IN ('active','exchange_missing')")
             n = cur.fetchone()[0]
             con.close()
             return (n < threshold, n)
