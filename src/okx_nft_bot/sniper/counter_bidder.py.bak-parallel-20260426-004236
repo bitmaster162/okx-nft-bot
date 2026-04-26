@@ -41,7 +41,6 @@ import re as _re
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -622,46 +621,17 @@ class CounterBidder:
             log.info("📋 %s: %d WL collections to scan", chain.upper(), len(wl_addrs_chain))
 
             wl_rival_offers: list[RivalOffer] = []
-            
-            # ── β 0.2 Feature 3: PARALLEL FETCH 2026-04-26 ──
-            # Phase 1 fetch was sequential (152 calls × 300ms = 45s+). Parallelize
-            # the FETCH stage with ThreadPoolExecutor. Processing stays sequential
-            # to avoid race conditions on shared state (already_winning, etc.)
-            _parallel_workers = _env_int("COUNTERBID_PHASE1_WORKERS", 5)
-            _eligible_addrs: list[str] = []
-            for coll_addr in wl_addrs_chain:
+            for i, coll_addr in enumerate(wl_addrs_chain):
                 if self._stop_event.is_set():
                     break
+
+                # ── PATCH 2026-04-25: honor blacklist + buy_config.enabled=False in Phase 1 too ──
                 _skip, _reason = self._should_skip_nonwl_collection(coll_addr)
                 if _skip:
                     log.info("  ⛔ WL %s: %s — skip Phase 1", coll_addr[:14], _reason)
                     continue
-                _eligible_addrs.append(coll_addr)
-            
-            log.info("📋 %s: parallel-fetching top offers for %d collections (workers=%d)",
-                     chain.upper(), len(_eligible_addrs), _parallel_workers)
-            
-            _fetch_start = time.time()
-            _coll_offers_map: dict[str, list[RivalOffer]] = {}
-            with ThreadPoolExecutor(max_workers=_parallel_workers) as _ex:
-                _futures = {_ex.submit(self._fetch_top_offers_for_collection, addr, chain, 20): addr for addr in _eligible_addrs}
-                for _fut in as_completed(_futures):
-                    _addr = _futures[_fut]
-                    try:
-                        _coll_offers_map[_addr] = _fut.result(timeout=30) or []
-                    except Exception as _exc:
-                        log.warning("  fetch failed %s: %s", _addr[:14], str(_exc)[:80])
-                        _coll_offers_map[_addr] = []
-            log.info("📋 %s: parallel fetch done in %.1fs (%d/%d collections returned data)",
-                     chain.upper(), time.time()-_fetch_start,
-                     sum(1 for v in _coll_offers_map.values() if v), len(_eligible_addrs))
-            
-            # ── Sequential processing of pre-fetched results ──
-            for i, coll_addr in enumerate(_eligible_addrs):
-                if self._stop_event.is_set():
-                    break
 
-                top_offers = _coll_offers_map.get(coll_addr, [])
+                top_offers = self._fetch_top_offers_for_collection(coll_addr, chain, limit=20)
                 if not top_offers:
                     continue
 
