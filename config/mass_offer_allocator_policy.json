@@ -1,0 +1,21 @@
+{
+  "generated_at": "2026-04-08T07:27:36.756179+00:00",
+  "wallet": "0xbuyer",
+  "chain": "bsc",
+  "window_days": 30,
+  "summary": {
+    "collection_count": 0,
+    "policy_entries": 0,
+    "overweight_count": 0,
+    "neutral_count": 0,
+    "underweight_count": 0,
+    "watch_count": 0,
+    "block_count": 0,
+    "live_enabled_count": 0,
+    "dry_run_only_count": 0,
+    "top_collection": null,
+    "top_band": null,
+    "top_score": 0.0
+  },
+  "collections": {}
+}

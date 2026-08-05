@@ -10,6 +10,7 @@ from urllib import parse
 
 from okx_nft_bot.analytics.cross_market import detect_spreads, rank_collections
 from okx_nft_bot.clients.http import StdlibHttpTransport
+from okx_nft_bot.analytics import ExecutionHealthAnalyzer, PnlGuardAnalyzer, PortfolioRiskAnalyzer, WalletPnlAnalyzer
 from okx_nft_bot.config import Settings
 from okx_nft_bot.storage.sqlite import SQLiteStore
 
@@ -249,6 +250,9 @@ def _build_execution_snapshot(settings: Settings) -> dict[str, Any]:
                 'reconcile_age_seconds': (
                     max((now - reconcile_at).total_seconds(), 0.0) if reconcile_at is not None else None
                 ),
+                'fills': state.get_fill_summary(chain=settings.execution_chain),
+                'last_fill_reconcile_at': runtime.get('last_fill_reconcile_at'),
+                'last_confirmed_fill_at': runtime.get('last_confirmed_fill_at'),
             }
         )
     except Exception as exc:  # pragma: no cover
@@ -286,6 +290,140 @@ def build_runtime_metrics(settings: Settings, store: SQLiteStore, *, extra: dict
             'top_collection_name': rankings[0].collection_name if rankings else None,
         },
     }
+    if settings.buyer_wallet_address:
+        try:
+            portfolio = WalletPnlAnalyzer(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                collection_limit=5,
+                open_limit=5,
+                closed_limit=10,
+            )
+            payload['portfolio'] = portfolio.summary.to_dict()
+        except Exception as exc:  # pragma: no cover
+            payload['portfolio_error'] = repr(exc)
+    if settings.portfolio_risk_enabled:
+        try:
+            risk = PortfolioRiskAnalyzer(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                chain=settings.execution_chain,
+            )
+            payload['risk'] = risk.summary.to_dict()
+        except Exception as exc:  # pragma: no cover
+            payload['risk_error'] = repr(exc)
+    if settings.pnl_guard_enabled:
+        try:
+            pnl_guard = PnlGuardAnalyzer(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                chain=settings.execution_chain,
+                window_hours=settings.pnl_guard_window_hours,
+            )
+            payload['pnl_guard'] = pnl_guard.summary.to_dict()
+        except Exception as exc:  # pragma: no cover
+            payload['pnl_guard_error'] = repr(exc)
+    if settings.execution_health_enabled:
+        try:
+            execution_health = ExecutionHealthAnalyzer(settings=settings).build_report(
+                chain=settings.execution_chain,
+                window_hours=settings.execution_health_window_hours,
+                event_limit=settings.execution_health_event_limit,
+            )
+            payload['execution_health'] = execution_health.summary.to_dict()
+        except Exception as exc:  # pragma: no cover
+            payload['execution_health_error'] = repr(exc)
+    if settings.buyer_wallet_address:
+        try:
+            from okx_nft_bot.mass_offer import (
+                MassOfferAllocator,
+                MassOfferBudgetRebalancer,
+                MassOfferBudgetScheduler,
+                MassOfferCircuitBreaker,
+                MassOfferFeedbackController,
+                MassOfferQuarantineController,
+                MassOfferUnwindController,
+            )
+
+            allocator = MassOfferAllocator(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                chain=settings.execution_chain,
+                window_days=settings.mass_offer_allocator_window_days,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                event_limit=settings.mass_offer_economics_event_limit,
+            )
+            payload['allocator'] = allocator.summary
+            feedback = MassOfferFeedbackController(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                chain=settings.execution_chain,
+                window_days=settings.mass_offer_feedback_window_days,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                event_limit=settings.mass_offer_economics_event_limit,
+            )
+            payload['feedback'] = feedback.summary
+            circuit = MassOfferCircuitBreaker(settings=settings).build_report(
+                wallet=settings.buyer_wallet_address,
+                chain=settings.execution_chain,
+                window_hours=settings.mass_offer_circuit_window_hours,
+            )
+            payload['circuit'] = circuit.summary
+            budget = MassOfferBudgetScheduler(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                chain=settings.execution_chain,
+                window_days=settings.mass_offer_allocator_window_days,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                event_limit=settings.mass_offer_economics_event_limit,
+                price_bnb=settings.mass_offer_price_bnb,
+            )
+            payload['budget'] = budget.summary
+            quarantine = MassOfferQuarantineController(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                chain=settings.execution_chain,
+                window_days=settings.mass_offer_quarantine_window_days,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                event_limit=settings.mass_offer_economics_event_limit,
+                price_bnb=settings.mass_offer_price_bnb,
+            )
+            payload['quarantine'] = quarantine.summary
+            rebalance = MassOfferBudgetRebalancer(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                chain=settings.execution_chain,
+                window_days=settings.mass_offer_rebalance_window_days,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                event_limit=settings.mass_offer_economics_event_limit,
+                price_bnb=settings.mass_offer_price_bnb,
+            )
+            payload['rebalance'] = rebalance.summary
+            unwind = MassOfferUnwindController(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                chain=settings.execution_chain,
+                window_days=settings.mass_offer_unwind_window_days,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                event_limit=settings.mass_offer_economics_event_limit,
+                target_release_bnb=settings.mass_offer_unwind_target_release_bnb,
+                max_cancels=settings.mass_offer_unwind_max_cancels,
+            )
+            payload['unwind'] = unwind.summary
+        except Exception as exc:  # pragma: no cover
+            payload['allocator_error'] = repr(exc)
+    if settings.buyer_wallet_address:
+        try:
+            from okx_nft_bot.mass_offer import MassOfferPlanner, get_mass_offer_batch_runtime_summary
+
+            plan = MassOfferPlanner(settings=settings, store=store).build_report(
+                wallet=settings.buyer_wallet_address,
+                chain=settings.execution_chain,
+                window_days=settings.mass_offer_allocator_window_days,
+                reference_limit=settings.wallet_pnl_reference_event_limit,
+                event_limit=settings.mass_offer_economics_event_limit,
+                price_bnb=settings.mass_offer_price_bnb,
+            )
+            payload['plan'] = plan.summary
+            batch = get_mass_offer_batch_runtime_summary(PositionState(settings.execution_db_path))
+            if batch is not None:
+                payload['batch'] = batch
+        except Exception as exc:  # pragma: no cover
+            payload['plan_error'] = repr(exc)
     if extra:
         payload.update(extra)
     return payload

@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-04-08T07:27:36.859907+00:00",
+  "wallet": "0xbuyer",
+  "chain": "bsc",
+  "price_bnb": 0.1,
+  "window_days": 30,
+  "summary": {
+    "collection_count": 0,
+    "policy_entries": 0,
+    "clear_count": 0,
+    "cooldown_count": 0,
+    "dry_run_count": 0,
+    "block_count": 0,
+    "active_quarantine_count": 0,
+    "live_throttle_count": 0,
+    "dry_run_only_count": 0,
+    "blocked_count": 0,
+    "top_collection": null,
+    "top_band": null,
+    "top_score": 0.0,
+    "top_expiry_at": null,
+    "earliest_expiry_at": null,
+    "rebalancer_policy_entries": 0,
+    "rebalancer_top_collection": null,
+    "rebalancer_top_band": null
+  },
+  "collections": {}
+}

@@ -3,12 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-
-from okx_nft_bot.config import SUPPORTED_EXECUTION_CHAINS
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +54,9 @@ class PositionState:
     _ACTIVE_OFFER_ALLOWED_STATUSES = {
         "active",
         "cancelled",
+        "dry_run",
         "exchange_missing",
+        "filled",
         "killswitch_failed",
         "outbid",
         "retired",
@@ -86,14 +87,14 @@ class PositionState:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db_lock = __import__('threading').Lock()
+        # PATCH 2026-05-31 DB_LOCK_FIX: missing attribute caused
+        # 'PositionState object has no attribute _db_lock' in fallback path.
+        self._db_lock = threading.Lock()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _init_db(self) -> None:
@@ -163,214 +164,37 @@ class PositionState:
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS seaport_counter (
-                    wallet TEXT NOT NULL,
-                    chain TEXT NOT NULL,
-                    next_counter TEXT NOT NULL,
-                    last_synced_at TEXT NOT NULL,
-                    PRIMARY KEY (wallet, chain)
+                CREATE TABLE IF NOT EXISTS execution_fill_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_event_id TEXT NOT NULL UNIQUE,
+                    submit_log_id INTEGER,
+                    order_hash TEXT,
+                    engine TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    collection TEXT NOT NULL,
+                    contract_address TEXT,
+                    token_id TEXT NOT NULL,
+                    chain TEXT NOT NULL DEFAULT 'bsc',
+                    wallet TEXT,
+                    currency TEXT,
+                    submit_price REAL,
+                    fill_price REAL,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    confidence_label TEXT,
+                    submit_created_at TEXT,
+                    fill_event_time TEXT NOT NULL,
+                    tx_hash TEXT,
+                    note TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
             conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS place_cooldown (
-                    cache_key TEXT PRIMARY KEY,
-                    last_placed_ts REAL NOT NULL,
-                    qty INTEGER DEFAULT 0
-                )
-                """
+                "CREATE INDEX IF NOT EXISTS idx_execution_fill_log_fill_event_time ON execution_fill_log(fill_event_time)"
             )
             conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS wallet_nonce (
-                    wallet TEXT NOT NULL,
-                    chain TEXT NOT NULL,
-                    next_nonce TEXT NOT NULL,
-                    last_synced_at TEXT NOT NULL,
-                    PRIMARY KEY (wallet, chain)
-                )
-                """
+                "CREATE INDEX IF NOT EXISTS idx_execution_fill_log_order_hash ON execution_fill_log(order_hash)"
             )
-
-    def load_place_cooldowns(self) -> dict[str, tuple[float, int]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT cache_key, last_placed_ts, qty FROM place_cooldown"
-            ).fetchall()
-        return {str(r["cache_key"]): (float(r["last_placed_ts"]), int(r["qty"] or 0)) for r in rows}
-
-    def upsert_place_cooldown(self, *, cache_key: str, last_placed_ts: float, qty: int = 0) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO place_cooldown (cache_key, last_placed_ts, qty)
-                VALUES (?, ?, ?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    last_placed_ts = excluded.last_placed_ts,
-                    qty = excluded.qty
-                """,
-                (cache_key, float(last_placed_ts), int(qty)),
-            )
-
-    def cleanup_stale_place_cooldowns(self, *, max_age_seconds: float = 86400.0) -> int:
-        import time as _time
-        cutoff = _time.time() - max_age_seconds
-        with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM place_cooldown WHERE last_placed_ts < ?",
-                (cutoff,),
-            )
-        return cursor.rowcount
-
-    def allocate_seaport_counter(
-        self,
-        *,
-        wallet: str,
-        chain: str,
-        fetch_onchain_fn: Any,
-        resync_after_seconds: int = 60,
-    ) -> int:
-        """Atomically allocate a Seaport counter value.
-
-        Seaport counter semantics: this is a BULK-CANCEL EPOCH, not a per-order
-        nonce. Every order signed at epoch N remains valid until the offerer
-        calls ``incrementCounter()`` on-chain (which bumps the epoch and
-        invalidates all prior orders in one tx). At fulfill time, Seaport
-        derives ``orderHash`` using the CURRENT ON-CHAIN counter — signing
-        with a locally-incremented value produces a signature that cannot be
-        recovered on-chain (InvalidSigner revert).
-
-        Therefore: we must always return the current on-chain value (cached
-        briefly for performance), and we must NOT bump the DB counter per
-        allocation. The DB is refreshed only when (a) first call, (b) the
-        cache is older than ``resync_after_seconds``, or (c) an on-chain
-        ``incrementCounter()`` tx succeeds (caller's responsibility to force
-        a resync by updating last_synced_at to epoch 0).
-        """
-        wallet_key = wallet.lower()
-        chain_key = chain.lower()
-        now = datetime.now(timezone.utc)
-        now_iso = _fmt_dt(now)
-        with self._db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=10)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT next_counter, last_synced_at FROM seaport_counter WHERE wallet = ? AND chain = ?",
-                    (wallet_key, chain_key),
-                ).fetchone()
-                needs_sync = row is None
-                if row is not None:
-                    try:
-                        last_synced = _parse_dt(
-                            str(row["last_synced_at"]),
-                            field_name="last_synced_at",
-                            context=f"seaport_counter[{wallet_key}/{chain_key}]",
-                        )
-                    except InvalidTimestampError:
-                        needs_sync = True
-                    else:
-                        age = (now - last_synced).total_seconds()
-                        if age < 0 or age >= resync_after_seconds:
-                            needs_sync = True
-                if needs_sync:
-                    allocated = int(fetch_onchain_fn(wallet_key, chain_key))
-                else:
-                    allocated = int(row["next_counter"])
-                conn.execute(
-                    """
-                    INSERT INTO seaport_counter (wallet, chain, next_counter, last_synced_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(wallet, chain) DO UPDATE SET
-                        next_counter = excluded.next_counter,
-                        last_synced_at = excluded.last_synced_at
-                    """,
-                    (wallet_key, chain_key, str(allocated), now_iso),
-                )
-                conn.commit()
-                return allocated
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
-
-    def allocate_nonce(
-        self,
-        *,
-        wallet: str,
-        chain: str,
-        fetch_onchain_fn: Any,
-        resync_after_seconds: int = 60,
-    ) -> int:
-        """Atomically allocate a transaction nonce.
-
-        Uses BEGIN IMMEDIATE to serialize across processes sharing the same
-        wallet+chain. ``fetch_onchain_fn(wallet, chain)`` must return the
-        pending-tag transaction count from the RPC. We take
-        max(on_chain_pending, local_next) so that external transactions
-        (manual or from another tool) are accommodated.
-
-        Returns the nonce allocated to the caller and persists
-        ``next_nonce = returned + 1``.
-        """
-        wallet_key = wallet.lower()
-        chain_key = chain.lower()
-        now = datetime.now(timezone.utc)
-        now_iso = _fmt_dt(now)
-        with self._db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=10)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT next_nonce, last_synced_at FROM wallet_nonce WHERE wallet = ? AND chain = ?",
-                    (wallet_key, chain_key),
-                ).fetchone()
-                needs_sync = row is None
-                local_next: int | None = None
-                if row is not None:
-                    local_next = int(row["next_nonce"])
-                    try:
-                        last_synced = _parse_dt(
-                            str(row["last_synced_at"]),
-                            field_name="last_synced_at",
-                            context=f"wallet_nonce[{wallet_key}/{chain_key}]",
-                        )
-                    except InvalidTimestampError:
-                        needs_sync = True
-                    else:
-                        age = (now - last_synced).total_seconds()
-                        if age < 0 or age >= resync_after_seconds:
-                            needs_sync = True
-                if needs_sync:
-                    on_chain = int(fetch_onchain_fn(wallet_key, chain_key))
-                    allocated = max(on_chain, local_next) if local_next is not None else on_chain
-                else:
-                    allocated = int(local_next) if local_next is not None else 0
-                conn.execute(
-                    """
-                    INSERT INTO wallet_nonce (wallet, chain, next_nonce, last_synced_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(wallet, chain) DO UPDATE SET
-                        next_nonce = excluded.next_nonce,
-                        last_synced_at = excluded.last_synced_at
-                    """,
-                    (wallet_key, chain_key, str(allocated + 1), now_iso),
-                )
-                conn.commit()
-                return allocated
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
 
     def upsert_active_offer(
         self,
@@ -383,14 +207,6 @@ class PositionState:
         current_floor: float | None = None,
         preview_payload: dict[str, Any] | None = None,
     ) -> None:
-        # Unit guard: coerce wei-denominated prices to native units.
-        # Any real NFT price in wei exceeds 1e10; any native (ETH/BNB) price stays below 1e10.
-        # Mirrors execution_governor._coerce_price heuristic so rogue callers
-        # (e.g. mass_offer.engine) cannot write raw wei into active_offers.
-        if price_bnb is not None and float(price_bnb) >= 1e10:
-            price_bnb = float(price_bnb) / 1e18
-        if current_floor is not None and float(current_floor) >= 1e10:
-            current_floor = float(current_floor) / 1e18
         with self._connect() as conn:
             conn.execute(
                 """
@@ -460,6 +276,99 @@ class PositionState:
     def list_active_offers(self, *, chain: str | None = None) -> list[dict[str, Any]]:
         return [asdict(offer) for offer in self.get_active_offers(chain=chain)]
 
+    def count_active_offers(
+        self,
+        *,
+        chain: str | None = None,
+        collection: str | None = None,
+    ) -> int:
+        clauses = ["status = 'active'"]
+        params: list[Any] = []
+        if chain:
+            clauses.append("chain = ?")
+            params.append(chain.lower())
+        if collection:
+            clauses.append("collection = ?")
+            params.append(collection.lower())
+        where = " AND ".join(clauses)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM active_offers WHERE {where}",
+                params,
+            ).fetchone()
+        return int(row["count"] or 0) if row is not None else 0
+
+    def sum_active_exposure_bnb(
+        self,
+        *,
+        chain: str | None = None,
+        collection: str | None = None,
+    ) -> float:
+        clauses = ["status = 'active'"]
+        params: list[Any] = []
+        if chain:
+            clauses.append("chain = ?")
+            params.append(chain.lower())
+        if collection:
+            clauses.append("collection = ?")
+            params.append(collection.lower())
+        where = " AND ".join(clauses)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT COALESCE(SUM(price_bnb), 0.0) AS exposure FROM active_offers WHERE {where}",
+                params,
+            ).fetchone()
+        return float(row["exposure"] or 0.0) if row is not None else 0.0
+
+    def get_collection_active_stats(self, *, chain: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["status = 'active'"]
+        params: list[Any] = []
+        if chain:
+            clauses.append("chain = ?")
+            params.append(chain.lower())
+        where = " AND ".join(clauses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    collection,
+                    chain,
+                    COUNT(*) AS active_offer_count,
+                    SUM(price_bnb) AS active_exposure_bnb,
+                    AVG(price_bnb) AS avg_price_bnb,
+                    MIN(placed_at) AS oldest_offer_at,
+                    MAX(placed_at) AS newest_offer_at
+                FROM active_offers
+                WHERE {where}
+                GROUP BY collection, chain
+                ORDER BY active_offer_count DESC, active_exposure_bnb DESC, collection ASC
+                """,
+                params,
+            ).fetchall()
+        now = datetime.now(timezone.utc)
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            oldest_offer_at = _parse_dt(
+                str(row["oldest_offer_at"]),
+                field_name="placed_at",
+                context=f"active_offers[{row['collection']}]",
+            ) if row["oldest_offer_at"] else None
+            payload.append(
+                {
+                    "collection": str(row["collection"]),
+                    "chain": str(row["chain"]),
+                    "active_offer_count": int(row["active_offer_count"] or 0),
+                    "active_exposure_bnb": float(row["active_exposure_bnb"] or 0.0),
+                    "avg_price_bnb": float(row["avg_price_bnb"] or 0.0),
+                    "oldest_offer_at": oldest_offer_at.isoformat() if oldest_offer_at else None,
+                    "oldest_active_offer_hours": (
+                        max((now - oldest_offer_at).total_seconds() / 3600.0, 0.0) if oldest_offer_at else None
+                    ),
+                    "newest_offer_at": str(row["newest_offer_at"]) if row["newest_offer_at"] else None,
+                }
+            )
+        return payload
+
     def mark_offer_status(
         self,
         *,
@@ -467,8 +376,6 @@ class PositionState:
         status: str,
         current_floor: float | None = None,
     ) -> bool:
-        if current_floor is not None and float(current_floor) >= 1e10:
-            current_floor = float(current_floor) / 1e18
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -481,8 +388,6 @@ class PositionState:
         return cursor.rowcount > 0
 
     def touch_offer(self, *, order_hash: str, current_floor: float | None = None) -> bool:
-        if current_floor is not None and float(current_floor) >= 1e10:
-            current_floor = float(current_floor) / 1e18
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -886,7 +791,7 @@ class PositionState:
                     runtime_keys_cleared.append(key)
 
             raw_reconcile_chain = runtime_map.get("last_reconcile_chain")
-            if raw_reconcile_chain is not None and raw_reconcile_chain.strip().lower() not in SUPPORTED_EXECUTION_CHAINS:
+            if raw_reconcile_chain is not None and raw_reconcile_chain.strip().lower() != "bsc":
                 notes.append(
                     f"Invalid chain for execution_runtime_state.last_reconcile_chain: {raw_reconcile_chain!r}"
                 )
@@ -963,6 +868,191 @@ class PositionState:
         with self._connect() as conn:
             self._set_runtime_value_conn(conn, key, value)
 
+
+    # ── PRESERVED FROM PRE-GPT (place_cooldowns + seaport_counter + nonce) ──
+    def load_place_cooldowns(self) -> dict[str, tuple[float, int]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT cache_key, last_placed_ts, qty FROM place_cooldown"
+            ).fetchall()
+        return {str(r["cache_key"]): (float(r["last_placed_ts"]), int(r["qty"] or 0)) for r in rows}
+
+
+    def upsert_place_cooldown(self, *, cache_key: str, last_placed_ts: float, qty: int = 0) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO place_cooldown (cache_key, last_placed_ts, qty)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    last_placed_ts = excluded.last_placed_ts,
+                    qty = excluded.qty
+                """,
+                (cache_key, float(last_placed_ts), int(qty)),
+            )
+
+
+    def cleanup_stale_place_cooldowns(self, *, max_age_seconds: float = 86400.0) -> int:
+        import time as _time
+        cutoff = _time.time() - max_age_seconds
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM place_cooldown WHERE last_placed_ts < ?",
+                (cutoff,),
+            )
+        return cursor.rowcount
+
+
+    def allocate_seaport_counter(
+        self,
+        *,
+        wallet: str,
+        chain: str,
+        fetch_onchain_fn: Any,
+        resync_after_seconds: int = 60,
+    ) -> int:
+        """Atomically allocate a Seaport counter value.
+
+        Seaport counter semantics: this is a BULK-CANCEL EPOCH, not a per-order
+        nonce. Every order signed at epoch N remains valid until the offerer
+        calls ``incrementCounter()`` on-chain (which bumps the epoch and
+        invalidates all prior orders in one tx). At fulfill time, Seaport
+        derives ``orderHash`` using the CURRENT ON-CHAIN counter — signing
+        with a locally-incremented value produces a signature that cannot be
+        recovered on-chain (InvalidSigner revert).
+
+        Therefore: we must always return the current on-chain value (cached
+        briefly for performance), and we must NOT bump the DB counter per
+        allocation. The DB is refreshed only when (a) first call, (b) the
+        cache is older than ``resync_after_seconds``, or (c) an on-chain
+        ``incrementCounter()`` tx succeeds (caller's responsibility to force
+        a resync by updating last_synced_at to epoch 0).
+        """
+        wallet_key = wallet.lower()
+        chain_key = chain.lower()
+        now = datetime.now(timezone.utc)
+        now_iso = _fmt_dt(now)
+        with self._db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT next_counter, last_synced_at FROM seaport_counter WHERE wallet = ? AND chain = ?",
+                    (wallet_key, chain_key),
+                ).fetchone()
+                needs_sync = row is None
+                if row is not None:
+                    try:
+                        last_synced = _parse_dt(
+                            str(row["last_synced_at"]),
+                            field_name="last_synced_at",
+                            context=f"seaport_counter[{wallet_key}/{chain_key}]",
+                        )
+                    except InvalidTimestampError:
+                        needs_sync = True
+                    else:
+                        age = (now - last_synced).total_seconds()
+                        if age < 0 or age >= resync_after_seconds:
+                            needs_sync = True
+                if needs_sync:
+                    allocated = int(fetch_onchain_fn(wallet_key, chain_key))
+                else:
+                    allocated = int(row["next_counter"])
+                conn.execute(
+                    """
+                    INSERT INTO seaport_counter (wallet, chain, next_counter, last_synced_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(wallet, chain) DO UPDATE SET
+                        next_counter = excluded.next_counter,
+                        last_synced_at = excluded.last_synced_at
+                    """,
+                    (wallet_key, chain_key, str(allocated), now_iso),
+                )
+                conn.commit()
+                return allocated
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+
+    def allocate_nonce(
+        self,
+        *,
+        wallet: str,
+        chain: str,
+        fetch_onchain_fn: Any,
+        resync_after_seconds: int = 60,
+    ) -> int:
+        """Atomically allocate a transaction nonce.
+
+        Uses BEGIN IMMEDIATE to serialize across processes sharing the same
+        wallet+chain. ``fetch_onchain_fn(wallet, chain)`` must return the
+        pending-tag transaction count from the RPC. We take
+        max(on_chain_pending, local_next) so that external transactions
+        (manual or from another tool) are accommodated.
+
+        Returns the nonce allocated to the caller and persists
+        ``next_nonce = returned + 1``.
+        """
+        wallet_key = wallet.lower()
+        chain_key = chain.lower()
+        now = datetime.now(timezone.utc)
+        now_iso = _fmt_dt(now)
+        with self._db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT next_nonce, last_synced_at FROM wallet_nonce WHERE wallet = ? AND chain = ?",
+                    (wallet_key, chain_key),
+                ).fetchone()
+                needs_sync = row is None
+                local_next: int | None = None
+                if row is not None:
+                    local_next = int(row["next_nonce"])
+                    try:
+                        last_synced = _parse_dt(
+                            str(row["last_synced_at"]),
+                            field_name="last_synced_at",
+                            context=f"wallet_nonce[{wallet_key}/{chain_key}]",
+                        )
+                    except InvalidTimestampError:
+                        needs_sync = True
+                    else:
+                        age = (now - last_synced).total_seconds()
+                        if age < 0 or age >= resync_after_seconds:
+                            needs_sync = True
+                if needs_sync:
+                    on_chain = int(fetch_onchain_fn(wallet_key, chain_key))
+                    allocated = max(on_chain, local_next) if local_next is not None else on_chain
+                else:
+                    allocated = int(local_next) if local_next is not None else 0
+                conn.execute(
+                    """
+                    INSERT INTO wallet_nonce (wallet, chain, next_nonce, last_synced_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(wallet, chain) DO UPDATE SET
+                        next_nonce = excluded.next_nonce,
+                        last_synced_at = excluded.last_synced_at
+                    """,
+                    (wallet_key, chain_key, str(allocated + 1), now_iso),
+                )
+                conn.commit()
+                return allocated
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def record_submit_event(
         self,
         *,
@@ -993,7 +1083,339 @@ class PositionState:
                     created_at,
                 ),
             )
-            return int(cursor.lastrowid)
+            _submit_id = int(cursor.lastrowid)
+        # PATCH 2026-07-19: action-lifecycle journal (MVCS #3). Additive; own try/except; never breaks submit logging.
+        try:
+            from okx_nft_bot import action_lifecycle as _alc
+            _alc_db = str(self.db_path).replace("execution.sqlite3", "action_lifecycle.sqlite3")
+            _alc.record_submit(_alc_db, engine=engine, action_type=action_type,
+                               collection=collection, chain=chain, price_bnb=price_bnb,
+                               status=status, reason=reason)
+        except Exception:
+            pass
+        return _submit_id
+
+
+    def record_fill_match(
+        self,
+        *,
+        market_event_id: str,
+        submit_log_id: int | None,
+        order_hash: str | None,
+        engine: str,
+        action_type: str,
+        collection: str,
+        contract_address: str | None,
+        token_id: str,
+        chain: str,
+        wallet: str | None,
+        currency: str | None,
+        submit_price: float | None,
+        fill_price: float | None,
+        confidence: float,
+        confidence_label: str | None,
+        submit_created_at: str | None,
+        fill_event_time: str,
+        tx_hash: str | None = None,
+        note: str | None = None,
+    ) -> int:
+        created_at = _fmt_dt(datetime.now(timezone.utc))
+        resolved_order_hash = (str(order_hash).strip() if order_hash else None) or None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO execution_fill_log (
+                    market_event_id, submit_log_id, order_hash, engine, action_type, collection,
+                    contract_address, token_id, chain, wallet, currency, submit_price, fill_price,
+                    confidence, confidence_label, submit_created_at, fill_event_time, tx_hash, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(market_event_id) DO UPDATE SET
+                    submit_log_id=excluded.submit_log_id,
+                    order_hash=excluded.order_hash,
+                    engine=excluded.engine,
+                    action_type=excluded.action_type,
+                    collection=excluded.collection,
+                    contract_address=excluded.contract_address,
+                    token_id=excluded.token_id,
+                    chain=excluded.chain,
+                    wallet=excluded.wallet,
+                    currency=excluded.currency,
+                    submit_price=excluded.submit_price,
+                    fill_price=excluded.fill_price,
+                    confidence=excluded.confidence,
+                    confidence_label=excluded.confidence_label,
+                    submit_created_at=excluded.submit_created_at,
+                    fill_event_time=excluded.fill_event_time,
+                    tx_hash=excluded.tx_hash,
+                    note=excluded.note,
+                    created_at=excluded.created_at
+                """,
+                (
+                    market_event_id,
+                    submit_log_id,
+                    resolved_order_hash,
+                    engine,
+                    action_type,
+                    collection.lower(),
+                    contract_address.lower() if contract_address else None,
+                    str(token_id),
+                    chain.lower(),
+                    wallet.lower() if wallet else None,
+                    currency.upper() if currency else None,
+                    submit_price,
+                    fill_price,
+                    float(confidence),
+                    confidence_label,
+                    submit_created_at,
+                    fill_event_time,
+                    tx_hash,
+                    note,
+                    created_at,
+                ),
+            )
+            if resolved_order_hash:
+                conn.execute(
+                    """
+                    UPDATE active_offers
+                    SET status = 'filled', last_checked_at = CURRENT_TIMESTAMP
+                    WHERE order_hash = ?
+                    """,
+                    (resolved_order_hash,),
+                )
+            row = conn.execute(
+                "SELECT id FROM execution_fill_log WHERE market_event_id = ?",
+                (market_event_id,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def list_fill_matches(
+        self,
+        *,
+        chain: str | None = None,
+        since: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if chain:
+            clauses.append("chain = ?")
+            params.append(chain.lower())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, market_event_id, submit_log_id, order_hash, engine, action_type, collection,
+                       contract_address, token_id, chain, wallet, currency, submit_price, fill_price,
+                       confidence, confidence_label, submit_created_at, fill_event_time, tx_hash, note, created_at
+                FROM execution_fill_log
+                {where}
+                ORDER BY fill_event_time DESC, id DESC
+                {limit_sql}
+                """,
+                params,
+            ).fetchall()
+        resolved_since = None
+        if since is not None:
+            resolved_since = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                fill_event_time = _parse_dt(
+                    str(row["fill_event_time"]),
+                    field_name="fill_event_time",
+                    context=f"execution_fill_log[{row['id']}]",
+                )
+            except InvalidTimestampError as exc:
+                logger.warning("%s; ignoring malformed fill-log row", exc)
+                continue
+            if resolved_since is not None and fill_event_time < resolved_since:
+                continue
+            payload.append(
+                {
+                    "id": int(row["id"]),
+                    "market_event_id": str(row["market_event_id"]),
+                    "submit_log_id": int(row["submit_log_id"]) if row["submit_log_id"] is not None else None,
+                    "order_hash": row["order_hash"],
+                    "engine": str(row["engine"]),
+                    "action_type": str(row["action_type"]),
+                    "collection": str(row["collection"]),
+                    "contract_address": row["contract_address"],
+                    "token_id": str(row["token_id"]),
+                    "chain": str(row["chain"]),
+                    "wallet": row["wallet"],
+                    "currency": row["currency"],
+                    "submit_price": float(row["submit_price"] or 0.0) if row["submit_price"] is not None else None,
+                    "fill_price": float(row["fill_price"] or 0.0) if row["fill_price"] is not None else None,
+                    "confidence": float(row["confidence"] or 0.0),
+                    "confidence_label": row["confidence_label"],
+                    "submit_created_at": row["submit_created_at"],
+                    "fill_event_time": fill_event_time.isoformat(),
+                    "tx_hash": row["tx_hash"],
+                    "note": row["note"],
+                    "created_at": row["created_at"],
+                }
+            )
+        return payload
+
+    def get_fill_summary(
+        self,
+        *,
+        chain: str | None = None,
+        since: datetime | None = None,
+    ) -> dict[str, Any]:
+        rows = self.list_fill_matches(chain=chain, since=since)
+        matched_volume_by_currency: dict[str, float] = {}
+        confidence_sum = 0.0
+        latest_fill_at = rows[0]["fill_event_time"] if rows else None
+        for row in rows:
+            currency = str(row.get("currency") or "UNKNOWN")
+            matched_volume_by_currency[currency] = matched_volume_by_currency.get(currency, 0.0) + float(row.get("fill_price") or 0.0)
+            confidence_sum += float(row.get("confidence") or 0.0)
+        return {
+            "confirmed_fill_count": len(rows),
+            "matched_volume_by_currency": {key: round(value, 6) for key, value in sorted(matched_volume_by_currency.items())},
+            "avg_confidence": (confidence_sum / len(rows)) if rows else None,
+            "latest_fill_at": latest_fill_at,
+        }
+
+    def list_offer_snapshots(
+        self,
+        *,
+        chain: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if chain:
+            clauses.append("chain = ?")
+            params.append(chain.lower())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT order_hash, collection, chain, price_bnb, status, placed_at, last_checked_at, current_floor, preview_payload_json
+                FROM active_offers
+                {where}
+                ORDER BY placed_at DESC
+                """,
+                params,
+            ).fetchall()
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            payload.append(
+                {
+                    "order_hash": str(row["order_hash"]),
+                    "collection": str(row["collection"]),
+                    "chain": str(row["chain"]),
+                    "price_bnb": float(row["price_bnb"] or 0.0),
+                    "status": str(row["status"]),
+                    "placed_at": str(row["placed_at"]),
+                    "last_checked_at": str(row["last_checked_at"]),
+                    "current_floor": float(row["current_floor"]) if row["current_floor"] is not None else None,
+                    "preview_payload": json.loads(row["preview_payload_json"] or "{}"),
+                }
+            )
+        return payload
+
+    def list_submit_events(
+        self,
+        *,
+        chain: str | None = None,
+        since: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if chain:
+            clauses.append("chain = ?")
+            params.append(chain.lower())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, engine, action_type, collection, chain, price_bnb, status, reason, created_at
+                FROM execution_submit_log
+                {where}
+                ORDER BY id DESC
+                {limit_sql}
+                """,
+                params,
+            ).fetchall()
+        resolved_since = None
+        if since is not None:
+            resolved_since = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                created_at = _parse_dt(
+                    str(row["created_at"]),
+                    field_name="created_at",
+                    context=f"execution_submit_log[{row['id']}]",
+                )
+            except InvalidTimestampError as exc:
+                logger.warning("%s; ignoring malformed submit-log row", exc)
+                continue
+            if resolved_since is not None and created_at < resolved_since:
+                continue
+            payload.append(
+                {
+                    "id": int(row["id"]),
+                    "engine": str(row["engine"]),
+                    "action_type": str(row["action_type"]),
+                    "collection": str(row["collection"]),
+                    "chain": str(row["chain"]),
+                    "price_bnb": float(row["price_bnb"] or 0.0) if row["price_bnb"] is not None else None,
+                    "status": str(row["status"]),
+                    "reason": row["reason"],
+                    "created_at": created_at.isoformat(),
+                }
+            )
+        return payload
+
+    def get_collection_submit_stats(
+        self,
+        *,
+        chain: str | None = None,
+        since: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        stats: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in self.list_submit_events(chain=chain, since=since):
+            key = (str(row["chain"]), str(row["collection"]))
+            bucket = stats.setdefault(
+                key,
+                {
+                    "chain": str(row["chain"]),
+                    "collection": str(row["collection"]),
+                    "recent_submit_count": 0,
+                    "recent_submit_bnb": 0.0,
+                    "submitted_count": 0,
+                    "failed_count": 0,
+                    "blocked_count": 0,
+                    "latest_submit_at": None,
+                },
+            )
+            bucket["recent_submit_count"] += 1
+            bucket["recent_submit_bnb"] += float(row["price_bnb"] or 0.0)
+            status = str(row["status"]).strip().lower()
+            if status == "submitted":
+                bucket["submitted_count"] += 1
+            elif status == "blocked":
+                bucket["blocked_count"] += 1
+            else:
+                bucket["failed_count"] += 1
+            latest_submit_at = bucket.get("latest_submit_at")
+            if latest_submit_at is None or str(row["created_at"]) > str(latest_submit_at):
+                bucket["latest_submit_at"] = str(row["created_at"])
+        payload = list(stats.values())
+        payload.sort(key=lambda item: (-int(item["recent_submit_count"]), item["collection"]))
+        return payload
 
     def count_successful_live_submits_since(self, since: datetime) -> int:
         resolved_since = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)

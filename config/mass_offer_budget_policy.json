@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-04-08T07:27:36.767742+00:00",
+  "wallet": "0xbuyer",
+  "chain": "bsc",
+  "window_days": 30,
+  "summary": {
+    "collection_count": 0,
+    "policy_entries": 0,
+    "boost_count": 0,
+    "steady_count": 0,
+    "conserve_count": 0,
+    "hold_count": 0,
+    "freeze_count": 0,
+    "live_candidate_count": 0,
+    "daily_limit_bnb": 5.0,
+    "daily_spent_bnb": 0.0,
+    "daily_remaining_bnb": 5.0,
+    "available_live_budget_bnb": 1.0,
+    "allocated_total_bnb": 0.0,
+    "unallocated_bnb": 1.0,
+    "allocated_total_slots": 0,
+    "hourly_remaining_slots": 10,
+    "cooldown_remaining_seconds": 0,
+    "global_live_block": false,
+    "global_block_reason": null,
+    "top_collection": null,
+    "top_band": null,
+    "top_budget_bnb": 0.0,
+    "top_budget_offers": 0
+  },
+  "collections": {}
+}

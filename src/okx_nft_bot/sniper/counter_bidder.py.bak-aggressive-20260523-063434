@@ -447,7 +447,6 @@ class CounterBidder:
         self._cycle_buys = 0  # buys this scan cycle
         buy_settings = self.buy_config.get("buy_settings", {})
         self._buy_enabled = buy_settings.get("enabled", False)
-        self._sell_dry_run = _env_bool("SELL_DRY_RUN", True)  # PATCH 2026-05-27: sell-only dry-run
         self._max_buys_per_collection = buy_settings.get("max_buys_per_collection", 2)
         self._max_buys_per_cycle = buy_settings.get("max_total_buys_per_cycle", 5)
         self._buy_cooldown_seconds = buy_settings.get("cooldown_seconds", 60)
@@ -778,17 +777,10 @@ class CounterBidder:
 
             # Get WL collection addresses for this chain
             # For BSC: skip collections not verified on OKX (saves ~82 wasted API calls)
-            # ── PATCH 2026-08-01 (PRICE BAND): не стрелять туда, где не долетаем.
-            # Замер показал: медиана реальных сделок в части коллекций —
-            # сотни долларов, а наш потолок $3. Разрыв до 456x. Такие цели
-            # жгут лимит скорости и слоты, шанс исполнения нулевой.
-            # _price_band_ok=False → пропускаем. None (не сканировано) → работаем.
-            _band_off = _env_bool("PRICE_BAND_FILTER", True)
             wl_addrs_chain = [
                 addr for addr, info in self._wl_index.items()
                 if info.get("network", "").lower() == chain
                 and (chain != "bsc" or info.get("okx_verified", True))
-                and (not _band_off or info.get("_price_band_ok") is not False)
             ]
             log.info("📋 %s: %d WL collections to scan", chain.upper(), len(wl_addrs_chain))
 
@@ -884,18 +876,6 @@ class CounterBidder:
                     if _wl_cap_usd > 0 and our_top_usd > _wl_cap_usd * 1.05:
                         log.info("  ⚠ %s: we're #1 but OVER CAP $%.2f > cap $%.2f — will re-place",
                                  coll_addr[:14], our_top_usd, _wl_cap_usd)
-                        # PATCH 2026-05-31 TG_NOTIFY_SELF_CORRECT
-                        try:
-                            _tg_msg = (
-                                "⚠️ <b>SELF-CORRECT (OVER CAP)</b>\n"
-                                + "<code>" + str(coll_addr[:14]) + "</code> we#1 "
-                                + "$" + format(our_top_usd, ".2f") + " > cap "
-                                + "$" + format(_wl_cap_usd, ".2f")
-                                + "\n→ will re-place lower"
-                            )
-                            self._tg_send(_tg_msg)
-                        except Exception:
-                            pass
                         wl_rival_offers.extend(rivals)
                         time.sleep(2.0)
                         continue
@@ -907,18 +887,6 @@ class CounterBidder:
                         if best_en_usd > 0 and our_top_usd > best_en_usd * 1.5:
                             log.info("  ⚠ %s: we're #1 but OVERPAYING $%.2f vs rival $%.2f (>1.5x) — will re-place",
                                      coll_addr[:14], our_top_usd, best_en_usd)
-                            # PATCH 2026-05-31 TG_NOTIFY_SELF_CORRECT
-                            try:
-                                _tg_msg = (
-                                    "⚠️ <b>SELF-CORRECT (OVERPAY)</b>\n"
-                                    + "<code>" + str(coll_addr[:14]) + "</code> we#1 "
-                                    + "$" + format(our_top_usd, ".2f") + " vs rival "
-                                    + "$" + format(best_en_usd, ".2f")
-                                    + "\n→ will re-place lower"
-                                )
-                                self._tg_send(_tg_msg)
-                            except Exception:
-                                pass
                             wl_rival_offers.extend(rivals)
                             time.sleep(2.0)
                             continue
@@ -1048,34 +1016,6 @@ class CounterBidder:
                     log.info("  🎯 non-WL %s: %d offers (%s) — hunting",
                              addr[:14], len(coll_offers), reason)
 
-                    # === PATCH 2026-05-31 UNKNOWN_COLLECTION_FILTER ===
-                    # Defense against scammy/dust collections discovered via parasite hunt.
-                    # Only applies to "unknown" non-WL collections (no buy_config entry).
-                    # Env-tunable thresholds; default ON. Logs + TG when skipped.
-                    if not has_config and os.environ.get("COUNTERBID_NONWL_FILTER_ENABLED", "1") == "1":
-                        _ucf_min_offers = int(os.environ.get("NONWL_MIN_RIVAL_OFFERS", "3"))
-                        _ucf_min_usd = float(os.environ.get("NONWL_MIN_FLOOR_USD", "0.01"))
-                        _ucf_max_usd = float(os.environ.get("NONWL_MAX_FLOOR_USD", "10.0"))
-                        _ucf_skip = None
-                        if len(coll_offers) < _ucf_min_offers:
-                            _ucf_skip = "too_few_offers (" + str(len(coll_offers)) + "<" + str(_ucf_min_offers) + ")"
-                        elif cheapest_usd < _ucf_min_usd:
-                            _ucf_skip = "dust_floor ($" + format(cheapest_usd, ".4f") + "<$" + format(_ucf_min_usd, ".4f") + ")"
-                        elif cheapest_usd > _ucf_max_usd:
-                            _ucf_skip = "too_expensive ($" + format(cheapest_usd, ".2f") + ">$" + format(_ucf_max_usd, ".2f") + ")"
-                        if _ucf_skip:
-                            log.info("  ⛔ unknown-coll %s: filter SKIP %s", addr[:14], _ucf_skip)
-                            try:
-                                self._tg_send(
-                                    "⛔ <b>UNKNOWN-COLL FILTER</b>\n"
-                                    + "<code>" + str(addr[:14]) + "</code> skip\n"
-                                    + "reason: " + _ucf_skip
-                                )
-                            except Exception:
-                                pass
-                            continue
-                    # === END PATCH ===
-
                     limited = coll_offers[:self.nonwl_qty]
                     report.total_offers_found += len(limited)
 
@@ -1145,57 +1085,6 @@ class CounterBidder:
         return report
 
     # ── Phase 3: Missclick Buy ──────────────────────────────────
-
-    def _auto_add_collection_config(self, addr: str, name: str,
-                                     listing_price: float, currency: str,
-                                     chain: str) -> bool:
-        """PATCH 2026-05-30: after a successful Phase-3 buy on a collection
-        without explicit buy_config entry, auto-create one with conservative
-        prices. Gated by env AUTO_ADD_BUY_CONFIG (default on).
-
-        low_price        = listing_price * 1.5  (sell floor — 1.5x breakeven)
-        max_offer_price  = listing_price * 0.95 (won't bid above what we paid)
-        max_buy_price    = listing_price * 1.0  (won't pay more than we paid)
-        """
-        import os, json, time
-        if os.environ.get("AUTO_ADD_BUY_CONFIG", "1") not in ("1", "true", "yes", "on"):
-            return False
-        addr_lo = addr.lower()
-        colls = self.buy_config.setdefault("collections", {})
-        if addr_lo in colls:
-            return False  # never overwrite manual config
-        new_entry = {
-            "name": (name or addr_lo[:14])[:50],
-            "low_price": round(listing_price * 1.5, 6),
-            "max_offer_price": round(listing_price * 0.95, 6),
-            "max_buy_price": round(listing_price * 1.0, 6),
-            "currency": (currency or "WBNB").upper(),
-            "enabled": True,
-            "_auto_added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "_auto_added_from": "Phase3 missclick buy",
-            "_auto_buy_price": listing_price,
-            "_auto_buy_chain": chain,
-        }
-        colls[addr_lo] = new_entry
-        try:
-            path = "/app/config/buy_config.json"
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.buy_config, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, path)
-            log.warning(
-                "[AUTO_CONFIG_ADD] %s (%s) added to buy_config: low=%.6f %s, max_offer=%.6f, max_buy=%.6f",
-                addr_lo[:14], (name or "?")[:30],
-                new_entry["low_price"], currency,
-                new_entry["max_offer_price"], new_entry["max_buy_price"],
-            )
-            return True
-        except Exception as exc:
-            colls.pop(addr_lo, None)
-            log.error("[AUTO_CONFIG_ADD] file write failed for %s: %s",
-                      addr_lo[:14], exc)
-            return False
-
 
     def _run_missclick_buy_phase(self, chain: str, report: ScanReport) -> int:
         """Phase 3: scan WL collections for cheap listings and buy them.
@@ -1300,36 +1189,6 @@ class CounterBidder:
                                 result.currency, result.tx_hash or "?")
                     # Telegram alert
                     self._alert_buy(result, name, chain)
-                    # PATCH 2026-05-30: auto-add to buy_config if absent
-                    try:
-                        self._auto_add_collection_config(
-                            addr, name, result.listing_price,
-                            result.currency, chain)
-                    except Exception as _ace:
-                        log.warning("[AUTO_CONFIG_ADD] hook err: %s", _ace)
-
-                    # PATCH 2026-07-17 AUTOFLIP: queue for immediate resell at buy_price * multiplier
-                    if __import__('os').getenv('AUTOFLIP_ENABLED', '1') == '1':
-                        try:
-                            _mult = float(__import__('os').getenv('AUTOFLIP_MULTIPLIER', '3.0'))
-                            _flip_price = float(result.listing_price) * _mult
-                            if not hasattr(self, '_flip_queue'):
-                                self._flip_queue = []
-                            self._flip_queue.append({
-                                'chain': chain,
-                                'collection': addr,
-                                'name': name,
-                                'token_id': result.token_id,
-                                'buy_price': float(result.listing_price),
-                                'flip_price': _flip_price,
-                                'currency': result.currency,
-                                'queued_at': __import__('time').time(),
-                            })
-                            log.warning("  🎯 [AUTOFLIP] queued %s #%s @ %.6f %s (bought %.6f, x%.1f)",
-                                        name, result.token_id, _flip_price, result.currency,
-                                        result.listing_price, _mult)
-                        except Exception as _fe:
-                            log.warning("[AUTOFLIP] queue err: %s", _fe)
                 else:
                     log.error("  ❌ BUY FAILED: %s — %s", name, result.error)
 
@@ -1928,22 +1787,6 @@ class CounterBidder:
                      name, best_rival.price, best_rival.currency, best_rival_usd,
                      best_rival.maker[:14] if best_rival.maker else "?",
                      getattr(best_rival, "source_type", "tracked"))
-            # PATCH 2026-05-30 (ML_ADVISOR_SHADOW): log advisor recommendation
-            # next to actual decision. Gated by env ML_ADVISOR_ENABLED (default 0).
-            try:
-                from okx_nft_bot import advisor as _adv
-                if _adv.is_enabled():
-                    _ctx = _adv.MarketContext(
-                        chain=chain,
-                        collection=name[:30],
-                        competitor_activity=len(offers),
-                        is_wl=is_wl,
-                    )
-                    _rec = _adv.advise(_ctx)
-                    log.info("  [ML_ADVISOR_SHADOW] %s: %s conf=%.2f rule=%s reason=%s",
-                             name[:30], _rec.action.value, _rec.confidence, _rec.rule, _rec.reason)
-            except Exception as _adv_e:
-                log.debug("[ML_ADVISOR_SHADOW] hook err: %s", _adv_e)
         else:
             log.info("  🎯 %s: no rival found — min-offer mode", name)
         chain_native = {"eth": "WETH", "bsc": "WBNB"}.get(chain, "WETH")
@@ -2027,36 +1870,7 @@ class CounterBidder:
                 return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
             # Calculate outbid price: rival price + small step (undercut_bps)
-            _bps = self.undercut_bps
-            # ── PATCH 2026-08-01 (ANTI-WASH): не переплачивать за фиктивную
-            # ликвидность. Если у соперника нечем оплатить свою же ставку,
-            # его оффер — насос: он ничего не теряет, а мы задираем цену.
-            # PHANTOM  → вообще не перебиваем (пропускаем коллекцию)
-            # THIN     → перебиваем минимально (+0.5% вместо +10%)
-            # REAL     → как обычно
-            try:
-                _mk = (best_rival.maker or "").lower() if best_rival else ""
-                _flag = self._antiwash_flag(_mk) if _mk else None
-                if _flag == "PHANTOM":
-                    log.info("  🚫 %s: соперник %s НЕ ОБЕСПЕЧЕН (phantom) — "
-                             "не переплачиваем, пропуск", name, _mk[:14])
-                    return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-                _held = self._is_trap(addr, _mk) if _mk else 0
-                if _held > 0:
-                    log.warning("  🪤 %s: ЛОВУШКА — соперник %s сам держит %d "
-                                "NFT этой коллекции. Он не покупает, он тянет "
-                                "цену чтобы слить нам. НЕ перебиваем.",
-                                name, _mk[:14], _held)
-                    return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-                if _flag == "THIN":
-                    _bps = min(_bps, 50)
-                    log.info("  💧 %s: соперник %s тонкий (thin) — "
-                             "перебиваем минимально (+%.2f%%)",
-                             name, _mk[:14], _bps / 100.0)
-            except Exception as _awe:
-                log.debug("antiwash check skipped: %s", _awe)
-
-            outbid_usd = rival_usd * (1 + _bps / 10000)
+            outbid_usd = rival_usd * (1 + self.undercut_bps / 10000)
             if outbid_usd > cap_usd:
                 outbid_usd = cap_usd
 
@@ -2074,21 +1888,6 @@ class CounterBidder:
             if best_rival_usd > 0 and our_usd < best_rival_usd * 0.20:
                 log.info("  🚫 %s: our $%.2f < 20%% of best offer $%.2f — SKIP (too far below market)",
                          name, our_usd, best_rival_usd)
-                # ── PATCH 2026-07-31 (OVER-CAP VISIBILITY): Robert должен видеть
-                # на пульте всё, что ушло выше нашего потолка, и решать вручную.
-                # Раньше это оставалось только в логах и терялось.
-                try:
-                    self._record_execution_submit_event(
-                        chain=chain,
-                        collection=addr,
-                        price_bnb=our_price,
-                        status="over_cap",
-                        reason=("ВЫШЕ ПОТОЛКА: соперник $%.2f, наш лимит $%.2f (%s) "
-                                "— нужно решение" % (best_rival_usd, our_usd,
-                                                     (best_rival.maker or "?")[:14])),
-                    )
-                except Exception as _oexc:
-                    log.debug("over_cap record failed: %s", _oexc)
                 return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
         # ── FLOOR PRICE GUARD ──
@@ -2230,9 +2029,7 @@ class CounterBidder:
             existing_usd_pre = self.prices.to_usd(existing_price, existing_cur)
             we_are_winning = existing_usd_pre >= rival_usd
             cur_match_g1 = (existing_cur == rival_cur)  # PATCH 2026-05-21
-            # PATCH 2026-05-22 (AGGRESSIVE-FIRST): SAME-PRICE GUARD 1% → 0.2%, env-tunable
-            _sp_tol = float(os.getenv("OKX_SAME_PRICE_TOL", "0.002"))
-            if cur_match_g1 and we_are_winning and existing_usd_pre > 0 and abs(our_usd - existing_usd_pre) / existing_usd_pre < _sp_tol:
+            if cur_match_g1 and we_are_winning and existing_usd_pre > 0 and abs(our_usd - existing_usd_pre) / existing_usd_pre < 0.01:
                 log.info("  ✅ %s: new $%.4f ≈ old $%.4f (diff <1%%), we beat rival $%.4f — KEEP",
                          name, our_usd, existing_usd_pre, rival_usd)
                 return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
@@ -2269,11 +2066,9 @@ class CounterBidder:
                     _max_rival_cur = (_o.currency or "").upper()  # PATCH 2026-05-21
             _ex_cur_g2 = (our_existing.get("currency") or "").upper()  # PATCH 2026-05-21
             _cur_match_g2 = (_ex_cur_g2 == _max_rival_cur) if _max_rival_cur else True
-            # PATCH 2026-05-22 (AGGRESSIVE-FIRST): SELF-PROTECT 1.05 → 1.01 margin
-            _sp_mult = float(os.getenv("OKX_SELF_PROTECT_MULT", "1.01"))
-            if _cur_match_g2 and _ex_usd > 0 and _max_rival_usd > 0 and _ex_usd >= _max_rival_usd * _sp_mult:
-                log.info("  ✅ %s: SELF-PROTECT our $%.4f >= max_rival $%.4f * %.3f — KEEP (no self-outbid)",
-                         name, _ex_usd, _max_rival_usd, _sp_mult)
+            if _cur_match_g2 and _ex_usd > 0 and _max_rival_usd > 0 and _ex_usd >= _max_rival_usd * 1.05:
+                log.info("  ✅ %s: SELF-PROTECT our $%.4f >= max_rival $%.4f * 1.05 — KEEP (no self-outbid)",
+                         name, _ex_usd, _max_rival_usd)
                 self.already_winning += 1
                 return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
             if (not _cur_match_g2) and _ex_usd > 0 and _max_rival_usd > 0:
@@ -3413,57 +3208,6 @@ class CounterBidder:
         self._tg_send(msg)
         log.info("📱 TG alert sent: %s balance=%.6f < threshold=%.6f", currency, balance, threshold)
 
-    # ── PATCH 2026-08-01: чтение вердиктов анти-wash ──────────────
-    _ANTIWASH_PATH = "/app/data/antiwash_flags.json"
-    _antiwash_cache: dict = {}
-    _antiwash_loaded_at: float = 0.0
-
-    # ── PATCH 2026-08-01 (TRAP): соперник торгует тем, чем владеет ──
-    # Схема Robert'а: паразит ставит офферы на мусорную коллекцию и тянет
-    # цену вверх. Мы видим "конкуренцию", перебиваем — и он сливает нам
-    # свой мешок по задранной цене. Подпись схемы простая: настоящий
-    # покупатель НЕ владеет тем, что покупает. Если владеет — это ловушка.
-    _trap_cache: dict = {}
-    _TRAP_TTL = 900  # 15 мин
-
-    def _is_trap(self, collection: str, maker: str) -> int:
-        """Сколько NFT этой коллекции держит соперник. >0 = ловушка."""
-        import time as _t, json as _js, urllib.request as _u
-        if not collection or not maker:
-            return 0
-        key = (collection.lower(), maker.lower())
-        hit = self._trap_cache.get(key)
-        if hit and (_t.time() - hit[1]) < self._TRAP_TTL:
-            return hit[0]
-        try:
-            data = "0x70a08231" + maker[2:].rjust(64, "0")
-            body = _js.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                              "params": [{"to": collection, "data": data},
-                                         "latest"]}).encode()
-            req = _u.Request("https://bsc-dataseed.binance.org/", data=body,
-                             headers={"Content-Type": "application/json"})
-            v = _js.load(_u.urlopen(req, timeout=12)).get("result")
-            n = int(v, 16) if v and v != "0x" else 0
-        except Exception:
-            n = 0
-        type(self)._trap_cache[key] = (n, _t.time())
-        return n
-
-    def _antiwash_flag(self, maker):
-        """REAL / THIN / PHANTOM или None. Файл обновляет antiwash.py."""
-        import os as _os, json as _js, time as _t
-        try:
-            cls = type(self)
-            if _t.time() - cls._antiwash_loaded_at > 300:
-                if _os.path.exists(self._ANTIWASH_PATH):
-                    with open(self._ANTIWASH_PATH) as _f:
-                        cls._antiwash_cache = _js.load(_f)
-                    cls._antiwash_loaded_at = _t.time()
-            rec = cls._antiwash_cache.get((maker or "").lower())
-            return rec.get("verdict") if isinstance(rec, dict) else None
-        except Exception:
-            return None
-
     def _check_balance_for_offer(self, currency_address: str, currency: str,
                                   offer_price: float) -> bool:
         """Pre-flight balance check for a single offer.
@@ -3492,20 +3236,7 @@ class CounterBidder:
             # submitOrder step2 even though Seaport itself doesn't lock funds.
             # Tests confirmed: offer > balance → "This order is no longer valid".
             # Skip submits that exceed 90% of balance to save rate limit budget.
-            # PATCH 2026-07-17: allow up to $2.5 USD-eq offers regardless of balance (env floor)
-            _env_floor = float(__import__('os').getenv('MIN_OFFER_ALLOWANCE_' + str(cur).upper(), '0') or '0')
-            soft_cap = max(balance * 0.9, _env_floor)
-            # ── PATCH 2026-07-31 (ZERO-BALANCE GUARD) ──
-            # MIN_OFFER_ALLOWANCE_* задумывался как «пропускать мелкие офферы,
-            # даже если баланс чуть ниже». Но при ПУСТОМ кошельке он пропускал
-            # офферы вообще без покрытия — OKX потом отбивал их как
-            # "This order is no longer valid". Пример: USDC на BSC = 0,
-            # порог 1.0 → все офферы < $1 уходили в никуда.
-            # Теперь: нет монеты в этой сети — нет оффера в этой монете.
-            if balance <= 0.000001:
-                log.info("⛔ %s: баланс 0 в этой сети — оффер невозможен "
-                         "(порог %.4f игнорируется)", cur, _env_floor)
-                return False
+            soft_cap = balance * 0.9
             if offer_price > soft_cap:
                 log.info("⛔ %s balance=%.6f < offer=%.6f×1.11 (%.6f cap) — skip "
                          "(OKX rejects pre-fill if balance insufficient)",
@@ -3593,28 +3324,7 @@ class CounterBidder:
                 return False
 
             cur_upper = currency.upper()
-            # ── PATCH 2026-07-31 (QTY-BALANCE): OKX проверяет ПОЛНУЮ сумму
-            # (цена × количество), а не цену за штуку. Раньше мы слали
-            # qty=58 × 0.15 = 8.7 USDT при балансе 3 → "order is no longer
-            # valid". Теперь режем количество до того, что реально покрываем,
-            # вместо того чтобы пропускать бой целиком.
-            try:
-                _bal_now = self._get_balance(currency_address) or 0.0
-                _floor_now = float(__import__('os').getenv(
-                    'MIN_OFFER_ALLOWANCE_' + cur_upper, '0') or '0')
-                _cap_now = max(_bal_now * 0.9, _floor_now)
-                if price > 0 and quantity > 1 and (price * quantity) > _cap_now:
-                    _afford = max(1, int(_cap_now // price))
-                    if _afford < quantity:
-                        log.info("💰 %s %s: qty %d→%d (баланс %.4f, цена %.6f, лимит %.4f)",
-                                 collection_address[:14], cur_upper,
-                                 quantity, _afford, _bal_now, price, _cap_now)
-                        quantity = _afford
-            except Exception as _qexc:
-                log.debug("qty-balance cap skipped: %s", _qexc)
-
-            if not self._check_balance_for_offer(currency_address, cur_upper,
-                                                 price * max(1, quantity)):
+            if not self._check_balance_for_offer(currency_address, cur_upper, price):
                 self._record_execution_submit_event(
                     chain="bsc",
                     collection=collection_address,
@@ -3740,28 +3450,7 @@ class CounterBidder:
                 return False
 
             cur_upper = currency.upper()
-            # ── PATCH 2026-07-31 (QTY-BALANCE): OKX проверяет ПОЛНУЮ сумму
-            # (цена × количество), а не цену за штуку. Раньше мы слали
-            # qty=58 × 0.15 = 8.7 USDT при балансе 3 → "order is no longer
-            # valid". Теперь режем количество до того, что реально покрываем,
-            # вместо того чтобы пропускать бой целиком.
-            try:
-                _bal_now = self._get_balance(currency_address) or 0.0
-                _floor_now = float(__import__('os').getenv(
-                    'MIN_OFFER_ALLOWANCE_' + cur_upper, '0') or '0')
-                _cap_now = max(_bal_now * 0.9, _floor_now)
-                if price > 0 and quantity > 1 and (price * quantity) > _cap_now:
-                    _afford = max(1, int(_cap_now // price))
-                    if _afford < quantity:
-                        log.info("💰 %s %s: qty %d→%d (баланс %.4f, цена %.6f, лимит %.4f)",
-                                 collection_address[:14], cur_upper,
-                                 quantity, _afford, _bal_now, price, _cap_now)
-                        quantity = _afford
-            except Exception as _qexc:
-                log.debug("qty-balance cap skipped: %s", _qexc)
-
-            if not self._check_balance_for_offer(currency_address, cur_upper,
-                                                 price * max(1, quantity)):
+            if not self._check_balance_for_offer(currency_address, cur_upper, price):
                 self._record_execution_submit_event(
                     chain="eth",
                     collection=collection_address,
@@ -4179,14 +3868,21 @@ class CounterBidder:
                     low_price = round(max_op * 1.1, 6)
 
             if not low_price or low_price <= 0:
-                # PATCH 2026-05-29 (NO_CONFIG_DEFAULT_PRICE): collections without
-                # buy_config OR without price fields default to _SELL_DEFAULT_PRICE
-                # (0.1 BNB/ETH = "на шару"). No more market-floor lookup — the
-                # best_offer-as-floor path led to listing below low_price. ANTI_DUMP
-                # then handles undercut/refuse based on this default.
-                low_price = _SELL_DEFAULT_PRICE
-                log.info("  SELL %s: no config or no low_price → default %.4f %s",
-                         col_addr[:14], low_price, sell_currency)
+                if has_config:
+                    # Config exists but no price fields → safe default
+                    low_price = _SELL_DEFAULT_PRICE
+                else:
+                    # No config at all → check live offers to find market floor
+                    best_offer_price = self._get_best_offer_price(
+                        client, chain, col_addr, sell_decimals_pre)
+                    if best_offer_price and best_offer_price > 0:
+                        # Don't sell below best offer — use it as floor
+                        low_price = best_offer_price
+                        log.info("  SELL %s: no config → using best offer %.6f as floor",
+                                 col_addr[:14], low_price)
+                    else:
+                        # No offers either → safe high default
+                        low_price = _SELL_DEFAULT_PRICE
 
             currency_address = self._get_currency_address(sell_currency, chain)
             coll_name = cfg.get("name") or self._wl_index.get(col_addr, {}).get("collection_name") or col_addr[:14]
@@ -4266,14 +3962,15 @@ class CounterBidder:
                 # let it clamp our listing to an unsellable price. (Real market
                 # bids never exceed the cheapest ask.)
                 if our_sell_price < low_price:
-                    # PATCH 2026-05-29 (ANTI_DUMP): always honor low_price as hard floor.
-                    # Previous behaviour ignored low_price for no-config when "looks phantom"
-                    # — that path is what listed our товар at $0.45 / $3.18. No more.
-                    log.warning(
-                        "  SELL %s: rival-undercut %.6f BELOW low_price %.6f → clamp to low_price (anti-dump). has_config=%s",
-                        col_addr[:14], our_sell_price, low_price, has_config,
-                    )
-                    our_sell_price = low_price
+                    if not has_config and low_price > cheapest_rival_price * 2:
+                        log.warning(
+                            "  SELL %s: low_price %.6f (from best_offer, no config) "
+                            "looks phantom vs cheapest_rival=%.6f — ignoring clamp, "
+                            "listing at rival-undercut %.6f",
+                            col_addr[:14], low_price, cheapest_rival_price, our_sell_price,
+                        )
+                    else:
+                        our_sell_price = low_price
                 # HARD FLOOR-CAP (patch #6): regardless of config / low_price,
                 # our listing must be strictly BELOW the cheapest rival ask.
                 # If anything earlier clamped us to >= cheapest_rival_price,
@@ -4281,23 +3978,12 @@ class CounterBidder:
                 # Force-undercut rival by at least sell_bps. This protects
                 # against stale config low_price > current market floor (CR7
                 # Forever incident: config said 3.41 USDT but market crashed).
-                # PATCH 2026-05-29 (ANTI_DUMP): if rival is below low_price, REFUSE to
-                # list rather than chase them to the bottom. The previous FLOOR-CAP
-                # OVERRIDE would force our price below low_price to "stay sellable",
-                # which dumped good NFTs at $0.45 / $3.18.
                 floor_cap = cheapest_rival_price * step_factor
-                if low_price and floor_cap < low_price:
-                    log.warning(
-                        "  SELL %s: REFUSE LIST — to undercut rival %.6f we'd need %.6f < low_price %.6f. "
-                        "Holding inventory (anti-dump).",
-                        col_addr[:14], cheapest_rival_price, floor_cap, low_price,
-                    )
-                    continue
                 if our_sell_price > floor_cap:
                     log.warning(
                         "  SELL %s: our=%.6f > cheapest_rival_undercut=%.6f "
                         "(low_price=%.6f, config=%s) — FLOOR-CAP OVERRIDE: "
-                        "rival above low_price, undercut OK",
+                        "forcing price to rival-undercut; low_price source may be stale",
                         col_addr[:14], our_sell_price, floor_cap, low_price,
                         "yes" if has_config else "no",
                     )
@@ -4347,7 +4033,7 @@ class CounterBidder:
                 if token_id in our_listed_token_ids:
                     continue  # Already listed at good price
 
-                if self.dry_run or self._sell_dry_run:
+                if self.dry_run:
                     log.info("  SELL DRY-RUN: %s #%s at %.4f %s",
                              col_addr[:14], token_id, our_sell_price, sell_currency)
                     placed += 1

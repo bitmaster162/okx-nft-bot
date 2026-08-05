@@ -2,18 +2,16 @@
   "_comment": "Max prices for auto-buy and auto-offer on Binance whitelist collections",
   "defaults": {
     "eth": {
-      "max_buy_price": 0.00033751,
-      "max_offer_price": 0.00033751,
+      "max_buy_price": 0.000257,
+      "max_offer_price": 0.000257,
       "currency": "ETH",
-      "_comment": "~$0.54 at ~$2100/ETH",
-      "_cap_raised_070": "2026-05-27"
+      "_comment": "~$0.54 at ~$2100/ETH"
     },
     "bsc": {
-      "max_buy_price": 0.00107198,
-      "max_offer_price": 0.00107198,
+      "max_buy_price": 0.0009,
+      "max_offer_price": 0.0009,
       "currency": "BNB",
-      "_comment": "~$0.54 at ~$600/BNB",
-      "_cap_raised_070": "2026-05-27"
+      "_comment": "~$0.54 at ~$600/BNB"
     }
   },
   "offer_settings": {
@@ -24,22 +22,20 @@
     "max_total_offers": 50
   },
   "buy_settings": {
-    "enabled": true,
-    "max_buys_per_collection": 1,
-    "max_total_buys_per_cycle": 3,
+    "enabled": false,
+    "max_buys_per_collection": 2,
+    "max_total_buys_per_cycle": 5,
     "cooldown_seconds": 60,
-    "_disabled_at": "2026-05-28 Robert: still 0% win + spammy zombie listings + 429 storm",
-    "_disabled_reason": "Phase 3c has 0% win rate over 4808 attempts / 8 days — zombie listings in OKX asset-list API (indexer lag). Re-enable only after architectural fix (fresh-listing-age filter OR event-stream subscription).",
-    "_reenabled": "2026-05-29 with BUY_MAX_LISTING_AGE_S=60 freshness filter"
+    "_disabled_at": "2026-04-23",
+    "_disabled_reason": "Phase 3c has 0% win rate over 4808 attempts / 8 days \u2014 zombie listings in OKX asset-list API (indexer lag). Re-enable only after architectural fix (fresh-listing-age filter OR event-stream subscription)."
   },
   "sell_settings": {
-    "enabled": true,
+    "enabled": false,
     "undercut_step_bps": 50,
     "listing_duration_days": 7,
     "min_listing_price_bnb": 0.001,
     "_disabled_at": "20260425-152456",
-    "_disabled_reason": "Robert 2026-04-25: blucamon sold below low_price; _run_sell_phase missing floor check",
-    "_reenabled": "2026-05-27 Robert: SELL via dry-run first (SELL_DRY_RUN=1)"
+    "_disabled_reason": "Robert 2026-04-25: blucamon sold below low_price; _run_sell_phase missing floor check"
   },
   "collections": {
     "0x55700cd2e91f39bc56f589b346dac12a7907ea08": {
@@ -2520,30 +2516,27 @@
     },
     "0x198d33fb8f75ac6a7cb968962c743f09c486cca6": {
       "name": "Age of Gods",
-      "max_offer_price": 2.0,
-      "max_buy_price": 2.0,
+      "max_offer_price": 0.3255,
+      "max_buy_price": 0.3255,
       "currency": "USDT",
       "low_price": 0.35805,
-      "enabled": true,
-      "_robert_note": "cap raised to $2 on 2026-05-21 per request"
+      "enabled": true
     },
     "0xf184ce132a5dd2558da3476726c4a03a2d1baa4e": {
       "name": "Honey Shots",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.316365,
+      "max_buy_price": 0.316365,
       "currency": "USDT",
       "low_price": 0.348002,
-      "enabled": true,
-      "_robert_note_070": "raised from 0.316365 to 0.7 (USDT) = $0.70 on 2026-05-21"
+      "enabled": true
     },
     "0xdf7952b35f24acf7fc0487d01c8d5690a60dba07": {
       "name": "Pancake Bunnies",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.264705,
+      "max_buy_price": 0.264705,
       "currency": "USDT",
       "low_price": 0.291176,
-      "enabled": true,
-      "_robert_note_070": "raised from 0.264705 to 0.7 (USDT) = $0.70 on 2026-05-21"
+      "enabled": true
     },
     "0xd27447bbe1d068909ffd920f60ca8f8c6d53a61c": {
       "name": "BULL BTC CLUB",
@@ -2557,20 +2550,19 @@
     },
     "0x891d36718bf26c7389487366beecca04bb42b680": {
       "name": "Blucamon (BLUCAMON)",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.00125,
+      "max_buy_price": 0.00125,
       "currency": "USDT",
       "low_price": 0.00145,
       "enabled": false,
       "_last_auto_update": "2026-04-22 stale-floor realign (was low=0.128321/88x off; rival=0.00145)",
       "_updated_at": "20260425-152456",
       "_reverted_at": "20260425-154655",
-      "_reverted_reason": "Robert: blucamon cap should stay low — collection trades at $0.001",
+      "_reverted_reason": "Robert: blucamon cap should stay low \u2014 collection trades at $0.001",
       "_disabled_at": "20260425-170156",
       "_disabled_reason": "Robert 2026-04-25: bot sold our inventory at low price; offering more = buying back our own losses",
       "_blacklist_at": "20260425-193808",
-      "_blacklist_reason": "Robert 2026-04-25",
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "_blacklist_reason": "Robert 2026-04-25"
     },
     "0x0a8901b0e25deb55a87524f0cc164e9644020eba": {
       "name": "Pancake Squad",
@@ -2585,12 +2577,11 @@
     },
     "0xada0d90563ad7239d85752d6fed9ac1b7c2c1b06": {
       "name": "Elfin Auction",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.10815,
+      "max_buy_price": 0.10815,
       "currency": "USDT",
       "low_price": 0.118965,
-      "enabled": true,
-      "_robert_note_070": "raised from 0.10815 to 0.7 (USDT) = $0.70 on 2026-05-21"
+      "enabled": true
     },
     "0x1ddb2c0897daf18632662e71fdd2dbdc0eb3a9ec": {
       "name": "brnft",
@@ -2605,15 +2596,14 @@
     },
     "0xf3857306a37264f15a19ad37da8a9485e5f7cfb3": {
       "name": "Alien world",
-      "max_offer_price": 0.00108,
-      "max_buy_price": 0.00108,
+      "max_offer_price": 0.000471,
+      "max_buy_price": 0.000471,
       "currency": "WBNB",
       "low_price": 0.000518,
       "enabled": true,
       "_target_usdt": 0.3,
       "_updated_at": "20260425-172917",
-      "_update_reason": "WL audit 2026-04-25: cap was way above OKX floor",
-      "_robert_note_070": "raised from 0.000471 to 0.00108 (WBNB) = $0.70 on 2026-05-21"
+      "_update_reason": "WL audit 2026-04-25: cap was way above OKX floor"
     },
     "0x74839a2058695a5778ac41fcb9ee5a4bc9919424": {
       "name": "DPGU BSC",
@@ -2637,7 +2627,7 @@
       "_update_reason": "WL audit 2026-04-25: cap was way above OKX floor"
     },
     "0x73096042a5297128e2bb074bd91450db58f3b4ea": {
-      "name": "Kalmy’s Universe",
+      "name": "Kalmy\u2019s Universe",
       "max_offer_price": 0.001381,
       "max_buy_price": 0.001381,
       "currency": "WBNB",
@@ -2744,12 +2734,11 @@
     },
     "0x0cfc268a7bf2f5c41cadacfa5ab70143cbcdb1cd": {
       "name": "0x0cfc268a7bf2",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 2e-06,
+      "max_buy_price": 2e-06,
       "currency": "WBNB",
       "low_price": 2e-06,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0xfe6f685d787a331d35ddc2507bf15dfd1831f4ca": {
       "name": "Forever Worldwide: Portugal",
@@ -2772,12 +2761,11 @@
     },
     "0xe4a618c7e7ad3fad8e6c76baf12875f6b4a98f9c": {
       "name": "0xe4a618c7e7ad",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 0.000151,
+      "max_buy_price": 0.000151,
       "currency": "WBNB",
       "low_price": 0.000166,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0x13870dee6a39368a17dfa454799b2876edbb7200": {
       "name": "0x13870dee6a39",
@@ -2936,12 +2924,11 @@
     },
     "0x31730f3c834f0af5065c1020b98656bffbd9adf7": {
       "name": "0x31730f3c834f",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 0.000974,
+      "max_buy_price": 0.000974,
       "currency": "WBNB",
       "low_price": 0.001071,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0xdda9e7cea06972fd0b728460331165a9f0b559fb": {
       "name": "0xdda9e7cea069",
@@ -2978,48 +2965,43 @@
     },
     "0xf4de8d8738e184ae4817a8be016c644ba8c14c76": {
       "name": "0xf4de8d8738e1",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 0.00076,
+      "max_buy_price": 0.00076,
       "currency": "WBNB",
       "low_price": 0.000836,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0x34bb0479e9e59e4eb97529502d2d77b4b87cf6ac": {
       "name": "0x34bb0479e9e5",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 0.000696,
+      "max_buy_price": 0.000696,
       "currency": "WBNB",
       "low_price": 0.000766,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0xe6821ab1069f2f760688025aa9a1777faaabcafb": {
       "name": "0xe6821ab1069f",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 0.000693,
+      "max_buy_price": 0.000693,
       "currency": "WBNB",
       "low_price": 0.000762,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0xbbe20a1c9712e7a86fb852a11549c7f5c3352f9a": {
       "name": "0xbbe20a1c9712",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 0.000675,
+      "max_buy_price": 0.000675,
       "currency": "WBNB",
       "low_price": 0.000743,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0x93fb67399ff3ba8d0580237b2ae453cca4b33edf": {
       "name": "0x93fb67399ff3",
-      "max_offer_price": 0.00108,
-      "max_buy_price": 0.00108,
+      "max_offer_price": 0.000658,
+      "max_buy_price": 0.000658,
       "currency": "WBNB",
       "low_price": 0.000724,
-      "enabled": true,
-      "_robert_note_070": "raised from 0.000658 to 0.00108 (WBNB) = $0.70 on 2026-05-21"
+      "enabled": true
     },
     "0xafc7647b584730694b9606511f11f423a0816eff": {
       "name": "HorrorApeClub",
@@ -3135,48 +3117,43 @@
     },
     "0xaa1862d257a787080c9bb6e1bfabaab34554e9e1": {
       "name": "Alpine Esports Series 2023",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 0.00013,
+      "max_buy_price": 0.00013,
       "currency": "WBNB",
       "low_price": 0.000143,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0x0b7be70924395e3113db8b3db35b13bad4e0c5a9": {
       "name": "Alpine Race Collectibles",
-      "max_offer_price": 0.00107198,
-      "max_buy_price": 0.00107198,
+      "max_offer_price": 0.00013,
+      "max_buy_price": 0.00013,
       "currency": "WBNB",
       "low_price": 0.000143,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0xfb1da780bb60f9f15ef63f1cc3da1fbb5fef7152": {
       "name": "NFT Passport Collection",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.06565,
+      "max_buy_price": 0.06565,
       "currency": "USDT",
       "low_price": 0.072215,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0xbcb5b05283b01e08ab0dcd72c19c6aa04a73e8e3": {
       "name": "Pride of Nations NFT V2",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.02639,
+      "max_buy_price": 0.02639,
       "currency": "USDT",
       "low_price": 0.029029,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0xf250bf5953b6aa6c735e6a1ec4b4e8c52508a4fb": {
       "name": "Legendary Pandra King",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.54,
+      "max_buy_price": 0.54,
       "currency": "USDT",
       "low_price": 0.594,
-      "enabled": true,
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "enabled": true
     },
     "0xb1c4e4156a4bdddc4ce7eb05109c677ac91b4228": {
       "name": "Alan walker",
@@ -4578,38 +4555,35 @@
     "0x102a35917e9f2ff08ffc5dc4fe3e5a400e4f33a7": {
       "name": "CR7 NFT (BLACKLISTED)",
       "currency": "USDT",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.001,
+      "max_buy_price": 0.001,
       "low_price": 0.0011,
       "enabled": false,
       "_blacklist_reason": "Robert 2026-04-25: bot was filling above floor here; explicit blacklist",
-      "_added_at": "20260425-191945",
-      "_robert_note_070": "raised from 0.001 to 0.7 (USDT) = $0.70 on 2026-05-21"
+      "_added_at": "20260425-191945"
     },
     "0xe3b1d32e43ce8d658368e2cbff95d57ef39be8a6": {
       "name": "Space ID (BLACKLISTED)",
       "currency": "USDT",
-      "max_offer_price": 0.7,
-      "max_buy_price": 0.7,
+      "max_offer_price": 0.001,
+      "max_buy_price": 0.001,
       "low_price": 0.0011,
       "enabled": false,
-      "_blacklist_reason": "Robert 2026-04-25 — Phase 2 should not hunt here",
-      "_cap_raised_070": "2026-05-27 floor=$0.70"
+      "_blacklist_reason": "Robert 2026-04-25 \u2014 Phase 2 should not hunt here"
     },
     "0xdb3a8fb8bacd8ccece587344f3e704abe27f7581": {
       "name": "Mystery Box Maye Musk",
       "currency": "USDT",
       "enabled": true,
-      "max_offer_price": 4.0,
-      "max_buy_price": 4.0,
+      "max_offer_price": 1.5,
+      "max_buy_price": 1.5,
       "low_price": 1.65,
       "_target_usdt": 1.5,
       "_updated_at": "20260425-201931",
-      "_reason": "parasite top $1.15, raise to outbid",
-      "_robert_note_mb": "raised to $4 on 2026-05-21 (was 1.5 USDT)"
+      "_reason": "parasite top $1.15, raise to outbid"
     },
     "0x84eadf01bd0bcd90bd8eed1c610b24be1bc01260": {
-      "name": "Bi·Mech",
+      "name": "Bi\u00b7Mech",
       "currency": "WBNB",
       "enabled": true,
       "max_offer_price": 0.017268,
@@ -4672,14 +4646,6 @@
       "currency": "WETH",
       "enabled": true,
       "low_price": 0.00141
-    },
-    "0x252b6d73afbd35919d80297e86690473aadf1b62": {
-      "name": "parasite-discovered-0x252b6d73",
-      "max_offer_price": 4.0,
-      "max_buy_price": 4.0,
-      "currency": "USDT",
-      "enabled": true,
-      "_robert_note_252b": "added with cap $4 on 2026-05-21"
     }
   }
 }

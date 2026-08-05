@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-04-08T07:27:36.756189+00:00",
+  "wallet": "0xbuyer",
+  "chain": "bsc",
+  "window_days": 30,
+  "summary": {
+    "collection_count": 0,
+    "policy_entries": 0,
+    "promote_count": 0,
+    "steady_count": 0,
+    "throttle_count": 0,
+    "watch_count": 0,
+    "pause_count": 0,
+    "live_enabled_count": 0,
+    "dry_run_only_count": 0,
+    "top_collection": null,
+    "top_band": null,
+    "top_score": 0.0,
+    "recent_live_campaigns": 0,
+    "recent_submitted_total": 0
+  },
+  "collections": {}
+}

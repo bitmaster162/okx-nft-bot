@@ -6,6 +6,18 @@ import logging
 from datetime import datetime, timezone
 
 from okx_nft_bot.adapters.binance_support_mapper import BinanceSupportMapper
+from okx_nft_bot.analytics import (
+    ExecutionFillReconciler,
+    ExecutionHealthAnalyzer,
+    PnlGuardAnalyzer,
+    PortfolioRiskAnalyzer,
+    WalletPnlAnalyzer,
+    format_execution_fill_text,
+    format_execution_health_text,
+    format_pnl_guard_text,
+    format_portfolio_risk_text,
+    format_wallet_pnl_text,
+)
 from okx_nft_bot.analytics.cross_market import detect_spreads, rank_collections
 from okx_nft_bot.analytics.reporting import format_rankings_text, format_spreads_text, send_analytics_report
 from okx_nft_bot.clients.http import StdlibHttpTransport
@@ -35,7 +47,32 @@ from okx_nft_bot.deploy_ops import (
     restore_database,
     set_desired_profile,
 )
-from okx_nft_bot.mass_offer import MassOfferEngine
+from okx_nft_bot.mass_offer import (
+    MassOfferAllocator,
+    MassOfferBatchRunner,
+    MassOfferBudgetScheduler,
+    MassOfferBudgetRebalancer,
+    MassOfferCircuitBreaker,
+    MassOfferQuarantineController,
+    MassOfferUnwindController,
+    MassOfferEconomics,
+    MassOfferEngine,
+    MassOfferFeedbackController,
+    MassOfferPlanner,
+    format_mass_offer_allocator_text,
+    format_mass_offer_batch_text,
+    format_mass_offer_budget_text,
+    format_mass_offer_capital_text,
+    format_mass_offer_quarantine_text,
+    format_mass_offer_rebalance_text,
+    format_mass_offer_circuit_text,
+    format_mass_offer_unwind_execution_text,
+    format_mass_offer_unwind_text,
+    format_mass_offer_economics_text,
+    format_mass_offer_feedback_text,
+    format_mass_offer_plan_text,
+    format_mass_offer_policy_preview,
+)
 from okx_nft_bot.models import FilterDecision, NFTEvent
 from okx_nft_bot.notifiers.base import AlertEnvelope
 from okx_nft_bot.notifiers.factory import build_notifier
@@ -49,6 +86,7 @@ from okx_nft_bot.ops import (
     write_runtime_metrics,
 )
 from okx_nft_bot.pipeline.live_cycle import CursorState, Monitor
+from okx_nft_bot.pydantic_compat import model_dump_compat
 from okx_nft_bot.pipeline.run_once import run_once
 from okx_nft_bot.providers.okx_stub import OKXStubProvider
 from okx_nft_bot.registry import CollectionRegistry
@@ -83,9 +121,9 @@ def cmd_run_live_cycle(source_mode: str) -> int:
         'start_cursor': result.start_cursor,
         'end_cursor': result.end_cursor,
         'raw_events': len(result.raw_events),
-        'new_events': [event.model_dump(mode='json') for event in result.new_events],
-        'decisions': [decision.model_dump(mode='json') for decision in result.decisions],
-        'deliveries': [delivery.model_dump(mode='json') for delivery in result.deliveries],
+        'new_events': [model_dump_compat(event, mode='json') for event in result.new_events],
+        'decisions': [model_dump_compat(decision, mode='json') for decision in result.decisions],
+        'deliveries': [model_dump_compat(delivery, mode='json') for delivery in result.deliveries],
     }, ensure_ascii=False, indent=2, default=str))
     return 0
 
@@ -100,8 +138,8 @@ def cmd_run_collection(name: str, source_mode: str) -> int:
         'target_name': result.target_name,
         'source_mode': result.source_mode,
         'pages_fetched': result.result.pages_fetched,
-        'new_events': [event.model_dump(mode='json') for event in result.result.new_events],
-        'deliveries': [delivery.model_dump(mode='json') for delivery in result.result.deliveries],
+        'new_events': [model_dump_compat(event, mode='json') for event in result.result.new_events],
+        'deliveries': [model_dump_compat(delivery, mode='json') for delivery in result.result.deliveries],
     }, ensure_ascii=False, indent=2, default=str))
     return 0
 
@@ -142,12 +180,12 @@ def cmd_poll_telegram_once() -> int:
     runner, registry = _build_runner(settings, store)
     transport = StdlibHttpTransport(timeout=settings.okx_request_timeout, max_retries=settings.okx_max_retries, rate_limit_per_sec=settings.okx_rate_limit_per_sec)
     client = TelegramBotClient(bot_token=settings.telegram_bot_token, transport=transport)
-
-    def _load_counter_bidder():
+    processor = TelegramCommandProcessor(settings=settings, store=store, registry=registry, runner=runner, client=client)
+    # Wire ParasiteHunter if available
+    try:
+        from okx_nft_bot.sniper.parasite_hunter import ParasiteHunter
         from pathlib import Path
         import os as _os
-        from okx_nft_bot.sniper.counter_bidder import CounterBidder
-
         wl_path = Path(_os.getenv("BINANCE_WHITELIST_PATH", "./data/binance_whitelist.json"))
         buy_path = Path(_os.getenv("BUY_CONFIG_PATH", "./config/buy_config.json"))
         wl = {}
@@ -155,16 +193,9 @@ def cmd_poll_telegram_once() -> int:
             wl_data = json.loads(wl_path.read_text())
             wl = {item["contract_address"].lower(): item for item in wl_data if item.get("contract_address")}
         buy_cfg = json.loads(buy_path.read_text()) if buy_path.exists() else {}
-        return CounterBidder(wl, buy_cfg)
-
-    processor = TelegramCommandProcessor(
-        settings=settings,
-        store=store,
-        registry=registry,
-        runner=runner,
-        client=client,
-        counter_bidder_loader=_load_counter_bidder,
-    )
+        processor.parasite_hunter = ParasiteHunter(wl, buy_cfg)
+    except Exception as exc:
+        logger.warning("ParasiteHunter init failed (telegram): %s", exc)
     result = processor.poll_once()
     write_runtime_metrics(settings, store, extra={'daemon_status': 'telegram_poll', 'last_command': 'poll-telegram-once'})
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
@@ -196,7 +227,7 @@ def cmd_seed_demo() -> int:
     provider = OKXStubProvider()
     result = run_once(provider=provider, store=store, settings=settings)
     write_runtime_metrics(settings, store, extra={'daemon_status': 'seeded_demo', 'last_command': 'seed-demo'})
-    print(json.dumps({'events': [event.model_dump(mode='json') for event in result.events], 'decisions': [decision.model_dump(mode='json') for decision in result.decisions]}, ensure_ascii=False, indent=2, default=str))
+    print(json.dumps({'events': [model_dump_compat(event, mode='json') for event in result.events], 'decisions': [model_dump_compat(decision, mode='json') for decision in result.decisions]}, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
@@ -468,7 +499,7 @@ def cmd_show_offers(
     )
     offers = offers_store.query_offers(filters)
     print(json.dumps(
-        [o.model_dump(mode='json') for o in offers],
+        [model_dump_compat(o, mode='json') for o in offers],
         ensure_ascii=False, indent=2, default=str,
     ))
     return 0
@@ -591,6 +622,751 @@ def cmd_mass_offer_cancel(*, chain: str, collection: str | None) -> int:
     engine = MassOfferEngine(settings=settings)
     payload = engine.cancel_active(chain=chain, collection=collection)
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_policy_preview(
+    *,
+    collection: str,
+    chain: str,
+    price: float | None,
+    max_offers: int | None,
+    delay_seconds: float | None,
+    max_existing_offer: float | None,
+    dry_run: bool | None,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    engine = MassOfferEngine(settings=settings)
+    payload = engine.preview_policy(
+        collection=collection,
+        chain=chain,
+        price_bnb=price,
+        dry_run=dry_run,
+        max_total=max_offers,
+        delay_seconds=delay_seconds,
+        max_existing_offer=max_existing_offer,
+    )
+    if as_text:
+        print(format_mass_offer_policy_preview(payload))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_allocator(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    limit: int,
+    write: bool,
+    policy_limit: int | None,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    allocator = MassOfferAllocator(settings=settings, store=store)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_allocator_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    report = allocator.build_report(
+        wallet=wallet,
+        chain=chain,
+        window_days=resolved_window_days,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        event_limit=resolved_event_limit,
+    )
+    written_paths: dict[str, str] | None = None
+    if write:
+        written_paths = allocator.write_report(
+            wallet=wallet,
+            chain=chain,
+            window_days=resolved_window_days,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            event_limit=resolved_event_limit,
+            limit=policy_limit,
+        )
+    if as_text:
+        print(format_mass_offer_allocator_text(report, limit=limit))
+        if written_paths:
+            print(f"\nwritten_report={written_paths['report_path']}\nwritten_policy={written_paths['policy_path']}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_paths:
+            payload['written_paths'] = written_paths
+        if policy_limit is not None:
+            payload['policy_overrides_preview'] = report.to_policy_overrides(limit=policy_limit)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_feedback(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    limit: int,
+    write: bool,
+    policy_limit: int | None,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    controller = MassOfferFeedbackController(settings=settings, store=store)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_feedback_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    report = controller.build_report(
+        wallet=wallet,
+        chain=chain,
+        window_days=resolved_window_days,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        event_limit=resolved_event_limit,
+    )
+    written_paths: dict[str, str] | None = None
+    if write:
+        written_paths = controller.write_report(
+            wallet=wallet,
+            chain=chain,
+            window_days=resolved_window_days,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            event_limit=resolved_event_limit,
+            limit=policy_limit,
+        )
+    if as_text:
+        print(format_mass_offer_feedback_text(report, limit=limit))
+        if written_paths:
+            print(f"\nwritten_report={written_paths['report_path']}\nwritten_policy={written_paths['policy_path']}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_paths:
+            payload['written_paths'] = written_paths
+        if policy_limit is not None:
+            payload['policy_overrides_preview'] = report.to_policy_overrides(limit=policy_limit)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_circuit(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_hours: int | None,
+    limit: int,
+    write: bool,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    breaker = MassOfferCircuitBreaker(settings=settings)
+    resolved_window_hours = int(window_hours if window_hours is not None else settings.mass_offer_circuit_window_hours)
+    report = breaker.build_report(
+        wallet=wallet,
+        chain=chain,
+        window_hours=resolved_window_hours,
+    )
+    written_path: str | None = None
+    if write:
+        written_path = breaker.write_report(
+            wallet=wallet,
+            chain=chain,
+            window_hours=resolved_window_hours,
+        )
+    if as_text:
+        print(format_mass_offer_circuit_text(report, limit=limit))
+        if written_path:
+            print(f"\nwritten_report={written_path}")
+    else:
+        payload = report.to_dict()
+        payload["preview_limit"] = limit
+        if written_path:
+            payload["written_report"] = written_path
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_economics(
+    *,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    limit: int,
+    write: bool,
+    policy_limit: int | None,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    economics = MassOfferEconomics(settings=settings)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_economics_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    report = economics.build_report(chain=chain, window_days=resolved_window_days, event_limit=resolved_event_limit)
+    written_paths: dict[str, str] | None = None
+    if write:
+        written_paths = economics.write_report(
+            chain=chain,
+            window_days=resolved_window_days,
+            event_limit=resolved_event_limit,
+            limit=policy_limit,
+        )
+    if as_text:
+        print(format_mass_offer_economics_text(report, limit=limit))
+        if written_paths:
+            print(f"\nwritten_report={written_paths['report_path']}\nwritten_policy={written_paths['policy_path']}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_paths:
+            payload['written_paths'] = written_paths
+        if policy_limit is not None:
+            payload['policy_overrides_preview'] = report.to_policy_overrides(limit=policy_limit)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_wallet_pnl(
+    *,
+    wallet: str | None,
+    limit: int,
+    write: bool,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    analyzer = WalletPnlAnalyzer(settings=settings, store=store)
+    report = analyzer.build_report(
+        wallet=wallet,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        collection_limit=limit,
+        open_limit=limit,
+        closed_limit=max(limit, 1) * 2,
+    )
+    written_path: str | None = None
+    if write:
+        written_path = analyzer.write_report(
+            wallet=wallet,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+        )
+    if as_text:
+        print(format_wallet_pnl_text(report, collection_limit=limit, position_limit=limit))
+        if written_path:
+            print(f"\nwritten_report={written_path}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_path:
+            payload['written_report'] = written_path
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_execution_fills(
+    *,
+    wallet: str | None,
+    limit: int,
+    write: bool,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    reconciler = ExecutionFillReconciler(settings=settings, store=store)
+    report = reconciler.reconcile(
+        wallet=wallet,
+        reference_limit=settings.execution_fill_reference_event_limit,
+        chain=settings.execution_chain,
+        window_hours=settings.execution_fill_reconcile_window_hours,
+        price_tolerance_pct=settings.execution_fill_price_tolerance_pct,
+        pre_submit_slack_minutes=settings.execution_fill_pre_submit_slack_minutes,
+        limit=max(limit, 1) * 3,
+    )
+    written_path: str | None = None
+    if write:
+        written_path = reconciler.write_report(
+            wallet=wallet,
+            reference_limit=settings.execution_fill_reference_event_limit,
+            chain=settings.execution_chain,
+            window_hours=settings.execution_fill_reconcile_window_hours,
+            price_tolerance_pct=settings.execution_fill_price_tolerance_pct,
+            pre_submit_slack_minutes=settings.execution_fill_pre_submit_slack_minutes,
+        )
+    if as_text:
+        print(format_execution_fill_text(report, limit=limit))
+        if written_path:
+            print(f"\nwritten_report={written_path}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_path:
+            payload['written_report'] = written_path
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+
+
+def cmd_portfolio_risk(
+    *,
+    wallet: str | None,
+    limit: int,
+    write: bool,
+    apply_guardrails: bool,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    analyzer = PortfolioRiskAnalyzer(settings=settings, store=store)
+    report = (
+        analyzer.evaluate_and_apply(
+            wallet=wallet,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            chain=settings.execution_chain,
+        )
+        if apply_guardrails
+        else analyzer.build_report(
+            wallet=wallet,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            chain=settings.execution_chain,
+        )
+    )
+    written_path: str | None = None
+    if write:
+        written_path = analyzer.write_report(
+            wallet=wallet,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            chain=settings.execution_chain,
+            apply_guardrails=apply_guardrails,
+        )
+    if as_text:
+        print(format_portfolio_risk_text(report, limit=limit))
+        if written_path:
+            print(f"\nwritten_report={written_path}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        payload['apply_guardrails'] = apply_guardrails
+        if written_path:
+            payload['written_report'] = written_path
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+
+def cmd_pnl_guard(
+    *,
+    wallet: str | None,
+    limit: int,
+    write: bool,
+    apply_guardrails: bool,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    analyzer = PnlGuardAnalyzer(settings=settings, store=store)
+    report = (
+        analyzer.evaluate_and_apply(
+            wallet=wallet,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            chain=settings.execution_chain,
+            window_hours=settings.pnl_guard_window_hours,
+        )
+        if apply_guardrails
+        else analyzer.build_report(
+            wallet=wallet,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            chain=settings.execution_chain,
+            window_hours=settings.pnl_guard_window_hours,
+        )
+    )
+    written_path: str | None = None
+    if write:
+        written_path = analyzer.write_report(
+            wallet=wallet,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            chain=settings.execution_chain,
+            window_hours=settings.pnl_guard_window_hours,
+            apply_guardrails=apply_guardrails,
+        )
+    if as_text:
+        print(format_pnl_guard_text(report, limit=limit))
+        if written_path:
+            print(f"\nwritten_report={written_path}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        payload['apply_guardrails'] = apply_guardrails
+        if written_path:
+            payload['written_report'] = written_path
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_execution_health(
+    *,
+    limit: int,
+    write: bool,
+    apply_guardrails: bool,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    analyzer = ExecutionHealthAnalyzer(settings=settings)
+    report = (
+        analyzer.evaluate_and_apply(
+            chain=settings.execution_chain,
+            window_hours=settings.execution_health_window_hours,
+            event_limit=settings.execution_health_event_limit,
+        )
+        if apply_guardrails
+        else analyzer.build_report(
+            chain=settings.execution_chain,
+            window_hours=settings.execution_health_window_hours,
+            event_limit=settings.execution_health_event_limit,
+        )
+    )
+    written_path: str | None = None
+    if write:
+        written_path = analyzer.write_report(
+            chain=settings.execution_chain,
+            window_hours=settings.execution_health_window_hours,
+            event_limit=settings.execution_health_event_limit,
+            apply_guardrails=apply_guardrails,
+        )
+    if as_text:
+        print(format_execution_health_text(report, limit=limit))
+        if written_path:
+            print(f"\nwritten_report={written_path}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        payload['apply_guardrails'] = apply_guardrails
+        if written_path:
+            payload['written_report'] = written_path
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_budget(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    limit: int,
+    write: bool,
+    price: float | None,
+    policy_limit: int | None,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    scheduler = MassOfferBudgetScheduler(settings=settings, store=store)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_allocator_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    report = scheduler.build_report(
+        wallet=wallet,
+        chain=chain,
+        window_days=resolved_window_days,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        event_limit=resolved_event_limit,
+        price_bnb=price,
+    )
+    written_paths: dict[str, str] | None = None
+    if write:
+        written_paths = scheduler.write_report(
+            wallet=wallet,
+            chain=chain,
+            window_days=resolved_window_days,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            event_limit=resolved_event_limit,
+            price_bnb=price,
+            limit=policy_limit,
+        )
+    if as_text:
+        print(format_mass_offer_budget_text(report, limit=limit))
+        if written_paths:
+            print(
+                f"\nwritten_report={written_paths['report_path']}\n"
+                f"written_policy={written_paths['policy_path']}"
+            )
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_paths:
+            payload['written_paths'] = written_paths
+        if policy_limit is not None:
+            payload['policy_overrides_preview'] = report.to_policy_overrides(limit=policy_limit)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_quarantine(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    limit: int,
+    write: bool,
+    price: float | None,
+    policy_limit: int | None,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    quarantine = MassOfferQuarantineController(settings=settings, store=store)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_quarantine_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    report = quarantine.build_report(
+        wallet=wallet,
+        chain=chain,
+        window_days=resolved_window_days,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        event_limit=resolved_event_limit,
+        price_bnb=price,
+    )
+    written_paths: dict[str, str] | None = None
+    if write:
+        written_report = quarantine.write_report(
+            wallet=wallet,
+            chain=chain,
+            window_days=resolved_window_days,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            event_limit=resolved_event_limit,
+            price_bnb=price,
+            limit=policy_limit,
+        )
+        written_paths = {
+            "report_path": written_report,
+            "policy_path": str(settings.mass_offer_quarantine_policy_path),
+        }
+    if as_text:
+        print(format_mass_offer_quarantine_text(report, limit=limit))
+        if written_paths:
+            print(
+                f"\nwritten_report={written_paths['report_path']}\n"
+                f"written_policy={written_paths['policy_path']}"
+            )
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_paths:
+            payload['written_paths'] = written_paths
+        if policy_limit is not None:
+            payload['policy_overrides_preview'] = report.to_policy_overrides(limit=policy_limit)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_rebalance(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    limit: int,
+    write: bool,
+    price: float | None,
+    policy_limit: int | None,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    rebalancer = MassOfferBudgetRebalancer(settings=settings, store=store)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_rebalance_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    report = rebalancer.build_report(
+        wallet=wallet,
+        chain=chain,
+        window_days=resolved_window_days,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        event_limit=resolved_event_limit,
+        price_bnb=price,
+    )
+    written_paths: dict[str, str] | None = None
+    if write:
+        written_paths = rebalancer.write_report(
+            wallet=wallet,
+            chain=chain,
+            window_days=resolved_window_days,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            event_limit=resolved_event_limit,
+            price_bnb=price,
+            limit=policy_limit,
+        )
+    if as_text:
+        print(format_mass_offer_rebalance_text(report, limit=limit))
+        if written_paths:
+            print(
+                f"\nwritten_report={written_paths['report_path']}\n"
+                f"written_policy={written_paths['policy_path']}"
+            )
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_paths:
+            payload['written_paths'] = written_paths
+        if policy_limit is not None:
+            payload['policy_overrides_preview'] = report.to_policy_overrides(limit=policy_limit)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_unwind(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    limit: int,
+    write: bool,
+    target_bnb: float | None,
+    max_cancels: int | None,
+    apply: bool,
+    dry_run: bool,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    controller = MassOfferUnwindController(settings=settings, store=store)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_unwind_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    report = controller.build_report(
+        wallet=wallet,
+        chain=chain,
+        window_days=resolved_window_days,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        event_limit=resolved_event_limit,
+        target_release_bnb=target_bnb,
+        max_cancels=max_cancels,
+    )
+    written_report: str | None = None
+    if write:
+        written_report = controller.write_report(
+            wallet=wallet,
+            chain=chain,
+            window_days=resolved_window_days,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            event_limit=resolved_event_limit,
+            target_release_bnb=target_bnb,
+            max_cancels=max_cancels,
+        )
+    execution = controller.execute_report(report, dry_run=dry_run) if apply else None
+    if as_text:
+        print(format_mass_offer_unwind_text(report, limit=limit))
+        if written_report:
+            print(f"\nwritten_report={written_report}")
+        if execution is not None:
+            print(f"\n{format_mass_offer_unwind_execution_text(execution)}")
+    else:
+        payload: dict[str, object] = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_report:
+            payload['written_report'] = written_report
+        if execution is not None:
+            payload['execution'] = execution.to_dict()
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_plan(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    limit: int,
+    write: bool,
+    price: float | None,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    planner = MassOfferPlanner(settings=settings, store=store)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_allocator_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    report = planner.build_report(
+        wallet=wallet,
+        chain=chain,
+        window_days=resolved_window_days,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        event_limit=resolved_event_limit,
+        price_bnb=price,
+    )
+    written_path: str | None = None
+    if write:
+        written_path = planner.write_report(
+            wallet=wallet,
+            chain=chain,
+            window_days=resolved_window_days,
+            reference_limit=settings.wallet_pnl_reference_event_limit,
+            event_limit=resolved_event_limit,
+            price_bnb=price,
+        )
+    if as_text:
+        print(format_mass_offer_plan_text(report, limit=limit))
+        if written_path:
+            print(f"\nwritten_report={written_path}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = limit
+        if written_path:
+            payload['written_report'] = written_path
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_batch(
+    *,
+    wallet: str | None,
+    chain: str,
+    window_days: int | None,
+    event_limit: int | None,
+    collection_limit: int | None,
+    write: bool,
+    price: float | None,
+    dry_run: bool | None,
+    include_dry_run: bool,
+    as_text: bool,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    runner = MassOfferBatchRunner(settings=settings, store=store)
+    resolved_window_days = int(window_days if window_days is not None else settings.mass_offer_allocator_window_days)
+    resolved_event_limit = int(event_limit if event_limit is not None else settings.mass_offer_economics_event_limit)
+    resolved_collection_limit = int(collection_limit if collection_limit is not None else settings.mass_offer_batch_collection_limit)
+    report = runner.run_batch(
+        wallet=wallet,
+        chain=chain,
+        window_days=resolved_window_days,
+        reference_limit=settings.wallet_pnl_reference_event_limit,
+        event_limit=resolved_event_limit,
+        price_bnb=price,
+        collection_limit=resolved_collection_limit,
+        include_dry_run_collections=include_dry_run if include_dry_run else None,
+        dry_run=dry_run,
+        write_report=write,
+    )
+    if as_text:
+        print(format_mass_offer_batch_text(report, limit=resolved_collection_limit))
+        if write:
+            print(f"\nwritten_report={report.report_path}")
+    else:
+        payload = report.to_dict()
+        payload['preview_limit'] = resolved_collection_limit
+        if write:
+            payload['written_report'] = report.report_path
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_mass_offer_capital(*, chain: str, limit: int, as_text: bool) -> int:
+    settings = load_settings()
+    engine = MassOfferEngine(settings=settings)
+    payload = engine.capital_status(chain=chain, limit=limit)
+    if as_text:
+        print(format_mass_offer_capital_text(payload))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
@@ -723,7 +1499,7 @@ def cmd_send_test_alert() -> int:
     notifier = build_notifier(settings)
     alert = AlertEnvelope(event=NFTEvent(event_id='test:event:1', market='okx', event_type='sale', collection='Test Collection', token_id='1', contract_address='0xabc', price=1.23, currency='ETH', quantity=1, maker='0xseller', taker='0xbuyer', tx_hash='0xtest', event_time=datetime.now(timezone.utc), volume_24h=42.0, floor_price=1.0, raw_source='test'), decision=FilterDecision(event_id='test:event:1', passed=True, matched_rules=['manual_test']))
     result = notifier.send(alert)
-    print(json.dumps(result.model_dump(mode='json'), ensure_ascii=False, indent=2, default=str))
+    print(json.dumps(model_dump_compat(result, mode='json'), ensure_ascii=False, indent=2, default=str))
     return 0
 
 
@@ -1007,6 +1783,117 @@ def build_parser() -> argparse.ArgumentParser:
     mass_offer_cancel_p = subparsers.add_parser('mass-offer-cancel')
     mass_offer_cancel_p.add_argument('--chain', default='bsc')
     mass_offer_cancel_p.add_argument('--collection', default=None)
+    mass_offer_policy_preview_p = subparsers.add_parser('mass-offer-policy-preview')
+    mass_offer_policy_preview_p.add_argument('--collection', required=True)
+    mass_offer_policy_preview_p.add_argument('--chain', default='bsc')
+    mass_offer_policy_preview_p.add_argument('--price', type=float, default=None)
+    mass_offer_policy_preview_p.add_argument('--max-offers', type=int, default=None)
+    mass_offer_policy_preview_p.add_argument('--delay-seconds', type=float, default=None)
+    mass_offer_policy_preview_p.add_argument('--max-existing-offer', type=float, default=None)
+    mass_offer_policy_preview_p.add_argument('--dry-run', dest='dry_run', action='store_const', const=True, default=None)
+    mass_offer_policy_preview_p.add_argument('--live', dest='dry_run', action='store_const', const=False)
+    mass_offer_policy_preview_p.add_argument('--text', action='store_true')
+    mass_offer_econ_p = subparsers.add_parser('mass-offer-economics')
+    mass_offer_econ_p.add_argument('--chain', default='bsc')
+    mass_offer_econ_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_econ_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_econ_p.add_argument('--limit', type=int, default=5)
+    mass_offer_econ_p.add_argument('--policy-limit', type=int, default=None)
+    mass_offer_econ_p.add_argument('--write', action='store_true')
+    mass_offer_econ_p.add_argument('--text', action='store_true')
+    mass_offer_alloc_p = subparsers.add_parser('mass-offer-allocator')
+    mass_offer_alloc_p.add_argument('--wallet', default=None)
+    mass_offer_alloc_p.add_argument('--chain', default='bsc')
+    mass_offer_alloc_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_alloc_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_alloc_p.add_argument('--limit', type=int, default=5)
+    mass_offer_alloc_p.add_argument('--policy-limit', type=int, default=None)
+    mass_offer_alloc_p.add_argument('--write', action='store_true')
+    mass_offer_alloc_p.add_argument('--text', action='store_true')
+    mass_offer_feedback_p = subparsers.add_parser('mass-offer-feedback')
+    mass_offer_feedback_p.add_argument('--wallet', default=None)
+    mass_offer_feedback_p.add_argument('--chain', default='bsc')
+    mass_offer_feedback_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_feedback_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_feedback_p.add_argument('--limit', type=int, default=5)
+    mass_offer_feedback_p.add_argument('--policy-limit', type=int, default=None)
+    mass_offer_feedback_p.add_argument('--write', action='store_true')
+    mass_offer_feedback_p.add_argument('--text', action='store_true')
+    mass_offer_budget_p = subparsers.add_parser('mass-offer-budget')
+    mass_offer_budget_p.add_argument('--wallet', default=None)
+    mass_offer_budget_p.add_argument('--chain', default='bsc')
+    mass_offer_budget_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_budget_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_budget_p.add_argument('--price', type=float, default=None)
+    mass_offer_budget_p.add_argument('--limit', type=int, default=5)
+    mass_offer_budget_p.add_argument('--policy-limit', type=int, default=None)
+    mass_offer_budget_p.add_argument('--write', action='store_true')
+    mass_offer_budget_p.add_argument('--text', action='store_true')
+    mass_offer_circuit_p = subparsers.add_parser('mass-offer-circuit')
+    mass_offer_circuit_p.add_argument('--wallet', default=None)
+    mass_offer_circuit_p.add_argument('--chain', default='bsc')
+    mass_offer_circuit_p.add_argument('--window-hours', type=int, default=None)
+    mass_offer_circuit_p.add_argument('--limit', type=int, default=5)
+    mass_offer_circuit_p.add_argument('--write', action='store_true')
+    mass_offer_circuit_p.add_argument('--text', action='store_true')
+    mass_offer_quarantine_p = subparsers.add_parser('mass-offer-quarantine')
+    mass_offer_quarantine_p.add_argument('--wallet', default=None)
+    mass_offer_quarantine_p.add_argument('--chain', default='bsc')
+    mass_offer_quarantine_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_quarantine_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_quarantine_p.add_argument('--price', type=float, default=None)
+    mass_offer_quarantine_p.add_argument('--limit', type=int, default=5)
+    mass_offer_quarantine_p.add_argument('--policy-limit', type=int, default=None)
+    mass_offer_quarantine_p.add_argument('--write', action='store_true')
+    mass_offer_quarantine_p.add_argument('--text', action='store_true')
+    mass_offer_rebalance_p = subparsers.add_parser('mass-offer-rebalance')
+    mass_offer_rebalance_p.add_argument('--wallet', default=None)
+    mass_offer_rebalance_p.add_argument('--chain', default='bsc')
+    mass_offer_rebalance_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_rebalance_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_rebalance_p.add_argument('--price', type=float, default=None)
+    mass_offer_rebalance_p.add_argument('--limit', type=int, default=5)
+    mass_offer_rebalance_p.add_argument('--policy-limit', type=int, default=None)
+    mass_offer_rebalance_p.add_argument('--write', action='store_true')
+    mass_offer_rebalance_p.add_argument('--text', action='store_true')
+    mass_offer_unwind_p = subparsers.add_parser('mass-offer-unwind')
+    mass_offer_unwind_p.add_argument('--wallet', default=None)
+    mass_offer_unwind_p.add_argument('--chain', default='bsc')
+    mass_offer_unwind_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_unwind_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_unwind_p.add_argument('--target-bnb', type=float, default=None)
+    mass_offer_unwind_p.add_argument('--max-cancels', type=int, default=None)
+    mass_offer_unwind_p.add_argument('--limit', type=int, default=5)
+    mass_offer_unwind_p.add_argument('--write', action='store_true')
+    mass_offer_unwind_p.add_argument('--apply', action='store_true')
+    mass_offer_unwind_p.add_argument('--dry-run', action='store_true')
+    mass_offer_unwind_p.add_argument('--text', action='store_true')
+
+    mass_offer_plan_p = subparsers.add_parser('mass-offer-plan')
+    mass_offer_plan_p.add_argument('--wallet', default=None)
+    mass_offer_plan_p.add_argument('--chain', default='bsc')
+    mass_offer_plan_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_plan_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_plan_p.add_argument('--price', type=float, default=None)
+    mass_offer_plan_p.add_argument('--limit', type=int, default=5)
+    mass_offer_plan_p.add_argument('--write', action='store_true')
+    mass_offer_plan_p.add_argument('--text', action='store_true')
+    mass_offer_batch_p = subparsers.add_parser('mass-offer-batch')
+    mass_offer_batch_p.add_argument('--wallet', default=None)
+    mass_offer_batch_p.add_argument('--chain', default='bsc')
+    mass_offer_batch_p.add_argument('--window-days', type=int, default=None)
+    mass_offer_batch_p.add_argument('--event-limit', type=int, default=None)
+    mass_offer_batch_p.add_argument('--price', type=float, default=None)
+    mass_offer_batch_p.add_argument('--collections', type=int, default=None)
+    mass_offer_batch_p.add_argument('--include-dry-run', action='store_true')
+    mass_offer_batch_p.add_argument('--dry-run', dest='dry_run', action='store_const', const=True, default=None)
+    mass_offer_batch_p.add_argument('--live', dest='dry_run', action='store_const', const=False)
+    mass_offer_batch_p.add_argument('--write', action='store_true')
+    mass_offer_batch_p.add_argument('--text', action='store_true')
+    mass_offer_capital_p = subparsers.add_parser('mass-offer-capital')
+    mass_offer_capital_p.add_argument('--chain', default='bsc')
+    mass_offer_capital_p.add_argument('--limit', type=int, default=5)
+    mass_offer_capital_p.add_argument('--text', action='store_true')
     subparsers.add_parser('compare-markets')
     detect_spreads_p = subparsers.add_parser('detect-spreads')
     detect_spreads_p.add_argument('--min-pct', type=float, default=3.0)
@@ -1016,6 +1903,35 @@ def build_parser() -> argparse.ArgumentParser:
     rank_collections_p.add_argument('--min-pct', type=float, default=3.0)
     rank_collections_p.add_argument('--limit', type=int, default=10)
     rank_collections_p.add_argument('--sample-limit', type=int, default=5000)
+    wallet_pnl = subparsers.add_parser('wallet-pnl', help='Build wallet portfolio PnL summary from stored events')
+    wallet_pnl.add_argument('--wallet', default=None)
+    wallet_pnl.add_argument('--limit', type=int, default=5)
+    wallet_pnl.add_argument('--write', action='store_true')
+    wallet_pnl.add_argument('--text', action='store_true')
+    execution_fills = subparsers.add_parser('execution-fills', help='Reconcile execution submits with wallet buy fills')
+    execution_fills.add_argument('--wallet', default=None)
+    execution_fills.add_argument('--limit', type=int, default=5)
+    execution_fills.add_argument('--write', action='store_true')
+    execution_fills.add_argument('--text', action='store_true')
+    portfolio_risk = subparsers.add_parser('portfolio-risk', help='Assess portfolio/execution risk and optionally enforce dry-run guardrails')
+    portfolio_risk.add_argument('--wallet', default=None)
+    portfolio_risk.add_argument('--limit', type=int, default=5)
+    portfolio_risk.add_argument('--write', action='store_true')
+    portfolio_risk.add_argument('--apply-guardrails', action='store_true')
+    portfolio_risk.add_argument('--text', action='store_true')
+    pnl_guard = subparsers.add_parser('pnl-guard', help='Assess recent realized PnL guardrails and optionally enforce dry-run')
+    pnl_guard.add_argument('--wallet', default=None)
+    pnl_guard.add_argument('--limit', type=int, default=5)
+    pnl_guard.add_argument('--write', action='store_true')
+    pnl_guard.add_argument('--apply-guardrails', action='store_true')
+    pnl_guard.add_argument('--text', action='store_true')
+
+    execution_health = subparsers.add_parser('execution-health', help='Assess recent execution failure health and optionally enforce dry-run')
+    execution_health.add_argument('--limit', type=int, default=5)
+    execution_health.add_argument('--write', action='store_true')
+    execution_health.add_argument('--apply-guardrails', action='store_true')
+    execution_health.add_argument('--text', action='store_true')
+
     snapshot_analytics_p = subparsers.add_parser('snapshot-analytics')
     snapshot_analytics_p.add_argument('--min-pct', type=float, default=3.0)
     snapshot_analytics_p.add_argument('--limit', type=int, default=10)
@@ -1184,6 +2100,178 @@ def main() -> int:
         return cmd_mass_offer_status(chain=args.chain)
     if args.command == 'mass-offer-cancel':
         return cmd_mass_offer_cancel(chain=args.chain, collection=args.collection)
+    if args.command == 'mass-offer-policy-preview':
+        return cmd_mass_offer_policy_preview(
+            collection=args.collection,
+            chain=args.chain,
+            price=args.price,
+            max_offers=args.max_offers,
+            delay_seconds=args.delay_seconds,
+            max_existing_offer=args.max_existing_offer,
+            dry_run=args.dry_run,
+            as_text=args.text,
+        )
+    if args.command == 'mass-offer-economics':
+        return cmd_mass_offer_economics(
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            limit=args.limit,
+            write=args.write,
+            policy_limit=args.policy_limit,
+            as_text=args.text,
+        )
+    if args.command == 'mass-offer-allocator':
+        return cmd_mass_offer_allocator(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            limit=args.limit,
+            write=args.write,
+            policy_limit=args.policy_limit,
+            as_text=args.text,
+        )
+    if args.command == 'mass-offer-feedback':
+        return cmd_mass_offer_feedback(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            limit=args.limit,
+            write=args.write,
+            policy_limit=args.policy_limit,
+            as_text=args.text,
+        )
+    if args.command == 'mass-offer-budget':
+        return cmd_mass_offer_budget(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            limit=args.limit,
+            write=args.write,
+            price=args.price,
+            policy_limit=args.policy_limit,
+            as_text=args.text,
+        )
+    if args.command == 'mass-offer-circuit':
+        return cmd_mass_offer_circuit(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_hours=args.window_hours,
+            limit=args.limit,
+            write=args.write,
+            as_text=args.text,
+        )
+    if args.command == 'mass-offer-quarantine':
+        return cmd_mass_offer_quarantine(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            limit=args.limit,
+            write=args.write,
+            price=args.price,
+            policy_limit=args.policy_limit,
+            as_text=args.text,
+        )
+
+    if args.command == 'mass-offer-rebalance':
+        return cmd_mass_offer_rebalance(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            limit=args.limit,
+            write=args.write,
+            price=args.price,
+            policy_limit=args.policy_limit,
+            as_text=args.text,
+        )
+
+    if args.command == 'mass-offer-unwind':
+        return cmd_mass_offer_unwind(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            limit=args.limit,
+            write=args.write,
+            target_bnb=args.target_bnb,
+            max_cancels=args.max_cancels,
+            apply=args.apply,
+            dry_run=args.dry_run,
+            as_text=args.text,
+        )
+
+    if args.command == 'mass-offer-plan':
+        return cmd_mass_offer_plan(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            limit=args.limit,
+            write=args.write,
+            price=args.price,
+            as_text=args.text,
+        )
+    if args.command == 'mass-offer-batch':
+        return cmd_mass_offer_batch(
+            wallet=args.wallet,
+            chain=args.chain,
+            window_days=args.window_days,
+            event_limit=args.event_limit,
+            collection_limit=args.collections,
+            write=args.write,
+            price=args.price,
+            dry_run=args.dry_run,
+            include_dry_run=args.include_dry_run,
+            as_text=args.text,
+        )
+    if args.command == 'mass-offer-capital':
+        return cmd_mass_offer_capital(
+            chain=args.chain,
+            limit=args.limit,
+            as_text=args.text,
+        )
+    if args.command == 'wallet-pnl':
+        return cmd_wallet_pnl(
+            wallet=args.wallet,
+            limit=args.limit,
+            write=args.write,
+            as_text=args.text,
+        )
+    if args.command == 'execution-fills':
+        return cmd_execution_fills(
+            wallet=args.wallet,
+            limit=args.limit,
+            write=args.write,
+            as_text=args.text,
+        )
+    if args.command == 'portfolio-risk':
+        return cmd_portfolio_risk(
+            wallet=args.wallet,
+            limit=args.limit,
+            write=args.write,
+            apply_guardrails=args.apply_guardrails,
+            as_text=args.text,
+        )
+    if args.command == 'pnl-guard':
+        return cmd_pnl_guard(
+            wallet=args.wallet,
+            limit=args.limit,
+            write=args.write,
+            apply_guardrails=args.apply_guardrails,
+            as_text=args.text,
+        )
+    if args.command == 'execution-health':
+        return cmd_execution_health(
+            limit=args.limit,
+            write=args.write,
+            apply_guardrails=args.apply_guardrails,
+            as_text=args.text,
+        )
     if args.command == 'compare-markets':
         return cmd_compare_markets()
     if args.command == 'detect-spreads':

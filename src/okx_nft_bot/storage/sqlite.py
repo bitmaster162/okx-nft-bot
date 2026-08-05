@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from okx_nft_bot.models import NFTEvent, RawEvent
+from okx_nft_bot.pydantic_compat import model_dump_json_compat, model_validate_json_compat
 
 
 class SQLiteStore:
@@ -14,10 +15,7 @@ class SQLiteStore:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=10000")
-        return conn
+        return sqlite3.connect(self.db_path)
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -75,6 +73,10 @@ class SQLiteStore:
                 )
                 """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_event_time ON normalized_events(event_time)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_maker ON normalized_events(maker)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_taker ON normalized_events(taker)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_contract_time ON normalized_events(contract_address, event_time)")
 
     def insert_raw_events(self, raw_events: list[RawEvent]) -> None:
         with self._connect() as conn:
@@ -132,7 +134,7 @@ class SQLiteStore:
                         event.volume_24h,
                         event.floor_price,
                         event.raw_source,
-                        event.model_dump_json(),
+                        model_dump_json_compat(event),
                     )
                     for event in events
                 ],
@@ -141,24 +143,14 @@ class SQLiteStore:
     def filter_new_events(self, events: list[NFTEvent]) -> list[NFTEvent]:
         if not events:
             return []
-
         event_ids = [event.event_id for event in events]
-        existing: set[str] = set()
-
-        # SQLite has a limit of 999 parameters in a single query.
-        # We batch the checks to avoid "too many SQL variables" errors.
-        batch_size = 900
-        for i in range(0, len(event_ids), batch_size):
-            batch = event_ids[i : i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            with self._connect() as conn:
-                cursor = conn.execute(
-                    f"SELECT event_id FROM normalized_events WHERE event_id IN ({placeholders})",
-                    batch,
-                )
-                for row in cursor.fetchall():
-                    existing.add(row[0])
-
+        placeholders = ','.join('?' for _ in event_ids)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f'SELECT event_id FROM normalized_events WHERE event_id IN ({placeholders})',
+                event_ids,
+            )
+            existing = {row[0] for row in cursor.fetchall()}
         return [event for event in events if event.event_id not in existing]
 
     def get_state(self, namespace: str, key: str) -> str | None:
@@ -245,7 +237,41 @@ class SQLiteStore:
                 """,
                 params,
             )
-            return [NFTEvent.model_validate_json(row[0]) for row in cursor.fetchall()]
+            return [model_validate_json_compat(NFTEvent, row[0]) for row in cursor.fetchall()]
+
+    def fetch_wallet_event_models(
+        self,
+        *,
+        wallet: str,
+        limit: int | None = None,
+        market: str | None = None,
+    ) -> list[NFTEvent]:
+        resolved_wallet = wallet.strip().lower()
+        if not resolved_wallet:
+            return []
+        clauses = ["(LOWER(COALESCE(maker, '')) = ? OR LOWER(COALESCE(taker, '')) = ?)"]
+        params: list[object] = [resolved_wallet, resolved_wallet]
+        if market:
+            clauses.append("market = ?")
+            params.append(market)
+        where = f"WHERE {' AND '.join(clauses)}"
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT ?"
+            params.append(limit)
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT payload_json
+                FROM normalized_events
+                {where}
+                ORDER BY event_time ASC
+                {limit_sql}
+                """,
+                params,
+            )
+            return [model_validate_json_compat(NFTEvent, row[0]) for row in cursor.fetchall()]
 
     def fetch_state_rows(self) -> list[dict[str, object]]:
         with self._connect() as conn:

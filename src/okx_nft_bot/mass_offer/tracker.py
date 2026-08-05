@@ -292,6 +292,43 @@ class MassOfferTracker:
             ).fetchall()
         return [self._row_to_campaign(row) for row in rows]
 
+    def list_campaigns_since(
+        self,
+        *,
+        chain: str | None = None,
+        since: datetime | None = None,
+        collection: str | None = None,
+        limit: int | None = None,
+    ) -> list[MassOfferCampaign]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if chain:
+            clauses.append('chain = ?')
+            params.append(chain.lower())
+        if collection:
+            clauses.append('collection = ?')
+            params.append(collection.lower())
+        if since is not None:
+            resolved_since = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+            clauses.append('updated_at >= ?')
+            params.append(resolved_since.strftime('%Y-%m-%d %H:%M:%S'))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+        limit_sql = ' LIMIT ?' if limit is not None else ''
+        if limit is not None:
+            params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM mass_offer_campaigns
+                {where}
+                ORDER BY updated_at DESC, id DESC
+                {limit_sql}
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_campaign(row) for row in rows]
+
     def list_active_records(
         self,
         *,
@@ -319,6 +356,58 @@ class MassOfferTracker:
                 [*params, limit],
             ).fetchall()
         return [self._row_to_record(row) for row in rows]
+
+    def get_collection_campaign_stats(self, *, chain: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if chain:
+            clauses.append("chain = ?")
+            params.append(chain.lower())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    collection,
+                    chain,
+                    COUNT(*) AS campaigns_total,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS campaigns_completed,
+                    SUM(scanned_count) AS scanned_total,
+                    SUM(target_count) AS target_total,
+                    SUM(submitted_count) AS submitted_total,
+                    SUM(dry_run_count) AS dry_run_total,
+                    SUM(skipped_count) AS skipped_total,
+                    SUM(failed_count) AS failed_total,
+                    AVG(price_bnb) AS avg_price_bnb,
+                    MAX(price_bnb) AS max_price_bnb,
+                    MAX(updated_at) AS last_campaign_at
+                FROM mass_offer_campaigns
+                {where}
+                GROUP BY collection, chain
+                ORDER BY submitted_total DESC, target_total DESC, last_campaign_at DESC
+                """,
+                params,
+            ).fetchall()
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            payload.append(
+                {
+                    "collection": str(row["collection"]),
+                    "chain": str(row["chain"]),
+                    "campaigns_total": int(row["campaigns_total"] or 0),
+                    "campaigns_completed": int(row["campaigns_completed"] or 0),
+                    "scanned_total": int(row["scanned_total"] or 0),
+                    "target_total": int(row["target_total"] or 0),
+                    "submitted_total": int(row["submitted_total"] or 0),
+                    "dry_run_total": int(row["dry_run_total"] or 0),
+                    "skipped_total": int(row["skipped_total"] or 0),
+                    "failed_total": int(row["failed_total"] or 0),
+                    "avg_price_bnb": float(row["avg_price_bnb"] or 0.0),
+                    "max_price_bnb": float(row["max_price_bnb"] or 0.0),
+                    "last_campaign_at": row["last_campaign_at"],
+                }
+            )
+        return payload
 
     @staticmethod
     def _row_to_campaign(row: sqlite3.Row) -> MassOfferCampaign:

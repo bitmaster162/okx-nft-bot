@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import asdict
 
-from okx_nft_bot.config import load_settings, validate_execution_chain
+from okx_nft_bot.config import load_settings
 from okx_nft_bot.counterbid import CounterBidder, CounterbidConfigManager
 from okx_nft_bot.execution_governor import ExecutionGovernor
 from okx_nft_bot.signing import preview_counterbid
@@ -12,10 +12,10 @@ from okx_nft_bot.undercutter import PositionState, UndercutEngine, UndercutSched
 
 
 def _ensure_bsc(chain: str) -> str:
-    try:
-        return validate_execution_chain(chain)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
+    resolved = chain.lower()
+    if resolved != "bsc":
+        raise SystemExit("Execution track currently supports only --chain bsc")
+    return resolved
 
 
 def _load_state(settings) -> PositionState:
@@ -188,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--price", required=True, type=float)
     preview.add_argument("--chain", default="bsc")
 
-    counter_scan = subparsers.add_parser("counterbid-scan", help="Scan configured collections for rival offers")
+    counter_scan = subparsers.add_parser("counterbid-scan", help="Scan configured collections for parasite offers")
     counter_scan.add_argument("--collection", default=None)
     counter_scan.add_argument("--chain", default="bsc")
     counter_scan.add_argument("--refresh", action="store_true")
@@ -206,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     counter_config.add_argument("--max-price", type=float, default=1.0)
     counter_config.add_argument("--margin", type=float, default=0.001)
 
-    counter_status = subparsers.add_parser("counterbid-status", help="Show execution collection config and rival wallet status")
+    counter_status = subparsers.add_parser("counterbid-status", help="Show execution collection config and parasite wallet status")
     counter_status.add_argument("--chain", default="bsc")
 
     undercut_run = subparsers.add_parser("undercut-run", help="Run one dry-run undercut cycle")

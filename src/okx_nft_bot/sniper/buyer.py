@@ -367,6 +367,31 @@ class OKXInstantBuyer:
             log.debug("No listings found for %s [%s]", collection_name, chain_lower)
             return None
 
+        # PATCH 2026-05-29 (FRESHNESS_FILTER): skip zombie listings (OKX indexer lag).
+        # Phase 3 historically had 0% win over 4808+ attempts because OKX returns stale
+        # listings that look active but were already sold. Only accept listings created
+        # in last BUY_MAX_LISTING_AGE_S seconds (default 60). Set =0 to disable.
+        _max_age_s = int(os.environ.get("BUY_MAX_LISTING_AGE_S", "60"))
+        if _max_age_s > 0:
+            _now_ms = int(time.time() * 1000)
+            _fresh = []
+            for _it in listings:
+                _ts = _it.get("listingTime") or _it.get("createTime") or _it.get("listTime") or _it.get("createTs") or 0
+                try:
+                    _ts = int(_ts)
+                    if 0 < _ts < 1e12:
+                        _ts *= 1000  # was seconds
+                except Exception:
+                    _ts = 0
+                if _ts == 0 or (_now_ms - _ts) <= _max_age_s * 1000:
+                    _fresh.append(_it)
+            if len(_fresh) < len(listings):
+                log.info("FRESHNESS_FILTER %s: %d/%d listings within %ds, %d filtered as zombie",
+                         collection_name, len(_fresh), len(listings), _max_age_s, len(listings)-len(_fresh))
+            listings = _fresh
+            if not listings:
+                return None
+
         # 2. Find cheapest ≤ max_price (uses normalised _price_human)
         cheapest = None
         cheapest_price = 999999.0

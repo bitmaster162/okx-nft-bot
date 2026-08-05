@@ -12,8 +12,10 @@ from typing import Any, Mapping
 
 log = logging.getLogger("counterbid.okx_api")
 
-_MAX_429_RETRIES = 3
-_429_BACKOFF_BASE = 2.0  # seconds: 2, 4, 8
+# PATCH 2026-05-31 SMOOTH_429: 429 ratio was 50% — bot was DOSing itself.
+# Raise base 2->4 and retries 3->4 (4/8/16/32 wait pattern).
+_MAX_429_RETRIES = 4
+_429_BACKOFF_BASE = 4.0  # seconds: 4, 8, 16, 32
 
 from okx_nft_bot.clients.http import HTTPStatusError, build_url
 from okx_nft_bot.clients.okx import OKXMarketplaceClient
@@ -340,7 +342,7 @@ class OKXAPIClient:
             hasattr(self, "_last_onchain_cancel_ts")
             and (time.time() - getattr(self, "_last_onchain_cancel_ts", 0)) < 120
         )
-        full_retries = 2 if recent_onchain else 1
+        full_retries = 3 if recent_onchain else 3  # PATCH 2026-04-26: bumped from 1/2 to 3/3 for transient OKX rejections
         last_exc = None
 
         for full_attempt in range(1, full_retries + 1):
@@ -373,13 +375,22 @@ class OKXAPIClient:
                 return self._complete_two_step_offer(step1_resp, private_key, chain_id, endpoint)
             except OKXSubmitError as exc:
                 last_exc = exc
-                if "no longer valid" in str(exc).lower() and full_attempt < full_retries:
-                    log.warning("create_offer: step2 rejected with '%s' — will retry full flow in 10s",
-                                exc)
+                # ── PATCH 2026-04-26 v2: retry full flow on transient OKX rejections ──
+                # OKX backend stores the expected EIP-712 message keyed by step1
+                # orderId. step2 verifies our signature against THAT exact message.
+                # Re-running step1 gets a fresh orderId+salt+message — a fresh
+                # chance to land. The _create_offer_direct fallback uses a
+                # locally-generated salt, which OKX rejects with "Signature
+                # verification unsuccessful" because the expected message differs.
+                # So full-flow retry is the right path; direct is a last-ditch
+                # only useful when OKX is completely unresponsive.
+                if ("no longer valid" in str(exc).lower() or
+                    "signature verification" in str(exc).lower()) and full_attempt < full_retries:
+                    log.warning("create_offer: step2 rejected with '%s' — will retry full flow in 10s (%d/%d)",
+                                exc, full_attempt, full_retries)
                     time.sleep(10)
                     continue
-                # ETH direct fallback: if OKX 2-step flow fails on Seaport chains,
-                # try building the order locally with real on-chain counter
+                # ETH direct fallback: only after full-flow retries exhausted
                 if "no longer valid" in str(exc).lower() and chain_lower in ("eth", "bsc"):
                     log.warning("create_offer: OKX 2-step failed for %s — trying _create_offer_direct fallback", chain_lower)
                     try:
@@ -919,6 +930,32 @@ class OKXAPIClient:
             order_keys = {f["name"] for f in eip712_types.get("OrderComponents", [])}
             eip712_message = {k: v for k, v in eip712_message.items() if k in order_keys}
 
+        # ── PATCH 2026-04-26: counter sync from on-chain Seaport ──
+        # OKX step1 bakes a `counter` value into the EIP-712 message based on
+        # OKX backend's view of our wallet. If our on-chain counter has bumped
+        # since OKX last synced (e.g. after incrementCounter() bulk-cancel),
+        # signing with stale counter produces a signature that step2 rejects
+        # as "This order is no longer valid" (= signer-recovery mismatch).
+        # Override with current on-chain counter before signing.
+        try:
+            from okx_nft_bot.signing.seaport_signer import get_counter as _get_counter
+            _chain_name = {1: "eth", 56: "bsc", 137: "polygon"}.get(chain_id, "bsc")
+            _on_chain_counter = _get_counter(
+                eip712_message["offerer"],
+                rpc_urls=get_rpc_urls(_chain_name),
+            )
+            _step1_counter = eip712_message.get("counter")
+            if str(_on_chain_counter) != str(_step1_counter):
+                log.warning(
+                    "create_offer counter sync: step1=%s != on-chain=%s — overriding",
+                    _step1_counter, _on_chain_counter,
+                )
+                eip712_message["counter"] = str(_on_chain_counter)
+            else:
+                log.debug("create_offer counter sync: matches (%s)", _on_chain_counter)
+        except Exception as _sync_exc:
+            log.warning("create_offer counter sync skipped: %s", _sync_exc)
+
         structured = {
             "types": eip712_types,
             "domain": eip712_domain,
@@ -1270,6 +1307,32 @@ class OKXAPIClient:
             log.error("submit_seaport_order FAILED code=%s msg=%s", code, msg)
             raise OKXSubmitError(f"OKX submitOrder failed: code={code} msg={msg}")
 
+        # ── PATCH 2026-04-26: extract from data.successOrderIds + log errors ──
+        # OKX submitOrder returns {data:{successOrderIds:[...],errors:[...]}} — the
+        # legacy _extract_scalar(orderId|offerId|orderHash|id) misses this nested
+        # shape, silently returning offer_id=None and surfacing as
+        # no_offer_id_in_response in mass_offer engine. Surface it explicitly.
+        resp_data = response.get("data", {})
+        if isinstance(resp_data, dict):
+            success_ids = resp_data.get("successOrderIds", [])
+            errors = resp_data.get("errors", [])
+            if errors:
+                err_msgs = [e.get("message", str(e)) for e in errors if isinstance(e, dict)]
+                log.warning("submit_seaport_order errors: %s", "; ".join(err_msgs))
+            if success_ids:
+                offer_id = str(success_ids[0])
+                log.info("submit_seaport_order ✓ offer_id=%s (from successOrderIds)", offer_id)
+                return {
+                    "offer_id": offer_id,
+                    "status": "submitted",
+                    "raw": response,
+                }
+            if errors and not success_ids:
+                # Order rejected with code=0 — raise so caller sees actual cause
+                msg_first = errors[0].get("message", "unknown") if errors else "unknown"
+                raise OKXSubmitError(f"submit_seaport_order rejected: {msg_first}")
+
+        # Fallback to legacy extraction (older response shapes)
         offer_id = self._extract_scalar(response, keys=("orderId", "offerId", "orderHash", "id"))
         status = self._extract_scalar(response, keys=("status", "state")) or "submitted"
 

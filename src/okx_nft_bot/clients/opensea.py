@@ -431,6 +431,10 @@ class OpenSeaClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "X-API-KEY": self.settings.opensea_api_key,
+            # PATCH 2026-07-31: без браузерного UA Cloudflare отдаёт
+            # "Error 1010: Access denied" на ВСЕ запросы к api.opensea.io.
+            # Именно это глушило весь OpenSea-фронт, а не ключ.
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         }
 
         log.info(
@@ -474,5 +478,7 @@ class OpenSeaClient:
         headers = {
             'Accept': 'application/json',
             'X-API-KEY': self.settings.opensea_api_key,
+            # PATCH 2026-07-31: браузерный UA обязателен (Cloudflare 1010)
+            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         }
         return self.transport.request_json(method='GET', url=url, headers=headers)

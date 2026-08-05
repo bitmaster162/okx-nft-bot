@@ -1,5 +1,5 @@
 """
-Rival Scanner v4 — unified WL capture + rival undercut + missclick buy.
+Parasite Hunter v4 — unified WL capture + parasite undercut + missclick buy.
 
 Strategy (3 phases per scan cycle):
   PHASE 1 — WL CAPTURE (highest priority):
@@ -7,8 +7,8 @@ Strategy (3 phases per scan cycle):
     Undercut EVERYONE except self/friends.
     Goal: be the best offer on every WL collection.
 
-  PHASE 2 — RIVAL NON-WL HUNT:
-    Scan 37 rival wallets, find their offers on NON-WL collections.
+  PHASE 2 — PARASITE NON-WL HUNT:
+    Scan 37 parasite wallets, find their offers on NON-WL collections.
     Undercut if offer < $0.01 or collection has config in buy_config.
     Place up to ~10 offers per collection.
 
@@ -16,18 +16,18 @@ Strategy (3 phases per scan cycle):
     Check WL listings — buy anything priced below our max ($0.51 default).
 
 Env vars:
-    COUNTERBID_ENABLED=1
-    COUNTERBID_DRY_RUN=1
-    COUNTERBID_MAX_PER_COLLECTION=50
-    COUNTERBID_UNDERCUT_BPS=50       # undercut by 0.5%
-    COUNTERBID_MAX_USD=0.51          # max offer value in USD
-    COUNTERBID_DELAY_SECONDS=1.0     # delay between offers
-    COUNTERBID_SCAN_INTERVAL=300     # full scan every 5 min
-    COUNTERBID_COLLECTION_DELAY=2.0  # delay between collections during scan
-    COUNTERBID_CHAINS=bsc,eth        # chains to scan
-    COUNTERBID_OFFER_CURRENCIES=WBNB,USDT  # currencies we can offer in
-    COUNTERBID_NONWL_MAX_USD=0.01    # max for non-WL rival offers
-    COUNTERBID_NONWL_QTY=10          # offers per non-WL collection
+    PARASITE_HUNTER_ENABLED=1
+    PARASITE_HUNTER_DRY_RUN=1
+    PARASITE_HUNTER_MAX_PER_COLLECTION=50
+    PARASITE_HUNTER_UNDERCUT_BPS=50       # undercut by 0.5%
+    PARASITE_HUNTER_MAX_USD=0.51          # max offer value in USD
+    PARASITE_HUNTER_DELAY_SECONDS=1.0     # delay between offers
+    PARASITE_HUNTER_SCAN_INTERVAL=300     # full scan every 5 min
+    PARASITE_HUNTER_COLLECTION_DELAY=2.0  # delay between collections during scan
+    PARASITE_HUNTER_CHAINS=bsc,eth        # chains to scan
+    PARASITE_HUNTER_OFFER_CURRENCIES=WBNB,USDT  # currencies we can offer in
+    PARASITE_HUNTER_NONWL_MAX_USD=0.01    # max for non-WL parasite offers
+    PARASITE_HUNTER_NONWL_QTY=10          # offers per non-WL collection
     FRIEND_WALLETS=0x...,0x...            # friend wallets — never undercut
     BUYER_WALLET_ADDRESS=0x...            # our wallet — never undercut
     OKX_SLUG_MAP=0xaddr1=slug1,0xaddr2=slug2  # contract → OKX page slug
@@ -39,19 +39,12 @@ import logging
 import os
 import re as _re
 import threading
-
-# F.1+F.3 PATCH 2026-04-27: lazy import of Brain client (fail-soft)
-try:
-    from okx_nft_bot import brain_client as _brain
-except Exception:
-    _brain = None
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
-log = logging.getLogger("sniper.counter_bidder")
+log = logging.getLogger("sniper.parasite_hunter")
 
 
 # ── Live price fetcher ────────────────────────────────────────
@@ -156,7 +149,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 @dataclass
-class RivalOffer:
+class ParasiteOffer:
     """Single offer parsed from API."""
     collection_address: str
     collection_name: str
@@ -175,7 +168,7 @@ class HuntResult:
     collection_address: str
     collection_name: str
     chain: str
-    rival_offers_found: int
+    parasite_offers_found: int
     our_offers_placed: int
     our_offers_failed: int
     our_offers_skipped: int
@@ -191,7 +184,7 @@ class ScanReport:
     wl_undercuts_placed: int = 0
     wl_already_best: int = 0
     wl_friend_skipped: int = 0
-    # Phase 2: Rival non-WL
+    # Phase 2: Parasite non-WL
     nonwl_offers_found: int = 0
     nonwl_collections: int = 0
     nonwl_undercuts_placed: int = 0
@@ -208,76 +201,34 @@ class ScanReport:
     # Legacy compat
     total_offers_found: int = 0
     collections_with_offers: int = 0
-    by_collection: dict[str, list[RivalOffer]] = field(default_factory=dict)
+    by_collection: dict[str, list[ParasiteOffer]] = field(default_factory=dict)
     undercuts_placed: int = 0
     undercuts_failed: int = 0
     undercuts_skipped: int = 0
     scan_duration_sec: float = 0.0
 
 
-class CounterBidder:
-    """Unified WL capture + rival undercut system for OKX.
+class ParasiteHunter:
+    """Unified WL capture + parasite undercut system for OKX.
 
-    v4: Phase 1 scans ALL offers on WL collections, Phase 2 hunts rivals on non-WL.
+    v4: Phase 1 scans ALL offers on WL collections, Phase 2 hunts parasites on non-WL.
     Protected wallets (self + friends) are never undercut.
     """
 
-    # BNB→WBNB, ETH→WETH, BUSD→USDT (Seaport uses wrapped; BUSD≡USDT on BSC)
-    _WRAP_MAP = {"BNB": "WBNB", "ETH": "WETH", "BUSD": "USDT"}
-
-    # Token address → symbol (used by _resolve_currency)
-    _KNOWN_ADDRESSES: dict[str, str] = {
-        # ETH mainnet
-        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "WETH",
-        "0xdac17f958d2ee523a2206206994597c13d831ec7": "USDT",
-        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC",
-        "0x6b175474e89094c44da98b954eedeac495271d0f": "DAI",
-        # BSC
-        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "WBNB",
-        "0x55d398326f99059ff775485246999027b3197955": "USDT",
-        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",
-        "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",
-        "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3": "DAI",
-    }
-
     def __init__(self, binance_whitelist: dict[str, dict], buy_config: dict):
-        self.enabled = _env_bool("COUNTERBID_ENABLED", False)
-        self.dry_run = _env_bool("COUNTERBID_DRY_RUN", True)
+        self.enabled = _env_bool("PARASITE_HUNTER_ENABLED", False)
+        self.dry_run = _env_bool("PARASITE_HUNTER_DRY_RUN", True)
 
-        # ── Rival wallets (targets to undercut) ──
+        # ── Parasite wallets (targets to undercut) ──
         self.target_wallets: set[str] = set()
-        pw_raw = _env("RIVAL_WALLETS")
+        pw_raw = _env("PARASITE_WALLETS")
         if pw_raw:
             self.target_wallets = {w.strip().lower() for w in pw_raw.split(",") if w.strip()}
-        explicit = _env("COUNTERBID_TARGET")
+        explicit = _env("PARASITE_HUNTER_TARGET")
         if explicit:
             self.target_wallets.add(explicit.strip().lower())
         if not self.target_wallets:
             self.target_wallets = {"0xf1771cf8831393422189330a79dd896223c357a4"}
-
-        # F.1 PATCH 2026-04-27: freeze env baseline so Brain merge is additive only.
-        # Brain failures will never reduce the wallet set below env-configured baseline.
-        self._target_wallets_env_baseline: set[str] = set(self.target_wallets)
-
-        # PATCH 2026-05-14: Phase 2 wallet filter. If env COUNTERBID_PHASE2_WALLET_FILTER
-        # is set (comma-separated wallets), Phase 2 (non-WL hunt) ONLY undercuts offers
-        # whose maker is in this set. Used to narrow Phase 2 to a single high-value
-        # parasite without disabling Brain merge for Phase 1 sightings/reporting.
-        _pf = _env("COUNTERBID_PHASE2_WALLET_FILTER", "")
-        self._phase2_wallet_filter: set[str] | None = (
-            {w.strip().lower() for w in _pf.split(",") if w.strip()} if _pf else None
-        )
-        if self._phase2_wallet_filter:
-            log.info("PHASE 2 WALLET FILTER active: %d wallets (sample: %s)",
-                     len(self._phase2_wallet_filter),
-                     sorted(self._phase2_wallet_filter)[:2])
-
-        # F.2 PATCH 2026-04-27: per-scan accumulator for sighting reports.
-        # Maps unknown-maker wallet → set of collections where seen this scan.
-        # Cleared at start of every scan_wallet, reported at end of scan to Brain.
-        self._scan_unknown_makers: dict[str, set[str]] = {}
-        # Threshold: how many collections before reporting a sighting (Brain dedup-promotes after 3 sightings)
-        self._sighting_min_collections: int = int(__import__("os").environ.get("BRAIN_SIGHTING_MIN_COLLECTIONS", "3"))
 
         # ── Our wallet + friend wallets (NEVER undercut these) ──
         self.our_wallet = _env("BUYER_WALLET_ADDRESS", "").strip().lower()
@@ -291,50 +242,28 @@ class CounterBidder:
             self.protected_wallets.add(self.our_wallet)
 
         # ── WL capture settings ──
-        self.max_per_collection = _env_int("COUNTERBID_MAX_PER_COLLECTION", 50)
-        self.undercut_bps = _env_int("COUNTERBID_UNDERCUT_BPS", 50)
-        self.max_usd = _env_float("COUNTERBID_MAX_USD", 0.51)
-        # PATCH 2026-04-26: per-chain max_usd override — ETH rivals bid $1-$444
-        # per NFT, so a $0.7 global cap is meaningless on ETH. Default to
-        # max_usd if env not set (backwards compat).
-        self.max_usd_eth = _env_float("COUNTERBID_MAX_USD_ETH", self.max_usd)
-        self.delay = _env_float("COUNTERBID_DELAY_SECONDS", 1.0)
-        self.scan_interval = _env_int("COUNTERBID_SCAN_INTERVAL", 300)
-        self.collection_delay = _env_float("COUNTERBID_COLLECTION_DELAY", 2.0)
+        self.max_per_collection = _env_int("PARASITE_HUNTER_MAX_PER_COLLECTION", 50)
+        self.undercut_bps = _env_int("PARASITE_HUNTER_UNDERCUT_BPS", 50)
+        self.max_usd = _env_float("PARASITE_HUNTER_MAX_USD", 0.51)
+        self.delay = _env_float("PARASITE_HUNTER_DELAY_SECONDS", 1.0)
+        self.scan_interval = _env_int("PARASITE_HUNTER_SCAN_INTERVAL", 300)
+        self.collection_delay = _env_float("PARASITE_HUNTER_COLLECTION_DELAY", 2.0)
         self.chains = [
             c.strip().lower()
-            for c in _env("COUNTERBID_CHAINS", "bsc").split(",")
+            for c in _env("PARASITE_HUNTER_CHAINS", "bsc").split(",")
             if c.strip()
         ]
         self.offer_currencies = [
             c.strip().upper()
-            for c in _env("COUNTERBID_OFFER_CURRENCIES", "WBNB,WETH,USDT").split(",")
+            for c in _env("PARASITE_HUNTER_OFFER_CURRENCIES", "WBNB,WETH,USDT").split(",")
             if c.strip()
         ]
 
-        # ── Phase 2: non-WL rival hunt settings ──
-        self.nonwl_max_usd = _env_float("COUNTERBID_NONWL_MAX_USD", 0.001)
-        self.nonwl_qty = _env_int("COUNTERBID_NONWL_QTY", 10)
-        # ── B1 RESTORED 2026-04-25: dynamic qty = budget_usd / price_usd ──
-        # Was removed in 60ce14f, replaced by binary 10/1; Robert confirmed
-        # original spec was qty = budget/cap_usd capped at max_qty.
-        self.budget_usd = _env_float("COUNTERBID_BUDGET_USD", 8.8)
-        # ── 3-POOL BUDGETS 2026-04-25 (Robert): WL / non-WL / missclick-buy ──
-        # If pool-specific not set, fall back to global budget_usd.
-        self.budget_wl_usd = _env_float("COUNTERBID_BUDGET_WL_USD", self.budget_usd)
-        self.budget_nonwl_usd = _env_float("COUNTERBID_BUDGET_NONWL_USD", self.budget_usd)
-        self.budget_buy_usd = _env_float("COUNTERBID_BUDGET_BUY_USD", self.budget_usd)
-        self.max_qty = _env_int("COUNTERBID_MAX_QTY", 200)
-        # WL-FIRST RULE: non-WL counter-offers are OUT OF MANDATE by default.
-        # Inventory we hold on non-WL collections is SELL-side only (listings,
-        # re-listings, cancels) — never BUY-side (no new collection offers,
-        # no counterbids on rivals squatting non-WL collections). Set
-        # COUNTERBID_NONWL_ENABLED=1 explicitly to re-enable the
-        # non-WL hunt path.
-        self.nonwl_enabled = _env("COUNTERBID_NONWL_ENABLED", "0") == "1"
-        # ── Non-WL blacklist (collections to NEVER hunt even in Phase 2) ──
-        _bl_raw = _env("COUNTERBID_NONWL_BLACKLIST", "")
-        self.nonwl_blacklist: set[str] = {a.strip().lower() for a in _bl_raw.split(",") if a.strip()}
+        # ── Phase 2: non-WL parasite hunt settings ──
+        self.nonwl_max_usd = _env_float("PARASITE_HUNTER_NONWL_MAX_USD", 0.001)
+        self.nonwl_qty = _env_int("PARASITE_HUNTER_NONWL_QTY", 10)
+        # Phase 2 toggle (default OFF — disable non-WL parasite hunt)
+        self.phase2_enabled = _env_bool("PARASITE_HUNTER_PHASE2_ENABLED", False)
 
         self.binance_whitelist = binance_whitelist
         self.buy_config = buy_config
@@ -386,14 +315,6 @@ class CounterBidder:
         # Local offer tracker: "addr:chain" → list of offer_ids we placed
         # Backup for self-bidding protection when OKX API fails to return our offers
         self._local_placed_offers: dict[str, list[str]] = {}
-        # Local qty cache: "addr:chain" → qty we last placed (OKX API doesn't return real qty)
-        self._placed_qty_cache: dict[str, int] = {}
-        # Floor price cache (per-scan)
-        self._floor_cache: dict[str, float] = {}
-
-        # Balance tracking (instance-level to prevent cross-instance leaks)
-        self._balance_cache: dict[str, tuple[float, float]] = {}
-        self._low_balance_alerted: set[str] = set()
 
         # ── OKX page slug map (address → slug) for new API endpoints ──
         # Old priapi/v5/nft/ec/ endpoints are DEAD (404).
@@ -430,7 +351,7 @@ class CounterBidder:
         status = "ENABLED" if self.enabled else "DISABLED"
         mode = "DRY RUN" if self.dry_run else "LIVE"
         log.info(
-            "CounterBidder v4: %s (%s) targets=%d friends=%d undercut=%dbps "
+            "ParasiteHunter v4: %s (%s) targets=%d friends=%d undercut=%dbps "
             "max=$%.2f chains=%s wl=%d currencies=%s",
             status, mode, len(self.target_wallets), len(self.friend_wallets),
             self.undercut_bps, self.max_usd, ",".join(self.chains),
@@ -447,7 +368,6 @@ class CounterBidder:
         self._cycle_buys = 0  # buys this scan cycle
         buy_settings = self.buy_config.get("buy_settings", {})
         self._buy_enabled = buy_settings.get("enabled", False)
-        self._sell_dry_run = _env_bool("SELL_DRY_RUN", True)  # PATCH 2026-05-27: sell-only dry-run
         self._max_buys_per_collection = buy_settings.get("max_buys_per_collection", 2)
         self._max_buys_per_cycle = buy_settings.get("max_total_buys_per_cycle", 5)
         self._buy_cooldown_seconds = buy_settings.get("cooldown_seconds", 60)
@@ -547,8 +467,8 @@ class CounterBidder:
         try:
             state = self._get_execution_state()
             state.record_submit_event(
-                engine="counter_bidder",
-                action_type="LIVE_RIVAL_BID",
+                engine="parasite_hunter",
+                action_type="LIVE_PARASITE_HUNTER",
                 collection=collection,
                 chain=chain,
                 price_bnb=price_bnb,
@@ -556,27 +476,7 @@ class CounterBidder:
                 reason=reason,
             )
         except Exception as exc:
-            log.debug("counter_bidder submit event skipped: %s", exc)
-        # PATCH 2026-04-30 (BV1): journal to Brain on successful submit, fire-and-forget
-        if status == "submitted":
-            try:
-                from okx_nft_bot import brain_client as _bv1_brain
-                from datetime import datetime as _bv1_dt, timezone as _bv1_tz
-                _bv1_brain._request("POST", "/journal/event", {
-                    "bot_id": "okx_nft_bot_v13",
-                    "event_type": "offer_submitted",
-                    "payload": {
-                        "side": "buy",
-                        "chain": chain,
-                        "collection": collection,
-                        "price_bnb": price_bnb,
-                        "reason": reason,
-                        "engine": "counter_bidder",
-                        "filled_at": _bv1_dt.now(_bv1_tz.utc).isoformat(),
-                    },
-                })
-            except Exception as _bv1_e:
-                log.debug("BV1 journal err: %s", _bv1_e)
+            log.debug("parasite_hunter submit event skipped: %s", exc)
 
     # ── Background scanner ─────────────────────────────────────
 
@@ -589,11 +489,11 @@ class CounterBidder:
 
         self._stop_event.clear()
         self._bg_thread = threading.Thread(
-            target=self._background_loop, daemon=True, name="rival-scanner"
+            target=self._background_loop, daemon=True, name="parasite-hunter"
         )
         self._bg_thread.start()
         log.info(
-            "🎯 CounterBidder v4 background scan started "
+            "🎯 ParasiteHunter v4 background scan started "
             "(interval=%ds, chains=%s, targets=%d, friends=%d)",
             self.scan_interval, ",".join(self.chains),
             len(self.target_wallets), len(self.friend_wallets)
@@ -605,123 +505,14 @@ class CounterBidder:
         if self._bg_thread:
             self._bg_thread.join(timeout=10)
 
-    # F.1 PATCH 2026-04-27: pull confirmed parasites from Brain, additive merge into target_wallets.
-    # Never reduces below env baseline. Subtracts protected wallets defensively.
-    def _refresh_brain_intel(self):
-        if _brain is None:
-            return
-        try:
-            wallets = _brain.get_confirmed_parasites()
-        except Exception as e:
-            log.debug("brain /parasites pull failed: %s", e)
-            return
-        if not wallets:
-            return
-        new_set = set(self._target_wallets_env_baseline) | {w.lower() for w in wallets if w and w.startswith("0x")}
-        new_set -= self.protected_wallets
-        if new_set != self.target_wallets:
-            added = new_set - self.target_wallets
-            if added:
-                log.info("F.1 brain: +%d parasites from Brain (sample: %s)", len(added), sorted(list(added))[:3])
-            self.target_wallets = new_set
-
-    # F.3 PATCH 2026-04-27: liveness heartbeat to Brain. Fail-soft.
-    def _send_heartbeat(self):
-        if _brain is None:
-            return
-        try:
-            _brain.heartbeat(
-                bot_id="okx_nft_bot_v13",
-                wallet=self.our_wallet or None,
-                status={
-                    "total_scans": int(getattr(self, "total_scans", 0)),
-                    "rival_count": len(self.target_wallets),
-                    "scan_interval_s": int(self.scan_interval),
-                    "chains": list(self.chains),
-                },
-            )
-        except Exception as e:
-            log.debug("brain heartbeat failed: %s", e)
-
-    # F.2 PATCH 2026-04-27: report per-scan accumulated unknown makers to Brain.
-    # Runs at end of each scan cycle. Fail-soft.
-    def _report_scan_sightings(self):
-        if _brain is None:
-            return
-        if not self._scan_unknown_makers:
-            return
-        try:
-            reported = 0
-            for maker, colls in self._scan_unknown_makers.items():
-                if not maker or not maker.startswith("0x"):
-                    continue
-                if len(colls) < self._sighting_min_collections:
-                    continue
-                _brain.report_parasite_sighting(
-                    wallet=maker,
-                    platform="okx",
-                    chain="bsc",
-                    notes=f"counter_bidder scan — active on {len(colls)} WL collections",
-                    bot_id="okx_nft_bot_v13",
-                )
-                reported += 1
-            if reported > 0:
-                log.info("F.2 brain: reported %d sightings (threshold %d collections)", reported, self._sighting_min_collections)
-        except Exception as e:
-            log.debug("F.2 sighting report failed: %s", e)
-
     def _background_loop(self):
-        """Main background loop — wallet-level scan each interval.
-        PATCH 2026-05-02 (smart-pause): if WETH balance == 0 for 30+ min → sleep 10 min between checks.
-        Resumes normal cadence as soon as balance > 0.
-        """
-        empty_balance_since = None
-        SMART_PAUSE_THRESHOLD_S = 30 * 60   # 30 min of empty → enter pause
-        SMART_PAUSE_SLEEP_S = 10 * 60       # then sleep 10 min between balance polls
-
+        """Main background loop — wallet-level scan each interval."""
         while not self._stop_event.is_set():
-            # PATCH: smart-pause check
             try:
-                # Iterate WETH addresses across configured chains
-                weth_zero = True
-                for chain in self.chains:
-                    weth_addr = self._weth_addr_for_chain(chain) if hasattr(self, "_weth_addr_for_chain") else None
-                    if not weth_addr:
-                        # fall back: check first cached balance
-                        for addr, (bal, _) in (self._balance_cache or {}).items():
-                            if bal > 0:
-                                weth_zero = False
-                                break
-                        break
-                    bal = self._get_balance(weth_addr)
-                    if bal > 0:
-                        weth_zero = False
-                        break
-                # Track empty streak
-                if weth_zero:
-                    if empty_balance_since is None:
-                        empty_balance_since = time.time()
-                    elif time.time() - empty_balance_since > SMART_PAUSE_THRESHOLD_S:
-                        log.info("[SMART_PAUSE] WETH=0 for %.0fmin — sleeping %.0fmin", (time.time()-empty_balance_since)/60, SMART_PAUSE_SLEEP_S/60)
-                        self._stop_event.wait(SMART_PAUSE_SLEEP_S)
-                        continue
-                else:
-                    if empty_balance_since is not None:
-                        log.info("[SMART_PAUSE] WETH balance restored, resuming normal scan")
-                        empty_balance_since = None
-            except Exception as e:
-                log.debug("[SMART_PAUSE] balance check failed: %s — proceeding with normal scan", e)
-                empty_balance_since = None
-
-            try:
-                self._scan_unknown_makers.clear()  # F.2 — fresh accumulator per scan
-                self._refresh_brain_intel()  # F.1
                 report = self.scan_wallet()
                 self.last_report = report
                 self.total_scans += 1
                 self._alert_scan_report(report)
-                self._report_scan_sightings()  # F.2
-                self._send_heartbeat()  # F.3
             except Exception as exc:
                 log.error("🎯 Background scan error: %s", exc)
 
@@ -731,8 +522,9 @@ class CounterBidder:
 
     def scan_wallet(self) -> ScanReport:
         """Multi-phase scan cycle:
+        Phase 0: PRIORITY KILL — outbid ALL offers from priority parasite FIRST
         Phase 1: WL capture — undercut ALL offers on WL collections (except self/friends)
-        Phase 2: Rival non-WL — undercut rival offers on non-WL if cheap or configured
+        Phase 2: Parasite non-WL — undercut parasite offers on non-WL if cheap or configured
         Phase 2b: Sell side — list our NFTs cheapest but above low_price
         Phase 3: Missclick buy — buy underpriced WL listings
         Phase 3c: Config buy — buy underpriced non-WL from buy_config
@@ -743,6 +535,7 @@ class CounterBidder:
         self._friend_skipped_count = 0
         self._best_offer_cache = {}  # reset per-scan cache
         self._nftid_offers_cache = {}  # reset per-scan nftId offers cache
+        self._processed_collections: set[str] = set()  # Phase dedup: prevent double-processing
 
         # ── Evict stale cache entries to prevent memory leaks ──
         now = time.time()
@@ -756,7 +549,8 @@ class CounterBidder:
             if now - v.get("ts", 0) < 300
         }
         # Purge floor cache
-        self._floor_cache = {}
+        if hasattr(self, "_floor_cache"):
+            self._floor_cache = {}
 
         # Pre-fetch prices
         self.prices._refresh_if_stale()
@@ -764,188 +558,136 @@ class CounterBidder:
         eth_usd = self.prices.get_usd_price("ETH")
         log.info("💰 Live prices: BNB=$%.2f ETH=$%.2f", bnb_usd, eth_usd)
 
+        # ── Priority parasite wallet (Phase 0 target) ──
+        priority_parasite = _env(
+            "PRIORITY_PARASITE_WALLET",
+            "0xf1771cf8831393422189330a79dd896223c357a4",
+        ).strip().lower()
+
         for chain in self.chains:
             if self._stop_event.is_set():
                 break
             report.chains_scanned.append(chain)
 
             # ══════════════════════════════════════════════
+            # PHASE 0: PRIORITY PARASITE KILL
+            # Fetch ALL offers from the priority parasite wallet and
+            # outbid every single one BEFORE any other work.
+            # This ensures the parasite gets crushed immediately each cycle.
+            # ══════════════════════════════════════════════
+            log.info("═══ PHASE 0: PRIORITY KILL %s…%s on %s ═══",
+                     priority_parasite[:8], priority_parasite[-4:], chain.upper())
+            try:
+                p0_offers = self._fetch_single_wallet(priority_parasite, chain)
+                log.info("🎯 PHASE 0 %s: fetched %d offers from priority parasite",
+                         chain.upper(), len(p0_offers))
+
+                if p0_offers:
+                    # Group by collection
+                    p0_by_coll: dict[str, list[ParasiteOffer]] = defaultdict(list)
+                    for o in p0_offers:
+                        p0_by_coll[o.collection_address].append(o)
+
+                    log.info("🎯 PHASE 0 %s: %d collections to outbid",
+                             chain.upper(), len(p0_by_coll))
+
+                    for addr, coll_offers in p0_by_coll.items():
+                        if self._stop_event.is_set():
+                            break
+                        name = coll_offers[0].collection_name or addr[:14]
+                        log.info("  💀 PHASE 0: outbidding %d offers on %s",
+                                 len(coll_offers), name)
+
+                        result = self._undercut_collection(addr, coll_offers, chain)
+                        self._processed_collections.add(f"{addr}:{chain}")
+
+                        report.total_offers_found += len(coll_offers)
+                        report.undercuts_placed += result.our_offers_placed
+                        report.undercuts_failed += result.our_offers_failed
+                        report.undercuts_skipped += result.our_offers_skipped
+
+                        if self.collection_delay > 0 and not self.dry_run:
+                            time.sleep(self.collection_delay)
+
+                    log.info("✅ PHASE 0 %s: done — %d collections processed",
+                             chain.upper(), len(p0_by_coll))
+
+                    # Clear best-offer cache so Phase 1/2 don't use stale
+                    # data from before our Phase 0 offers were placed.
+                    self._best_offer_cache.clear()
+                    self._nftid_offers_cache.clear()
+                else:
+                    log.info("✅ PHASE 0 %s: parasite has 0 offers — nothing to kill",
+                             chain.upper())
+
+            except Exception as exc:
+                log.error("PHASE 0 PRIORITY KILL %s failed: %s",
+                          chain.upper(), exc, exc_info=True)
+
+            # ══════════════════════════════════════════════
             # PHASE 1: WL CAPTURE — be the best offer on every WL collection
-            # Scans ALL offers (not just rivals) on each WL collection.
+            # Scans ALL offers (not just parasites) on each WL collection.
             # Undercuts anyone who isn't us or a friend.
             # ══════════════════════════════════════════════
             log.info("═══ PHASE 1: WL CAPTURE on %s ═══", chain.upper())
 
             # Get WL collection addresses for this chain
             # For BSC: skip collections not verified on OKX (saves ~82 wasted API calls)
-            # ── PATCH 2026-08-01 (PRICE BAND): не стрелять туда, где не долетаем.
-            # Замер показал: медиана реальных сделок в части коллекций —
-            # сотни долларов, а наш потолок $3. Разрыв до 456x. Такие цели
-            # жгут лимит скорости и слоты, шанс исполнения нулевой.
-            # _price_band_ok=False → пропускаем. None (не сканировано) → работаем.
-            _band_off = _env_bool("PRICE_BAND_FILTER", True)
             wl_addrs_chain = [
                 addr for addr, info in self._wl_index.items()
                 if info.get("network", "").lower() == chain
                 and (chain != "bsc" or info.get("okx_verified", True))
-                and (not _band_off or info.get("_price_band_ok") is not False)
             ]
             log.info("📋 %s: %d WL collections to scan", chain.upper(), len(wl_addrs_chain))
 
-            wl_rival_offers: list[RivalOffer] = []
-            
-            # ── β 0.2 Feature 3: PARALLEL FETCH 2026-04-26 ──
-            # Phase 1 fetch was sequential (152 calls × 300ms = 45s+). Parallelize
-            # the FETCH stage with ThreadPoolExecutor. Processing stays sequential
-            # to avoid race conditions on shared state (already_winning, etc.)
-            _parallel_workers = _env_int("COUNTERBID_PHASE1_WORKERS", 5)
-            _eligible_addrs: list[str] = []
-            for coll_addr in wl_addrs_chain:
-                if self._stop_event.is_set():
-                    break
-                _skip, _reason = self._should_skip_nonwl_collection(coll_addr)
-                if _skip:
-                    log.info("  ⛔ WL %s: %s — skip Phase 1", coll_addr[:14], _reason)
-                    continue
-                _eligible_addrs.append(coll_addr)
-            
-            log.info("📋 %s: parallel-fetching top offers for %d collections (workers=%d)",
-                     chain.upper(), len(_eligible_addrs), _parallel_workers)
-            
-            _fetch_start = time.time()
-            _coll_offers_map: dict[str, list[RivalOffer]] = {}
-            with ThreadPoolExecutor(max_workers=_parallel_workers) as _ex:
-                _futures = {_ex.submit(self._fetch_top_offers_for_collection, addr, chain, 20): addr for addr in _eligible_addrs}
-                for _fut in as_completed(_futures):
-                    _addr = _futures[_fut]
-                    try:
-                        _coll_offers_map[_addr] = _fut.result(timeout=30) or []
-                    except Exception as _exc:
-                        log.warning("  fetch failed %s: %s", _addr[:14], str(_exc)[:80])
-                        _coll_offers_map[_addr] = []
-            log.info("📋 %s: parallel fetch done in %.1fs (%d/%d collections returned data)",
-                     chain.upper(), time.time()-_fetch_start,
-                     sum(1 for v in _coll_offers_map.values() if v), len(_eligible_addrs))
-            
-            # ── Sequential processing of pre-fetched results ──
-            for i, coll_addr in enumerate(_eligible_addrs):
+            wl_enemy_offers: list[ParasiteOffer] = []
+            for i, coll_addr in enumerate(wl_addrs_chain):
                 if self._stop_event.is_set():
                     break
 
-                top_offers = _coll_offers_map.get(coll_addr, [])
+                # Phase dedup: skip collections already processed in Phase 0
+                dedup_key = f"{coll_addr}:{chain}"
+                if dedup_key in self._processed_collections:
+                    log.info("  ⏭ WL %s: already processed in Phase 0 — skip", coll_addr[:14])
+                    continue
+
+                top_offers = self._fetch_top_offers_for_collection(coll_addr, chain, limit=5)
                 if not top_offers:
                     continue
 
-                # Filter: keep only rival offers (not us, not friends)
+                # Filter: keep only enemy offers (not us, not friends)
                 # IMPORTANT: skip offers with empty maker — could be our own offer
                 # that the API didn't return maker info for
-                rivals = [o for o in top_offers if o.maker and o.maker not in self.protected_wallets]
-
-                # F.2 PATCH 2026-04-27: track UNKNOWN makers (not yet in target_wallets)
-                # per collection. Reported at end of scan to Brain /parasite/seen.
-                for _r in rivals:
-                    if _r.maker and _r.maker not in self.target_wallets:
-                        self._scan_unknown_makers.setdefault(_r.maker, set()).add(coll_addr)
-                if not rivals:
+                for o in top_offers:
+                    if not o.maker:
+                        log.warning("  ⚠ %s: offer with EMPTY maker (price=%.4f %s) — treating as unknown, skip to avoid self-bid",
+                                    coll_addr[:14], o.price, o.currency)
+                enemies = [o for o in top_offers if o.maker and o.maker not in self.protected_wallets]
+                if not enemies:
                     # All top offers are ours/friends — we're winning
                     self.already_winning += 1
                     continue
 
-                # ── PATCH 2026-04-25: outlier filter requires SECOND rival to be MEANINGFUL ──
-                # Old bug: junk $0.01 spam offers as second-best made real $1+ rivals look like bait.
-                # Now: second must be at least 5% of our cap (or $0.10 absolute) to be trusted as anchor.
-                if len(rivals) >= 2:
-                    e_usd = [(e, self.prices.to_usd(e.price, e.currency.upper())) for e in rivals]
-                    e_usd.sort(key=lambda x: x[1], reverse=True)
-                    _cap_cfg = self.buy_config.get("collections", {}).get(coll_addr, {})
-                    _cap = _cap_cfg.get("max_offer_price", 0)
-                    _cap_cur = (_cap_cfg.get("currency") or "WBNB").upper()
-                    _cap_usd = self.prices.to_usd(_cap, _cap_cur) if _cap else 0
-                    _min_meaningful = max(0.10, _cap_usd * 0.05)
-                    if e_usd[1][1] >= _min_meaningful and e_usd[0][1] > e_usd[1][1] * 3:
-                        log.info("  🗑 %s: Phase1 filtering outlier rival $%.2f (>3x second $%.2f, second >= $%.2f) maker=%s",
-                                 coll_addr[:14], e_usd[0][1], e_usd[1][1], _min_meaningful, (e_usd[0][0].maker or "?")[:14])
-                        rivals = [e for e, _ in e_usd[1:]]
-                    elif e_usd[1][1] < _min_meaningful and _cap_usd > 0 and e_usd[0][1] > _cap_usd * 10:
-                        log.info("  🗑 %s: Phase1 filtering outlier rival $%.2f (>10x cap $%.2f, second too small at $%.2f) maker=%s",
-                                 coll_addr[:14], e_usd[0][1], _cap_usd, e_usd[1][1], (e_usd[0][0].maker or "?")[:14])
-                        rivals = [e for e, _ in e_usd[1:]]
-
-                # Check: is our offer already #1 (highest price)?
+                # Check: is our offer already #1?
                 if top_offers[0].maker and top_offers[0].maker in self.protected_wallets:
-                    our_top = top_offers[0]
-                    our_top_usd = self.prices.to_usd(our_top.price, our_top.currency.upper())
-
-                    # Overpay check 1: our offer exceeds buy_config cap → re-place
-                    _wl_cfg = self.buy_config.get("collections", {}).get(coll_addr, {})
-                    _wl_cap = _wl_cfg.get("max_offer_price", 0)
-                    _wl_cur = (_wl_cfg.get("currency") or "WBNB").upper()
-                    _wl_cap_usd = self.prices.to_usd(_wl_cap, _wl_cur) if _wl_cap > 0 else 0
-                    if _wl_cap_usd > 0 and our_top_usd > _wl_cap_usd * 1.05:
-                        log.info("  ⚠ %s: we're #1 but OVER CAP $%.2f > cap $%.2f — will re-place",
-                                 coll_addr[:14], our_top_usd, _wl_cap_usd)
-                        # PATCH 2026-05-31 TG_NOTIFY_SELF_CORRECT
-                        try:
-                            _tg_msg = (
-                                "⚠️ <b>SELF-CORRECT (OVER CAP)</b>\n"
-                                + "<code>" + str(coll_addr[:14]) + "</code> we#1 "
-                                + "$" + format(our_top_usd, ".2f") + " > cap "
-                                + "$" + format(_wl_cap_usd, ".2f")
-                                + "\n→ will re-place lower"
-                            )
-                            self._tg_send(_tg_msg)
-                        except Exception:
-                            pass
-                        wl_rival_offers.extend(rivals)
-                        time.sleep(2.0)
-                        continue
-
-                    if rivals:
-                        best_en = rivals[0]
-                        best_en_usd = self.prices.to_usd(best_en.price, best_en.currency.upper())
-                        # Overpay check 2: we're >50% above best rival → re-place
-                        if best_en_usd > 0 and our_top_usd > best_en_usd * 1.5:
-                            log.info("  ⚠ %s: we're #1 but OVERPAYING $%.2f vs rival $%.2f (>1.5x) — will re-place",
-                                     coll_addr[:14], our_top_usd, best_en_usd)
-                            # PATCH 2026-05-31 TG_NOTIFY_SELF_CORRECT
-                            try:
-                                _tg_msg = (
-                                    "⚠️ <b>SELF-CORRECT (OVERPAY)</b>\n"
-                                    + "<code>" + str(coll_addr[:14]) + "</code> we#1 "
-                                    + "$" + format(our_top_usd, ".2f") + " vs rival "
-                                    + "$" + format(best_en_usd, ".2f")
-                                    + "\n→ will re-place lower"
-                                )
-                                self._tg_send(_tg_msg)
-                            except Exception:
-                                pass
-                            wl_rival_offers.extend(rivals)
-                            time.sleep(2.0)
-                            continue
-                        log.info("    Our: %.6f %s ($%.2f) | Best rival: %.6f %s ($%.2f)",
-                                 our_top.price, our_top.currency, our_top_usd,
-                                 best_en.price, best_en.currency, best_en_usd)
-                    log.info("  \u2705 %s: we're #1 (%.6f %s $%.2f), %d rivals below \u2014 KEEP",
-                             coll_addr[:14], our_top.price, our_top.currency, our_top_usd, len(rivals))
                     self.already_winning += 1
-                    time.sleep(2.0)
                     continue
 
-                wl_rival_offers.extend(rivals)
+                wl_enemy_offers.extend(enemies)
 
-                # Rate limit: OKX ~1 req/2s on collection-offers
-                if i % 10 == 9:
-                    time.sleep(8.0)  # cooldown burst every 10 collections
+                # Rate limit: don't hammer OKX
+                if i % 20 == 19:
+                    time.sleep(1.0)
                 else:
-                    time.sleep(2.0)
+                    time.sleep(0.15)
 
-            # Group rival offers by collection and undercut
-            if wl_rival_offers:
-                by_wl: dict[str, list[RivalOffer]] = defaultdict(list)
-                for o in wl_rival_offers:
+            # Group enemy offers by collection and undercut
+            if wl_enemy_offers:
+                by_wl: dict[str, list[ParasiteOffer]] = defaultdict(list)
+                for o in wl_enemy_offers:
                     by_wl[o.collection_address].append(o)
 
-                report.wl_offers_found += len(wl_rival_offers)
+                report.wl_offers_found += len(wl_enemy_offers)
                 report.wl_collections = len(by_wl)
 
                 for addr, coll_offers in by_wl.items():
@@ -953,6 +695,7 @@ class CounterBidder:
                     report.total_offers_found += len(coll_offers)
 
                     result = self._undercut_collection(addr, coll_offers, chain)
+                    self._processed_collections.add(f"{addr}:{chain}")  # Phase dedup
                     report.undercuts_placed += result.our_offers_placed
                     report.wl_undercuts_placed += result.our_offers_placed
                     report.undercuts_failed += result.our_offers_failed
@@ -964,73 +707,32 @@ class CounterBidder:
 
             report.wl_already_best = self.already_winning
 
-
-        # ── PATCH 2026-04-27: PHASE 2/2b/3/3c moved to second pass — Phase 1 ETH starts faster ──
-        for chain in self.chains:
-            if self._stop_event.is_set():
-                break
             # ══════════════════════════════════════════════
-            # PHASE 2: RIVAL NON-WL — cheap collections rivals sit on
-            # Wallet-level scan of all rivals, then filter non-WL.
+            # PHASE 2: PARASITE NON-WL — cheap collections parasites sit on
+            # Wallet-level scan of all parasites, then filter non-WL.
             # NOTE: BSC /offers endpoint ignores maker filter, but
             #       /collection-offers endpoint WORKS with maker on BSC.
             # ══════════════════════════════════════════════
-            if not self.nonwl_enabled:
-                log.info(
-                    "═══ PHASE 2: NON-WL RIVAL HUNT on %s — SKIPPED "
-                    "(COUNTERBID_NONWL_ENABLED=0, WL-first rule in effect) ═══",
-                    chain.upper(),
-                )
-                # Skip entire non-WL counter-offer block; we still fall through
-                # to PHASE 2b SELL which handles non-WL inventory liquidation.
-                all_rival = []
-                nonwl_rival = []
+            log.info("═══ PHASE 2: NON-WL PARASITE HUNT on %s ═══", chain.upper())
+
+            if not self.phase2_enabled:
+                log.info("⏭ PHASE 2 disabled (PARASITE_HUNTER_PHASE2_ENABLED=0) — skipping")
+                all_parasite = []
             else:
-                # ── PATCH 2026-04-26: skip Phase 2 when quota guard full ──
-                # Phase 2 iterates 100+ rival non-WL collections doing 4-5 API
-                # calls each. When quota guard blocks every submit, this is
-                # pure waste — 15-20 min/cycle of meaningless lookups. Skip
-                # to next chain (e.g. Phase 1 ETH) so productive work isn't
-                # starved. auto_stale_cancel cron frees slots periodically;
-                # next cycle Phase 2 runs normally.
-                _quota_threshold_p2 = _env_int("COUNTERBID_QUOTA_THRESHOLD", 25)
-                _quota_ok_p2, _in_flight_p2 = self._check_okx_quota(_quota_threshold_p2)
-                if not _quota_ok_p2:
-                    log.warning(
-                        "═══ PHASE 2 SKIPPED on %s — quota guard %d/%d full "
-                        "(saving cycle time for other chains/Phase 1) ═══",
-                        chain.upper(), _in_flight_p2, _quota_threshold_p2,
-                    )
-                    continue
+                all_parasite = self._fetch_wallet_offers(chain)
+            nonwl_parasite = [o for o in all_parasite if o.collection_address not in self._wl_index]
 
-                log.info("═══ PHASE 2: NON-WL RIVAL HUNT on %s ═══", chain.upper())
+            log.info("🕷 %s: %d parasite non-WL offers", chain.upper(), len(nonwl_parasite))
 
-                all_rival = self._fetch_wallet_offers(chain)
-                # PATCH 2026-05-14: scope Phase 2 to a wallet filter if set
-                if self._phase2_wallet_filter:
-                    _before = len(all_rival)
-                    all_rival = [o for o in all_rival
-                                 if o.maker and o.maker.lower() in self._phase2_wallet_filter]
-                    log.info("🎯 %s: Phase 2 wallet filter: %d/%d offers kept (filter=%d wallets)",
-                             chain.upper(), len(all_rival), _before, len(self._phase2_wallet_filter))
-                nonwl_rival = [o for o in all_rival if o.collection_address not in self._wl_index]
-
-            log.info("🕷 %s: %d rival non-WL offers", chain.upper(), len(nonwl_rival))
-
-            if nonwl_rival:
-                by_nonwl: dict[str, list[RivalOffer]] = defaultdict(list)
-                for o in nonwl_rival:
+            if nonwl_parasite:
+                by_nonwl: dict[str, list[ParasiteOffer]] = defaultdict(list)
+                for o in nonwl_parasite:
                     by_nonwl[o.collection_address].append(o)
 
                 report.nonwl_collections = len(by_nonwl)
-                report.nonwl_offers_found += len(nonwl_rival)
+                report.nonwl_offers_found += len(nonwl_parasite)
 
                 for addr, coll_offers in by_nonwl.items():
-                    # ── PATCH 2026-04-25 (Phase A refactor): use _should_skip_nonwl_collection helper ──
-                    _skip, _reason = self._should_skip_nonwl_collection(addr)
-                    if _skip:
-                        log.info("  ⛔ non-WL %s: %s — skip", addr[:14], _reason)
-                        continue
                     has_config = addr in self.buy_config.get("collections", {})
                     cheapest_usd = min(
                         (self.prices.to_usd(o.price, o.currency) for o in coll_offers
@@ -1044,42 +746,21 @@ class CounterBidder:
                                   addr[:14], cheapest_usd)
                         continue
 
+                    # Phase dedup: skip if already processed in Phase 1 (WL)
+                    dedup_key = f"{addr}:{chain}"
+                    if dedup_key in self._processed_collections:
+                        log.info("  ⏭ non-WL %s: already processed in Phase 1 — skip", addr[:14])
+                        continue
+
                     reason = "config" if has_config else f"cheap(${cheapest_usd:.4f})"
                     log.info("  🎯 non-WL %s: %d offers (%s) — hunting",
                              addr[:14], len(coll_offers), reason)
-
-                    # === PATCH 2026-05-31 UNKNOWN_COLLECTION_FILTER ===
-                    # Defense against scammy/dust collections discovered via parasite hunt.
-                    # Only applies to "unknown" non-WL collections (no buy_config entry).
-                    # Env-tunable thresholds; default ON. Logs + TG when skipped.
-                    if not has_config and os.environ.get("COUNTERBID_NONWL_FILTER_ENABLED", "1") == "1":
-                        _ucf_min_offers = int(os.environ.get("NONWL_MIN_RIVAL_OFFERS", "3"))
-                        _ucf_min_usd = float(os.environ.get("NONWL_MIN_FLOOR_USD", "0.01"))
-                        _ucf_max_usd = float(os.environ.get("NONWL_MAX_FLOOR_USD", "10.0"))
-                        _ucf_skip = None
-                        if len(coll_offers) < _ucf_min_offers:
-                            _ucf_skip = "too_few_offers (" + str(len(coll_offers)) + "<" + str(_ucf_min_offers) + ")"
-                        elif cheapest_usd < _ucf_min_usd:
-                            _ucf_skip = "dust_floor ($" + format(cheapest_usd, ".4f") + "<$" + format(_ucf_min_usd, ".4f") + ")"
-                        elif cheapest_usd > _ucf_max_usd:
-                            _ucf_skip = "too_expensive ($" + format(cheapest_usd, ".2f") + ">$" + format(_ucf_max_usd, ".2f") + ")"
-                        if _ucf_skip:
-                            log.info("  ⛔ unknown-coll %s: filter SKIP %s", addr[:14], _ucf_skip)
-                            try:
-                                self._tg_send(
-                                    "⛔ <b>UNKNOWN-COLL FILTER</b>\n"
-                                    + "<code>" + str(addr[:14]) + "</code> skip\n"
-                                    + "reason: " + _ucf_skip
-                                )
-                            except Exception:
-                                pass
-                            continue
-                    # === END PATCH ===
 
                     limited = coll_offers[:self.nonwl_qty]
                     report.total_offers_found += len(limited)
 
                     result = self._undercut_collection(addr, limited, chain, is_wl=False)
+                    self._processed_collections.add(dedup_key)  # Mark as processed
                     report.undercuts_placed += result.our_offers_placed
                     report.nonwl_undercuts_placed += result.our_offers_placed
                     report.undercuts_failed += result.our_offers_failed
@@ -1128,6 +809,25 @@ class CounterBidder:
                 except Exception as exc:
                     log.error("PHASE 3c CONFIG BUY %s failed: %s", chain.upper(), exc, exc_info=True)
 
+            # ══════════════════════════════════════════════
+            # PHASE 4: PARASITE INTEL — scan parasite balances & approvals
+            # Runs every 5th scan cycle to save API calls.
+            # Logs which parasites have funds and marketplace approvals.
+            # ══════════════════════════════════════════════
+            if not hasattr(self, "_scan_cycle_count"):
+                self._scan_cycle_count = 0
+            self._scan_cycle_count += 1
+
+            if self._scan_cycle_count % 5 == 1:  # every 5th cycle
+                log.info("═══ PHASE 4: PARASITE INTEL on %s ═══", chain.upper())
+                try:
+                    intel = self._run_parasite_intel(chain)
+                    log.info("PHASE 4 %s: %d parasites with balance, %d with offers",
+                             chain.upper(), intel.get("with_balance", 0),
+                             intel.get("with_offers", 0))
+                except Exception as exc:
+                    log.error("PHASE 4 %s failed: %s", chain.upper(), exc)
+
         report.collections_with_offers = len(report.by_collection)
         report.scan_duration_sec = time.time() - t0
 
@@ -1145,57 +845,6 @@ class CounterBidder:
         return report
 
     # ── Phase 3: Missclick Buy ──────────────────────────────────
-
-    def _auto_add_collection_config(self, addr: str, name: str,
-                                     listing_price: float, currency: str,
-                                     chain: str) -> bool:
-        """PATCH 2026-05-30: after a successful Phase-3 buy on a collection
-        without explicit buy_config entry, auto-create one with conservative
-        prices. Gated by env AUTO_ADD_BUY_CONFIG (default on).
-
-        low_price        = listing_price * 1.5  (sell floor — 1.5x breakeven)
-        max_offer_price  = listing_price * 0.95 (won't bid above what we paid)
-        max_buy_price    = listing_price * 1.0  (won't pay more than we paid)
-        """
-        import os, json, time
-        if os.environ.get("AUTO_ADD_BUY_CONFIG", "1") not in ("1", "true", "yes", "on"):
-            return False
-        addr_lo = addr.lower()
-        colls = self.buy_config.setdefault("collections", {})
-        if addr_lo in colls:
-            return False  # never overwrite manual config
-        new_entry = {
-            "name": (name or addr_lo[:14])[:50],
-            "low_price": round(listing_price * 1.5, 6),
-            "max_offer_price": round(listing_price * 0.95, 6),
-            "max_buy_price": round(listing_price * 1.0, 6),
-            "currency": (currency or "WBNB").upper(),
-            "enabled": True,
-            "_auto_added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "_auto_added_from": "Phase3 missclick buy",
-            "_auto_buy_price": listing_price,
-            "_auto_buy_chain": chain,
-        }
-        colls[addr_lo] = new_entry
-        try:
-            path = "/app/config/buy_config.json"
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.buy_config, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, path)
-            log.warning(
-                "[AUTO_CONFIG_ADD] %s (%s) added to buy_config: low=%.6f %s, max_offer=%.6f, max_buy=%.6f",
-                addr_lo[:14], (name or "?")[:30],
-                new_entry["low_price"], currency,
-                new_entry["max_offer_price"], new_entry["max_buy_price"],
-            )
-            return True
-        except Exception as exc:
-            colls.pop(addr_lo, None)
-            log.error("[AUTO_CONFIG_ADD] file write failed for %s: %s",
-                      addr_lo[:14], exc)
-            return False
-
 
     def _run_missclick_buy_phase(self, chain: str, report: ScanReport) -> int:
         """Phase 3: scan WL collections for cheap listings and buy them.
@@ -1262,7 +911,8 @@ class CounterBidder:
                 continue
 
             # Map BNB→WBNB, ETH→WETH for consistency
-            buy_currency = self._WRAP_MAP.get(buy_currency, buy_currency)
+            _WRAP = {"BNB": "WBNB", "ETH": "WETH"}
+            buy_currency = _WRAP.get(buy_currency, buy_currency)
 
             name = (self._wl_index.get(addr, {}).get("collection_name")
                     or self._wl_index.get(addr, {}).get("name")
@@ -1300,36 +950,6 @@ class CounterBidder:
                                 result.currency, result.tx_hash or "?")
                     # Telegram alert
                     self._alert_buy(result, name, chain)
-                    # PATCH 2026-05-30: auto-add to buy_config if absent
-                    try:
-                        self._auto_add_collection_config(
-                            addr, name, result.listing_price,
-                            result.currency, chain)
-                    except Exception as _ace:
-                        log.warning("[AUTO_CONFIG_ADD] hook err: %s", _ace)
-
-                    # PATCH 2026-07-17 AUTOFLIP: queue for immediate resell at buy_price * multiplier
-                    if __import__('os').getenv('AUTOFLIP_ENABLED', '1') == '1':
-                        try:
-                            _mult = float(__import__('os').getenv('AUTOFLIP_MULTIPLIER', '3.0'))
-                            _flip_price = float(result.listing_price) * _mult
-                            if not hasattr(self, '_flip_queue'):
-                                self._flip_queue = []
-                            self._flip_queue.append({
-                                'chain': chain,
-                                'collection': addr,
-                                'name': name,
-                                'token_id': result.token_id,
-                                'buy_price': float(result.listing_price),
-                                'flip_price': _flip_price,
-                                'currency': result.currency,
-                                'queued_at': __import__('time').time(),
-                            })
-                            log.warning("  🎯 [AUTOFLIP] queued %s #%s @ %.6f %s (bought %.6f, x%.1f)",
-                                        name, result.token_id, _flip_price, result.currency,
-                                        result.listing_price, _mult)
-                        except Exception as _fe:
-                            log.warning("[AUTOFLIP] queue err: %s", _fe)
                 else:
                     log.error("  ❌ BUY FAILED: %s — %s", name, result.error)
 
@@ -1413,7 +1033,8 @@ class CounterBidder:
 
             max_buy = cfg["max_buy_price"]
             buy_currency = (cfg.get("currency") or "").upper()
-            buy_currency = self._WRAP_MAP.get(buy_currency, buy_currency)
+            _WRAP = {"BNB": "WBNB", "ETH": "WETH"}
+            buy_currency = _WRAP.get(buy_currency, buy_currency)
             name = cfg.get("name", addr[:14])
 
             report.cfg_buy_attempts += 1
@@ -1469,22 +1090,32 @@ class CounterBidder:
 
     def _alert_buy(self, result, name: str, chain: str):
         """Send Telegram alert for a successful buy."""
-        msg = (
-            f"🔥 <b>MISSCLICK BUY</b>\n"
-            f"Collection: {name}\n"
-            f"Token: #{result.token_id}\n"
-            f"Price: {result.listing_price:.6f} {result.currency}\n"
-            f"Chain: {chain.upper()}\n"
-            f"TX: <code>{result.tx_hash or '?'}</code>"
-        )
-        self._tg_send(msg)
+        if not self.tg_bot_token or not self.tg_chat_id:
+            return
+        try:
+            import requests as _req
+            msg = (
+                f"🔥 <b>MISSCLICK BUY</b>\n"
+                f"Collection: {name}\n"
+                f"Token: #{result.token_id}\n"
+                f"Price: {result.listing_price:.6f} {result.currency}\n"
+                f"Chain: {chain.upper()}\n"
+                f"TX: <code>{result.tx_hash or '?'}</code>"
+            )
+            _req.post(
+                f"https://api.telegram.org/bot{self.tg_bot_token}/sendMessage",
+                json={"chat_id": self.tg_chat_id, "text": msg, "parse_mode": "HTML"},
+                timeout=5,
+            )
+        except Exception as exc:
+            log.debug("Telegram buy alert failed: %s", exc)
 
-    def _fetch_wallet_offers(self, chain: str) -> list[RivalOffer]:
-        """Fetch active offers from ALL rival wallets on a given chain.
+    def _fetch_wallet_offers(self, chain: str) -> list[ParasiteOffer]:
+        """Fetch active offers from ALL parasite wallets on a given chain.
 
         Iterates over all target_wallets. Fetches BOTH token + collection offers.
         """
-        all_offers: list[RivalOffer] = []
+        all_offers: list[ParasiteOffer] = []
 
         for i, wallet in enumerate(sorted(self.target_wallets)):
             if self._stop_event.is_set():
@@ -1497,15 +1128,15 @@ class CounterBidder:
                          wallet[:8], wallet[-4:], len(wallet_offers))
                 all_offers.extend(wallet_offers)
 
-            # Rate limit: each wallet = 2-6 API calls (offers + collection-offers + pages)
+            # Small delay between wallets to avoid rate limiting
             if i < len(self.target_wallets) - 1:
-                time.sleep(1.5)
+                time.sleep(0.3)
 
         return all_offers
 
-    def _fetch_single_wallet(self, wallet: str, chain: str) -> list[RivalOffer]:
+    def _fetch_single_wallet(self, wallet: str, chain: str) -> list[ParasiteOffer]:
         """Fetch offers from a single wallet on a chain."""
-        offers: list[RivalOffer] = []
+        offers: list[ParasiteOffer] = []
 
         # Strategy 1: Use authenticated OKX API
         client = self._get_okx_client()
@@ -1513,12 +1144,14 @@ class CounterBidder:
             try:
                 raw_offers = self._fetch_raw_wallet(client, chain, wallet)
                 for raw in raw_offers:
-                    offers.append(self._raw_to_rival(raw, chain))
-                return offers
+                    offers.append(self._raw_to_parasite(raw, chain))
+                if offers:
+                    return offers
             except Exception as exc:
                 log.warning("API scan failed for %s...%s on %s: %s", wallet[:8], wallet[-4:], chain.upper(), exc)
 
-        return offers
+        # Strategy 2: Direct HTTP fallback (priapi)
+        return self._fetch_wallet_offers_priapi(chain, wallet)
 
     def _fetch_raw_wallet(self, client, chain: str, wallet: str = "") -> list[dict]:
         """Fetch raw offer dicts from OKX API for a specific wallet.
@@ -1545,13 +1178,13 @@ class CounterBidder:
                 if items:
                     log.info("🎯 %s API: %d raw items (token offers)", chain.upper(), len(items))
                     if log.isEnabledFor(logging.DEBUG) and items:
+                        import json as _json
                         log.debug("🔍 Sample raw token offer: %s",
                                   _json.dumps(items[0], ensure_ascii=False, default=str)[:500])
                     all_raw.extend(items)
                 cursor = self._extract_cursor(payload)
                 if not cursor:
                     break
-                time.sleep(1.0)  # rate limit between pages
 
         # 2) Collection offers — dedicated /collection-offers endpoint
         # NOTE: This is the ONLY way to find BSC collection offers by maker.
@@ -1576,13 +1209,13 @@ class CounterBidder:
                     log.info("🎯 %s API: %d raw items (collection-offers by maker)",
                              chain.upper(), len(items))
                     if log.isEnabledFor(logging.DEBUG) and items:
+                        import json as _json
                         log.debug("🔍 Sample raw collection offer: %s",
                                   _json.dumps(items[0], ensure_ascii=False, default=str)[:500])
                     all_raw.extend(items)
                 cursor = self._extract_cursor(payload)
                 if not cursor:
                     break
-                time.sleep(1.0)  # rate limit between pages
         except Exception as exc:
             log.warning("Collection-offers endpoint failed for %s...%s: %s",
                         target[:8], target[-4:], exc)
@@ -1612,7 +1245,7 @@ class CounterBidder:
 
     def _fetch_top_offers_for_collection(self, collection_address: str,
                                          chain: str,
-                                         limit: int = 5) -> list[RivalOffer]:
+                                         limit: int = 5) -> list[ParasiteOffer]:
         """Fetch top (highest price) offers for a WL collection from anyone.
 
         Used in Phase 1: check who has the best offers and undercut non-friends.
@@ -1625,7 +1258,7 @@ class CounterBidder:
             log.warning("WL Phase1: no OKX client available for %s", collection_address[:14])
             return []
 
-        all_offers: list[RivalOffer] = []
+        all_offers: list[ParasiteOffer] = []
 
         # BSC: /offers endpoint always returns 0 with collectionAddress filter,
         # only /collection-offers works. ETH: both work, query both.
@@ -1650,7 +1283,7 @@ class CounterBidder:
                 )
                 items = self._extract_items(payload)
                 if items:
-                    all_offers.extend(self._raw_to_rival(r, chain) for r in items)
+                    all_offers.extend(self._raw_to_parasite(r, chain) for r in items)
             except Exception as exc:
                 log.warning("WL Phase1 fetch failed for %s (%s): %s",
                             collection_address[:14], path.split("/")[-1], exc)
@@ -1660,24 +1293,34 @@ class CounterBidder:
 
         # Deduplicate and sort by price desc
         seen: set[str] = set()
-        unique: list[RivalOffer] = []
+        unique: list[ParasiteOffer] = []
         for o in all_offers:
             key = f"{o.maker}:{o.collection_address}:{o.price}:{o.currency}"
             if key not in seen:
                 seen.add(key)
                 unique.append(o)
-        unique.sort(key=lambda o: self.prices.to_usd(o.price, o.currency.upper()) if o.price > 0 else 0, reverse=True)
-
-        # NOTE: Phantom filtering is done in _undercut_collection where
-        # page_best (SSR) is already fetched via _fetch_best_offer_maker.
-        # No need to add extra HTTP calls here for 71+ collections.
+        unique.sort(key=lambda o: o.price, reverse=True)
         return unique[:limit]
+
+    def _fetch_wallet_offers_priapi(self, chain: str, wallet: str = "") -> list[ParasiteOffer]:
+        """Fallback: fetch wallet offers from priapi.
+
+        NOTE: The old priapi/v5/nft/ec/ endpoints are DEAD (404 since ~2026-03).
+        The new priapi/v1/nft/order/offers requires nftId, not maker — so
+        per-wallet scanning is not possible via priapi anymore.
+        Authenticated API (_fetch_raw_wallet) is now the ONLY source for
+        wallet-level offer scanning.
+        """
+        log.debug("priapi wallet-scan unavailable (endpoints deprecated) — "
+                   "relying on authenticated API for wallet %s...%s",
+                   (wallet or "?")[:8], (wallet or "?")[-4:])
+        return []
 
     # ── Single collection reactive hunt ───────────────────────
 
     def hunt_collection(self, collection_address: str, collection_name: str,
                         chain: str) -> HuntResult | None:
-        """Reactive hunt — triggered by sales_stream on rival trade detection."""
+        """Reactive hunt — triggered by sales_stream on parasite trade detection."""
         if not self.enabled:
             return None
 
@@ -1694,13 +1337,13 @@ class CounterBidder:
             return HuntResult(addr, collection_name, chain, 0, 0, 0, 0)
 
         is_wl = addr in self._wl_index
-        log.info("🎯 Reactive: %s — %d rival offers (WL=%s)", collection_name, len(offers), is_wl)
+        log.info("🎯 Reactive: %s — %d parasite offers (WL=%s)", collection_name, len(offers), is_wl)
         return self._undercut_collection(addr, offers, chain, is_wl=is_wl)
 
     def _fetch_collection_offers(self, collection_address: str,
-                                  chain: str) -> list[RivalOffer]:
-        """Fetch rival offers for a specific collection (all target wallets)."""
-        all_offers: list[RivalOffer] = []
+                                  chain: str) -> list[ParasiteOffer]:
+        """Fetch parasite offers for a specific collection (all target wallets)."""
+        all_offers: list[ParasiteOffer] = []
 
         for wallet in sorted(self.target_wallets):
             # Provider path
@@ -1715,7 +1358,7 @@ class CounterBidder:
                         max_pages=3,
                     )
                     all_offers.extend(
-                        self._normalized_to_rival(o, chain) for o in raw
+                        self._normalized_to_parasite(o, chain) for o in raw
                     )
                     continue
                 except Exception:
@@ -1731,7 +1374,7 @@ class CounterBidder:
                     for item in raw_offers:
                         parsed = self._parse_v1_offer(item, chain)
                         if parsed["maker"] == wallet:
-                            all_offers.append(RivalOffer(
+                            all_offers.append(ParasiteOffer(
                                 collection_address=addr,
                                 collection_name=addr[:14],
                                 chain=chain,
@@ -1747,56 +1390,16 @@ class CounterBidder:
 
         return all_offers
 
-    # ── Currency / qty helpers ──────────────────────────────────
-
-    def _pick_currency(self, rival_cur: str, cfg_cur: str,
-                       chain_currencies: set[str], chain_native: str) -> str:
-        """Choose our offer currency.
-
-        PATCH 2026-05-21: priority reordered to **rival > config > native**.
-        OKX orderbook sorts in NATIVE currency of each offer, so to actually
-        outbid we must use the rival's currency lane. _WRAP_MAP normalises
-        BUSD→USDT (Robert: 'one less coin on wallet, they are $1 anyway') and
-        BNB→WBNB / ETH→WETH for Seaport.
-
-        Config-level cfg_cur is now a FALLBACK when rival currency is not
-        reachable (not in offer_currencies). Previously cfg_cur=USDT for BSC
-        would steal placements away from WBNB rival lane → we sat at #2 forever.
-        """
-        cur_mapped = self._WRAP_MAP.get(rival_cur, rival_cur)  # BUSD→USDT, BNB→WBNB, ETH→WETH
-        # 1) rival's currency wins (after BUSD→USDT collapse)
-        if cur_mapped in chain_currencies and cur_mapped in self.offer_currencies:
-            return cur_mapped
-        # 2) config currency (fallback only)
-        if cfg_cur and cfg_cur in chain_currencies and cfg_cur in self.offer_currencies:
-            return cfg_cur
-        # 3) chain native
-        if chain_native in self.offer_currencies:
-            return chain_native
-        # 4) anything reachable on this chain
-        overlap = chain_currencies & set(self.offer_currencies)
-        if overlap:
-            return next(iter(overlap))
-        return chain_native
-
-    def _needs_qty_upgrade(self, addr: str, chain: str,
-                           price_usd: float, quantity: int) -> bool:
-        """True when we want qty > 1 but the cache says we haven't placed it yet."""
-        if quantity <= 1:
-            return False
-        cached = self._placed_qty_cache.get(f"{addr}:{chain}", 0)
-        return cached != quantity
-
     # ── Undercut logic ────────────────────────────────────────
 
     def _undercut_collection(self, collection_address: str,
-                              offers: list[RivalOffer],
+                              offers: list[ParasiteOffer],
                               chain: str,
                               is_wl: bool = True) -> HuntResult:
-        """Outbid rival offers for a single collection.
+        """Outbid parasite offers for a single collection.
 
         Logic:
-        1. Rival offers at price P in currency C
+        1. Parasite offers at price P in currency C
         2. Our outbid = P * (1 + undercut_bps/10000) in SAME currency C
         3. If we don't hold currency C, convert to our preferred currency
         4. Cap: collection max_offer_price > WL max_usd / non-WL nonwl_max_usd
@@ -1804,39 +1407,17 @@ class CounterBidder:
         """
         addr = collection_address.lower()
         name = offers[0].collection_name if offers else addr[:14]
-        cache_key = f"{addr}:{chain}"
 
         placed = 0
         failed = 0
         skipped = 0
 
-        # ── Pre-compute phantom ceiling for offer filtering ──
-        # OKX API sometimes returns stale/phantom offers (status=active but
-        # on-chain invalid). These have absurdly high prices ($14 USDT on a
-        # $5 collection). Use buy_config cap * 2 as ceiling when available.
-        coll_cfg = self.buy_config.get("collections", {}).get(addr, {})
-        _pre_cap_price = coll_cfg.get("max_offer_price", 0)
-        _pre_cap_cur = (coll_cfg.get("currency") or ("WBNB" if chain == "bsc" else "WETH")).upper()
-        _pre_cap_usd = self.prices.to_usd(_pre_cap_price, _pre_cap_cur) if _pre_cap_price > 0 else 0
-        # Only use absolute ceiling when we have a buy_config cap.
-        # For collections without config, we use relative outlier detection below.
-        phantom_ceiling = (_pre_cap_usd * 2) if _pre_cap_usd > 0 else 0  # 0 = no absolute ceiling
-
-        # ── G4 PATCH 2026-04-27: floor anchor via buy_config.low_price ──
-        # low_price ≈ 1.05× max_offer_price (intended as "floor estimate")
-        # Use it × 2 as STRICTER phantom-ceiling. Pick the more conservative
-        # of (max × 2) and (low × 2). No extra API calls.
-        _pre_low_price = coll_cfg.get("low_price", 0) or 0
-        _pre_low_usd = self.prices.to_usd(_pre_low_price, _pre_cap_cur) if _pre_low_price > 0 else 0
-        _low_ceiling = _pre_low_usd * 2 if _pre_low_usd > 0 else 0
-        if _low_ceiling > 0 and (phantom_ceiling == 0 or _low_ceiling < phantom_ceiling):
-            phantom_ceiling = _low_ceiling
-
-        # ── Find the REAL best rival offer (highest USD) ──
-        # First pass: collect all valid rival offers with USD values
-        rival_candidates: list[tuple[RivalOffer, float]] = []
-        best_rival: RivalOffer | None = None
-        best_rival_usd: float = 0.0
+        # ── Find the REAL best enemy offer (highest USD) ──
+        # First check passed parasite offers, then also fetch the actual
+        # top offer on the collection.  We must beat whoever is #1,
+        # not just the tracked parasites.
+        best_enemy: ParasiteOffer | None = None
+        best_enemy_usd: float = 0.0
         for offer in offers:
             if offer.price <= 0:
                 continue
@@ -1853,62 +1434,23 @@ class CounterBidder:
             offer_usd = self.prices.to_usd(offer.price, offer.currency.upper())
             if offer_usd <= 0:
                 continue
-            # Filter phantom offers by absolute ceiling (buy_config cap * 2)
-            if phantom_ceiling > 0 and offer_usd > phantom_ceiling:
-                log.info("  🗑 %s: skipping phantom offer $%.2f (>2x cap $%.2f) maker=%s",
-                         name, offer_usd, phantom_ceiling / 2, (offer.maker or "?")[:14])
-                continue
-            rival_candidates.append((offer, offer_usd))
+            if best_enemy is None or offer_usd > best_enemy_usd:
+                best_enemy = offer
+                best_enemy_usd = offer_usd
 
-        # ── PATCH 2026-04-25: outlier filter requires SECOND to be MEANINGFUL ──
-        # Old bug: junk $0.01 spam offers as second made real $1+ rivals look phantom.
-        # Now: second must be >= 5% of cap (or $0.10) to be trusted as anchor.
-        if len(rival_candidates) >= 2:
-            rival_candidates.sort(key=lambda x: x[1], reverse=True)
-            top_usd = rival_candidates[0][1]
-            second_usd = rival_candidates[1][1]
-            _cap_usd_phantom = (phantom_ceiling / 2) if phantom_ceiling > 0 else 0
-            _min_meaningful_phantom = max(0.10, _cap_usd_phantom * 0.05)
-            if second_usd >= _min_meaningful_phantom and top_usd > second_usd * 5:
-                phantom = rival_candidates[0][0]
-                log.info("  🗑 %s: filtering outlier offer $%.2f (>5x second $%.2f, second >= $%.2f) maker=%s — likely phantom",
-                         name, top_usd, second_usd, _min_meaningful_phantom, (phantom.maker or "?")[:14])
-                rival_candidates = rival_candidates[1:]
-            elif second_usd < _min_meaningful_phantom and _cap_usd_phantom > 0 and top_usd > _cap_usd_phantom * 10:
-                phantom = rival_candidates[0][0]
-                log.info("  🗑 %s: filtering outlier offer $%.2f (>10x cap $%.2f, second too small at $%.2f) maker=%s — likely phantom",
-                         name, top_usd, _cap_usd_phantom, second_usd, (phantom.maker or "?")[:14])
-                rival_candidates = rival_candidates[1:]
-
-        # Pick best rival from filtered candidates
-        for offer, offer_usd in rival_candidates:
-            if best_rival is None or offer_usd > best_rival_usd:
-                best_rival = offer
-                best_rival_usd = offer_usd
-
-        # Also check the REAL top RIVAL offer on the collection (may be from
+        # Also check the REAL top ENEMY offer on the collection (may be from
         # a non-tracked wallet).  _fetch_best_offer_maker now returns
-        # the best RIVAL (excluding our/friend wallets) directly.
+        # the best ENEMY (excluding our/friend wallets) directly.
         real_top = self._fetch_best_offer_maker(addr, chain)
-        rt_rival = real_top.get("_best_rival", real_top)
-        rt_usd = rt_rival.get("usd", 0) if rt_rival.get("maker") else 0
-        # Apply phantom ceiling to real_top too
-        if phantom_ceiling > 0 and rt_usd > phantom_ceiling:
-            log.info("  🗑 %s: skipping phantom real_top $%.2f (>2x cap $%.2f) maker=%s",
-                     name, rt_usd, phantom_ceiling / 2, (rt_rival.get("maker", "?"))[:14])
-            rt_usd = 0
-        # Relative outlier check for real_top vs best tracked rival
-        if rt_usd > 0 and best_rival_usd > 0 and rt_usd > best_rival_usd * 5:
-            log.info("  🗑 %s: skipping phantom real_top $%.2f (>5x tracked $%.2f) maker=%s",
-                     name, rt_usd, best_rival_usd, (rt_rival.get("maker", "?"))[:14])
-            rt_usd = 0
-        if rt_usd > best_rival_usd:
-            rt_price = rt_rival["price"]
-            rt_cur = rt_rival["currency"]
-            rt_maker = rt_rival["maker"]
-            log.info("  🔍 %s: real top rival is %.4f %s ($%.2f) from %s — higher than tracked rivals ($%.2f)",
-                     name, rt_price, rt_cur, rt_usd, rt_maker[:14], best_rival_usd)
-            best_rival = RivalOffer(
+        rt_enemy = real_top.get("_best_enemy", real_top)
+        rt_usd = rt_enemy.get("usd", 0) if rt_enemy.get("maker") else 0
+        if rt_usd > best_enemy_usd:
+            rt_price = rt_enemy["price"]
+            rt_cur = rt_enemy["currency"]
+            rt_maker = rt_enemy["maker"]
+            log.info("  🔍 %s: real top enemy is %.4f %s ($%.2f) from %s — higher than tracked parasites ($%.2f)",
+                     name, rt_price, rt_cur, rt_usd, rt_maker[:14], best_enemy_usd)
+            best_enemy = ParasiteOffer(
                 collection_address=addr,
                 collection_name=name,
                 chain=chain,
@@ -1920,61 +1462,55 @@ class CounterBidder:
                 maker=rt_maker,
                 expires_at="",
             )
-            best_rival_usd = rt_usd
+            best_enemy_usd = rt_usd
 
         # Choose our offer currency
-        if best_rival:
-            log.info("  🎯 %s: FINAL best_rival=%.6f %s ($%.4f) maker=%s src=%s",
-                     name, best_rival.price, best_rival.currency, best_rival_usd,
-                     best_rival.maker[:14] if best_rival.maker else "?",
-                     getattr(best_rival, "source_type", "tracked"))
-            # PATCH 2026-05-30 (ML_ADVISOR_SHADOW): log advisor recommendation
-            # next to actual decision. Gated by env ML_ADVISOR_ENABLED (default 0).
-            try:
-                from okx_nft_bot import advisor as _adv
-                if _adv.is_enabled():
-                    _ctx = _adv.MarketContext(
-                        chain=chain,
-                        collection=name[:30],
-                        competitor_activity=len(offers),
-                        is_wl=is_wl,
-                    )
-                    _rec = _adv.advise(_ctx)
-                    log.info("  [ML_ADVISOR_SHADOW] %s: %s conf=%.2f rule=%s reason=%s",
-                             name[:30], _rec.action.value, _rec.confidence, _rec.rule, _rec.reason)
-            except Exception as _adv_e:
-                log.debug("[ML_ADVISOR_SHADOW] hook err: %s", _adv_e)
+        if best_enemy:
+            log.info("  🎯 %s: FINAL best_enemy=%.6f %s ($%.4f) maker=%s src=%s",
+                     name, best_enemy.price, best_enemy.currency, best_enemy_usd,
+                     best_enemy.maker[:14] if best_enemy.maker else "?",
+                     getattr(best_enemy, "source_type", "tracked"))
         else:
-            log.info("  🎯 %s: no rival found — min-offer mode", name)
+            log.info("  🎯 %s: no enemy found — min-offer mode", name)
         chain_native = {"eth": "WETH", "bsc": "WBNB"}.get(chain, "WETH")
         chain_currencies = {
             "eth": {"WETH", "USDT", "USDC", "DAI"},
             "bsc": {"WBNB", "USDT", "USDC", "BUSD"},
         }.get(chain, {"WETH"})
 
-        # Read collection config for currency preference (reuse pre-computed coll_cfg)
+        # Read collection config for currency preference
+        coll_cfg = self.buy_config.get("collections", {}).get(addr, {})
         cfg_cur = (coll_cfg.get("currency") or "").upper()
 
         # Map native coin names to wrapped equivalents (OKX API returns
         # "BNB"/"ETH" but Seaport uses WBNB/WETH for offers).
-        # BUSD→USDT: OKX treats BUSD≡USDT on BSC, rivals often bid in
+        # BUSD→USDT: OKX treats BUSD≡USDT on BSC, parasites often bid in
         # BUSD but we outbid in USDT (same $1 value).
-        if best_rival is not None:
-            rival_cur = best_rival.currency.upper()
+        _WRAP_MAP = {"BNB": "WBNB", "ETH": "WETH", "BUSD": "USDT"}
+
+        if best_enemy is not None:
+            parasite_cur = best_enemy.currency.upper()
             # Normalise: BNB→WBNB, ETH→WETH, BUSD→USDT
-            rival_cur_mapped = self._WRAP_MAP.get(rival_cur, rival_cur)
-            if rival_cur != rival_cur_mapped:
-                log.info("  💱 %s: rival currency %s → mapped to %s for our offer",
-                         name, rival_cur, rival_cur_mapped)
-            our_cur = self._pick_currency(rival_cur_mapped, cfg_cur, chain_currencies, chain_native)
+            parasite_cur_mapped = _WRAP_MAP.get(parasite_cur, parasite_cur)
+            if parasite_cur != parasite_cur_mapped:
+                log.info("  💱 %s: enemy currency %s → mapped to %s for our offer",
+                         name, parasite_cur, parasite_cur_mapped)
+            if parasite_cur_mapped in chain_currencies and parasite_cur_mapped in self.offer_currencies:
+                our_cur = parasite_cur_mapped
+            elif cfg_cur and cfg_cur in chain_currencies:
+                our_cur = cfg_cur
+            elif chain_native in self.offer_currencies:
+                our_cur = chain_native
+            elif chain_currencies & set(self.offer_currencies):
+                our_cur = next(iter(chain_currencies & set(self.offer_currencies)))
+            else:
+                our_cur = chain_native
         else:
-            # No rival — use config currency or chain native
+            # No enemy — use config currency or chain native
             our_cur = cfg_cur if cfg_cur and cfg_cur in chain_currencies else chain_native
 
         # Determine cap
-        # PATCH 2026-04-26: pick chain-specific max for WL (Phase 1)
-        _chain_max = self.max_usd_eth if chain == "eth" else self.max_usd
-        global_cap = _chain_max if is_wl else self.nonwl_max_usd
+        global_cap = self.max_usd if is_wl else self.nonwl_max_usd
         coll_max = self._get_max_price(addr, chain, our_cur)
         has_collection_config = coll_max is not None
         if has_collection_config:
@@ -1983,27 +1519,24 @@ class CounterBidder:
         else:
             cap_usd = global_cap
 
-        # ── DYNAMIC QTY (B1 restored, 3-pool 2026-04-25): qty = budget_usd / cap_usd ──
-        _cheap_threshold = self.nonwl_max_usd  # kept for legacy fallback paths
-        is_premium = has_collection_config and cap_usd > _cheap_threshold
-        # Pick budget pool by context (is_wl param of _undercut_collection)
-        _budget_for_qty = self.budget_wl_usd if is_wl else self.budget_nonwl_usd
-        if cap_usd > 0 and _budget_for_qty > 0:
-            default_qty = max(1, min(self.max_qty, int(round(_budget_for_qty / cap_usd))))
-        else:
-            default_qty = 1
-        offer_duration_hours = 720  # 30d TTL — counter-bump is invalidate-all; no WBNB lock; less re-sign churn
+        # ── TWO-TIER SYSTEM ──
+        # WL collections: qty=40 (много офферов, ловим мисклики)
+        # Non-WL collections: qty=1 (минимум, просто перебиваем паразита)
+        is_premium = has_collection_config and cap_usd > self.max_usd
+        default_qty = 40 if is_wl else 1
+        should_cancel_old = True  # ALWAYS cancel old offers to prevent stacking
+        offer_duration_hours = 720  # 30 days
 
-        if best_rival is None:
-            # No rival → check if we already have an offer (avoid duplicates!)
+        if best_enemy is None:
+            # No enemy → check if we already have an offer (avoid duplicates!)
             our_existing = self._find_our_offer(addr, chain)
             if our_existing:
-                log.info("  ✅ %s: no rival, we already have offer (%.4f %s) — skip",
+                log.info("  ✅ %s: no enemy, we already have offer (%.4f %s) — skip",
                          name, our_existing["price"], our_existing["currency"])
                 self.already_winning += 1
                 return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
-            # No rival, no existing offer → place at minimum price
+            # No enemy, no existing offer → place at minimum price
             min_prices = {"WETH": 0.0001, "WBNB": 0.0001, "USDT": 0.01, "USDC": 0.01, "BUSD": 0.01, "DAI": 0.01}
             our_price = min_prices.get(our_cur, 0.0001)
             our_usd = self.prices.to_usd(our_price, our_cur)
@@ -2012,51 +1545,22 @@ class CounterBidder:
                 our_usd = cap_usd
                 our_price = self.prices.from_usd(our_usd, our_cur)
             quantity = coll_cfg.get("max_offers", default_qty)
-            log.info("  📎 %s: NO rival → min offer %.4f %s ($%.2f) qty=%d tier=%s%s",
+            log.info("  📎 %s: NO enemy → min offer %.4f %s ($%.2f) qty=%d tier=%s%s",
                      name, our_price, our_cur, our_usd, quantity,
                      "premium" if is_premium else "basic",
                      " [DRY]" if self.dry_run else "")
         else:
-            # Rival found — outbid by MINIMUM STEP (never jump to max price!)
-            offer = best_rival
-            rival_cur = offer.currency.upper()
-            rival_usd = self.prices.to_usd(offer.price, rival_cur)
-            if rival_usd <= 0:
+            # Enemy found — outbid by MINIMUM STEP (never jump to max price!)
+            offer = best_enemy
+            parasite_cur = offer.currency.upper()
+            parasite_usd = self.prices.to_usd(offer.price, parasite_cur)
+            if parasite_usd <= 0:
                 log.info("  ⏭ SKIP %s #%s: can't get USD price for %s",
-                         name, offer.token_id or "col", rival_cur)
+                         name, offer.token_id or "col", parasite_cur)
                 return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
-            # Calculate outbid price: rival price + small step (undercut_bps)
-            _bps = self.undercut_bps
-            # ── PATCH 2026-08-01 (ANTI-WASH): не переплачивать за фиктивную
-            # ликвидность. Если у соперника нечем оплатить свою же ставку,
-            # его оффер — насос: он ничего не теряет, а мы задираем цену.
-            # PHANTOM  → вообще не перебиваем (пропускаем коллекцию)
-            # THIN     → перебиваем минимально (+0.5% вместо +10%)
-            # REAL     → как обычно
-            try:
-                _mk = (best_rival.maker or "").lower() if best_rival else ""
-                _flag = self._antiwash_flag(_mk) if _mk else None
-                if _flag == "PHANTOM":
-                    log.info("  🚫 %s: соперник %s НЕ ОБЕСПЕЧЕН (phantom) — "
-                             "не переплачиваем, пропуск", name, _mk[:14])
-                    return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-                _held = self._is_trap(addr, _mk) if _mk else 0
-                if _held > 0:
-                    log.warning("  🪤 %s: ЛОВУШКА — соперник %s сам держит %d "
-                                "NFT этой коллекции. Он не покупает, он тянет "
-                                "цену чтобы слить нам. НЕ перебиваем.",
-                                name, _mk[:14], _held)
-                    return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-                if _flag == "THIN":
-                    _bps = min(_bps, 50)
-                    log.info("  💧 %s: соперник %s тонкий (thin) — "
-                             "перебиваем минимально (+%.2f%%)",
-                             name, _mk[:14], _bps / 100.0)
-            except Exception as _awe:
-                log.debug("antiwash check skipped: %s", _awe)
-
-            outbid_usd = rival_usd * (1 + _bps / 10000)
+            # Calculate outbid price: enemy price + small step (undercut_bps)
+            outbid_usd = parasite_usd * (1 + self.undercut_bps / 10000)
             if outbid_usd > cap_usd:
                 outbid_usd = cap_usd
 
@@ -2067,28 +1571,14 @@ class CounterBidder:
             return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
         # ── BEST OFFER RELEVANCE CHECK ──
-        # If our capped offer is < 20% of the best rival offer, skip.
+        # If our capped offer is < 20% of the best enemy offer, skip.
         # Placing a $0.54 offer on a collection where best offer is $242
         # is pointless — no one will sell that far below market.
-        if best_rival is not None:
-            if best_rival_usd > 0 and our_usd < best_rival_usd * 0.20:
+        if best_enemy is not None:
+            best_enemy_usd = self.prices.to_usd(best_enemy.price, best_enemy.currency.upper())
+            if best_enemy_usd > 0 and our_usd < best_enemy_usd * 0.20:
                 log.info("  🚫 %s: our $%.2f < 20%% of best offer $%.2f — SKIP (too far below market)",
-                         name, our_usd, best_rival_usd)
-                # ── PATCH 2026-07-31 (OVER-CAP VISIBILITY): Robert должен видеть
-                # на пульте всё, что ушло выше нашего потолка, и решать вручную.
-                # Раньше это оставалось только в логах и терялось.
-                try:
-                    self._record_execution_submit_event(
-                        chain=chain,
-                        collection=addr,
-                        price_bnb=our_price,
-                        status="over_cap",
-                        reason=("ВЫШЕ ПОТОЛКА: соперник $%.2f, наш лимит $%.2f (%s) "
-                                "— нужно решение" % (best_rival_usd, our_usd,
-                                                     (best_rival.maker or "?")[:14])),
-                    )
-                except Exception as _oexc:
-                    log.debug("over_cap record failed: %s", _oexc)
+                         name, our_usd, best_enemy_usd)
                 return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
         # ── FLOOR PRICE GUARD ──
@@ -2108,34 +1598,32 @@ class CounterBidder:
                             name, our_usd, floor_usd, safe_usd)
                 our_usd = safe_usd
                 our_price = self.prices.from_usd(our_usd, our_cur)
-        elif is_premium and not has_collection_config:
-            # Premium collection WITHOUT buy_config → floor unknown = risky
-            log.warning("  🚫 %s: premium offer $%.2f but floor UNKNOWN and no config — SKIP for safety",
+        elif is_premium:
+            # Premium collection but floor unknown — too risky, skip
+            log.warning("  🚫 %s: premium offer $%.2f but floor UNKNOWN — SKIP for safety",
                         name, our_usd)
             return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-        elif is_premium and has_collection_config and floor_usd <= 0:
-            # Premium WITH buy_config but floor unknown → trust the config cap
-            log.info("  ⚠ %s: floor UNKNOWN but have config cap $%.2f — proceeding (offer $%.2f)",
-                     name, cap_usd, our_usd)
 
-        # ── No-rival path: place offer with qty ──
-        if best_rival is None:
+        # ── No-enemy path: place offer with qty ──
+        if best_enemy is None:
             # quantity already set above
             if self.dry_run:
                 placed += 1
             else:
                 # Anti-stacking cooldown check
-                last_ts = self._last_placed.get(cache_key, 0)
+                cooldown_key = f"{addr}:{chain}"
+                last_ts = self._last_placed.get(cooldown_key, 0)
                 if time.time() - last_ts < self._PLACE_COOLDOWN:
                     mins_ago = (time.time() - last_ts) / 60
                     log.info("  ⏳ %s: cooldown active (placed %.1f min ago) — SKIP to prevent stacking", name, mins_ago)
                     return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
                 # Cancel old offers first to prevent stacking
-                cancel_ok = self._cancel_existing_offer(addr, chain, name)
-                if not cancel_ok:
-                    log.warning("  🚫 %s: cancel failed — ABORT new offer to prevent stacking", name)
-                    return HuntResult(addr, name, chain, len(offers), 0, 1, 0)
+                if should_cancel_old:
+                    cancel_ok = self._cancel_existing_offer(addr, chain, name)
+                    if not cancel_ok:
+                        log.warning("  🚫 %s: cancel failed — ABORT new offer to prevent stacking", name)
+                        return HuntResult(addr, name, chain, len(offers), 0, 1, 0)
 
                 try:
                     ok = self._submit_undercut(
@@ -2144,16 +1632,14 @@ class CounterBidder:
                         duration_hours=offer_duration_hours,
                     )
                     # ALWAYS set cooldown — even on failure (might have succeeded on-chain)
-                    self._last_placed[cache_key] = time.time()
-                    self._placed_qty_cache[cache_key] = quantity
+                    self._last_placed[cooldown_key] = time.time()
                     if ok:
                         placed += 1
                     else:
                         failed += 1
                 except Exception as exc:
                     log.error("  Min-offer failed %s: %s", name, exc)
-                    self._last_placed[cache_key] = time.time()
-                    self._placed_qty_cache[cache_key] = quantity
+                    self._last_placed[cooldown_key] = time.time()
                     failed += 1
 
                 if self.delay > 0:
@@ -2161,10 +1647,10 @@ class CounterBidder:
 
             return HuntResult(addr, name, chain, len(offers), placed, failed, skipped)
 
-        # ── Rival path: outbid the top rival ──
-        offer = best_rival
-        rival_cur = offer.currency.upper()
-        rival_usd = self.prices.to_usd(offer.price, rival_cur)
+        # ── Enemy path: outbid the top parasite ──
+        offer = best_enemy
+        parasite_cur = offer.currency.upper()
+        parasite_usd = self.prices.to_usd(offer.price, parasite_cur)
 
         # Check if we already hold the best (highest USD) offer — skip if so
         if self._we_already_best(addr, offer.token_id or "", chain):
@@ -2172,222 +1658,68 @@ class CounterBidder:
             return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
         # ── SMART OFFER CHECK: don't waste gas on pointless cancel+replace ──
-        # 1. If our offer already >= rival → check if we're WAY too high
-        #    and should LOWER to rival + min step (save money).
+        # 1. If our offer already >= enemy → check if we're WAY too high
+        #    and should LOWER to enemy + min step (save money).
         # 2. If difference is small → KEEP (not worth cancel+replace).
-        # 3. If our offer < rival → proceed to cancel+replace (outbid).
+        # 3. If our offer < enemy → proceed to cancel+replace (outbid).
         min_step_mult = 1 + self.undercut_bps / 10000  # e.g. 1.005 for 50 bps
         our_existing = self._find_our_offer(addr, chain)
         if our_existing:
             existing_usd = self.prices.to_usd(
                 our_existing["price"], our_existing["currency"].upper()
             )
-            target_usd = rival_usd * min_step_mult  # rival + minimum step
+            target_usd = parasite_usd * min_step_mult  # enemy + minimum step
             # Cap target to collection max
             if target_usd > cap_usd:
                 target_usd = cap_usd
 
-            if existing_usd > 0 and existing_usd >= rival_usd:
-                # We're already above rival.
+            if existing_usd > 0 and existing_usd >= parasite_usd:
+                # We're already above enemy.
                 # Only LOWER if we're paying >20% more than needed.
-                # e.g. rival=$0.10, target=$0.1005, threshold=$0.1206
+                # e.g. enemy=$0.10, target=$0.1005, threshold=$0.1206
                 # If our $0.1045 < $0.1206 → KEEP (not worth the churn)
                 lower_threshold = target_usd * 1.20  # 20% above target
                 if existing_usd <= lower_threshold:
-                    log.info("  ✅ %s: our $%.4f ≥ rival $%.4f, within 20%% of target $%.4f — KEEP",
-                             name, existing_usd, rival_usd, target_usd)
+                    # Reasonable range — KEEP as-is
+                    log.info("  ✅ %s: our $%.4f ≥ enemy $%.4f, within 20%% of target $%.4f — KEEP",
+                             name, existing_usd, parasite_usd, target_usd)
                     self.already_winning += 1
                     return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
                 else:
-                    # Way too high above rival — LOWER to rival + min step
-                    log.info("  📉 %s: our $%.4f > 20%% above target $%.4f (rival $%.4f) — LOWERING",
-                             name, existing_usd, target_usd, rival_usd)
+                    # Way too high above enemy — LOWER to enemy + min step
+                    log.info("  📉 %s: our $%.4f > 20%% above target $%.4f (enemy $%.4f) — LOWERING",
+                             name, existing_usd, target_usd, parasite_usd)
                     our_usd = target_usd
                     our_price = self.prices.from_usd(our_usd, our_cur)
 
-        # ── DYNAMIC QTY (B1, 3-pool 2026-04-25): recompute from actual our_usd ──
-        _budget_for_override = self.budget_wl_usd if is_wl else self.budget_nonwl_usd
-        if our_usd > 0 and _budget_for_override > 0:
-            dynamic_qty = max(1, min(self.max_qty, int(round(_budget_for_override / our_usd))))
-        else:
-            dynamic_qty = default_qty
-        quantity = coll_cfg.get("max_offers", dynamic_qty)
-        log.info("  📐 %s: qty=%d (budget=$%.2f [%s] / price=$%.4f, cap=%d, override=%s)",
-                 name, quantity, _budget_for_override, "WL" if is_wl else "non-WL",
-                 our_usd, self.max_qty,
-                 "yes" if coll_cfg.get("max_offers") is not None else "no")
-
-        # ── SAME-PRICE GUARD: don't cancel+replace if new price ≈ old price ──
-        # BUT only if we're already ABOVE the rival (winning). If rival is
-        # above us, we MUST re-place even if the diff is small.
-        # PATCH 2026-05-21: cross-currency check — OKX sorts orderbook by NATIVE
-        # currency, not USD-equivalent. If our existing offer is in a different
-        # currency than rival's, USD parity doesn't mean we're #1 in the OKX
-        # orderbook. Force re-place in rival's currency.
-        if our_existing:
-            existing_price = our_existing["price"]
-            existing_cur = our_existing["currency"].upper()
-            existing_usd_pre = self.prices.to_usd(existing_price, existing_cur)
-            we_are_winning = existing_usd_pre >= rival_usd
-            cur_match_g1 = (existing_cur == rival_cur)  # PATCH 2026-05-21
-            # PATCH 2026-05-22 (AGGRESSIVE-FIRST): SAME-PRICE GUARD 1% → 0.2%, env-tunable
-            _sp_tol = float(os.getenv("OKX_SAME_PRICE_TOL", "0.002"))
-            if cur_match_g1 and we_are_winning and existing_usd_pre > 0 and abs(our_usd - existing_usd_pre) / existing_usd_pre < _sp_tol:
-                log.info("  ✅ %s: new $%.4f ≈ old $%.4f (diff <1%%), we beat rival $%.4f — KEEP",
-                         name, our_usd, existing_usd_pre, rival_usd)
-                return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-            if not cur_match_g1 and we_are_winning:
-                # PATCH 2026-05-21: cross-currency situation — even if USD says we win,
-                # OKX orderbook sees us in a different currency lane. Re-place in rival's currency.
-                log.info("  💱 %s: cross-cur (our=%s rival=%s) — USD-tie ignored, will re-place in %s",
-                         name, existing_cur, rival_cur, rival_cur)
+        # Read quantity from collection config, or use tier default
+        quantity = coll_cfg.get("max_offers", default_qty)
 
         # ── Check if outbid price exceeds cap ──
-        # If best rival is above cap, try to find the next-best rival below cap.
-        # This handles spam/dust offers with absurd prices ($14 USDT on a $5 collection).
-        rival_above_cap = (rival_usd >= cap_usd) and (coll_max is not None)
+        # Check BEFORE cancelling — if enemy is above our cap, we may want
+        # to keep our existing offer instead of cancelling+replacing.
+        enemy_above_cap = (parasite_usd >= cap_usd) and (coll_max is not None)
 
-        # PATCH 2026-05-17: SELF-PROTECTION — if our_existing already beats ALL non-protected
-        # rivals (>5% margin), KEEP. Prevents self-outbid bug where bot fallbacks to a lower
-        # rival and trims own winning offer when best_rival is above cap.
-        # PATCH 2026-05-21: cross-currency check — track currency of the max-USD rival.
-        # If our existing offer is in a different currency lane than that rival,
-        # the OKX orderbook sorts us separately, so USD-based SELF-PROTECT is wrong.
-        if our_existing:
-            try:
-                _ex_usd = self.prices.to_usd(our_existing["price"], our_existing["currency"].upper())
-            except Exception:
-                _ex_usd = 0.0
-            _max_rival_usd = 0.0
-            _max_rival_cur = ""  # PATCH 2026-05-21
-            for _o in offers:
-                if _o.price <= 0 or not _o.maker or _o.maker in self.protected_wallets:
-                    continue
-                _ou = self.prices.to_usd(_o.price, _o.currency.upper())
-                if _ou and _ou > _max_rival_usd:
-                    _max_rival_usd = _ou
-                    _max_rival_cur = (_o.currency or "").upper()  # PATCH 2026-05-21
-            _ex_cur_g2 = (our_existing.get("currency") or "").upper()  # PATCH 2026-05-21
-            _cur_match_g2 = (_ex_cur_g2 == _max_rival_cur) if _max_rival_cur else True
-            # PATCH 2026-05-22 (AGGRESSIVE-FIRST): SELF-PROTECT 1.05 → 1.01 margin
-            _sp_mult = float(os.getenv("OKX_SELF_PROTECT_MULT", "1.01"))
-            if _cur_match_g2 and _ex_usd > 0 and _max_rival_usd > 0 and _ex_usd >= _max_rival_usd * _sp_mult:
-                log.info("  ✅ %s: SELF-PROTECT our $%.4f >= max_rival $%.4f * %.3f — KEEP (no self-outbid)",
-                         name, _ex_usd, _max_rival_usd, _sp_mult)
-                self.already_winning += 1
-                return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-            if (not _cur_match_g2) and _ex_usd > 0 and _max_rival_usd > 0:
-                # PATCH 2026-05-21: rival lives in different currency lane; SELF-PROTECT
-                # does not apply — must re-place in rival's currency to compete in same lane.
-                log.info("  💱 %s: SELF-PROTECT skipped (our_cur=%s rival_cur=%s) — will re-place in %s",
-                         name, _ex_cur_g2, _max_rival_cur, _max_rival_cur)
-
-        if rival_above_cap:
-            # Fallback: find the best rival BELOW cap
-            fallback_rival: RivalOffer | None = None
-            fallback_usd = 0.0
-            for o in offers:
-                if o.price <= 0 or not o.maker or o.maker in self.protected_wallets:
-                    continue
-                o_usd = self.prices.to_usd(o.price, o.currency.upper())
-                if 0 < o_usd < cap_usd and o_usd > fallback_usd:
-                    fallback_rival = o
-                    fallback_usd = o_usd
-            if fallback_rival:
-                log.info("  🔄 %s: best rival $%.2f > cap $%.2f — fallback to next rival $%.4f %s (maker=%s)",
-                         name, rival_usd, cap_usd, fallback_rival.price,
-                         fallback_rival.currency, (fallback_rival.maker or "?")[:14])
-                offer = fallback_rival
-                rival_cur = offer.currency.upper()
-                rival_usd = fallback_usd
-                # CRITICAL: recalculate our_cur for fallback rival's currency
-                # (original our_cur was set based on phantom rival, e.g. USDT
-                # but fallback is WBNB — must switch!)
-                our_cur = self._pick_currency(rival_cur, cfg_cur, chain_currencies, chain_native)
-                log.info("  🔄 %s: fallback our_cur=%s (rival_cur=%s)", name, our_cur, rival_cur)
-                # Recalculate via USD — rival_cur may differ from our_cur.
-                # BUG (fixed): previously `our_price = offer.price * min_step_mult`
-                # then `to_usd(our_price, our_cur)` mis-interpreted the
-                # rival-currency amount as our_cur (e.g. 0.0001 WBNB treated
-                # as 0.0001 USDT → $0.0001 offers). Now go through USD.
-                target_usd = rival_usd * min_step_mult
-                if target_usd > cap_usd:
-                    target_usd = cap_usd
-                our_price = self.prices.from_usd(target_usd, our_cur)
-                our_usd = target_usd
-                # Re-check SMART OFFER CHECK for the fallback rival
-                if our_existing:
-                    existing_usd = self.prices.to_usd(
-                        our_existing["price"], our_existing["currency"].upper()
-                    )
-                    if existing_usd > 0 and existing_usd >= fallback_usd:
-                        target_fb = fallback_usd * min_step_mult
-                        if target_fb > cap_usd:
-                            target_fb = cap_usd
-                        lower_threshold = target_fb * 1.20
-                        if existing_usd <= lower_threshold:
-                            _fb_budget = self.budget_wl_usd if is_wl else self.budget_nonwl_usd
-                            if existing_usd > 0 and _fb_budget > 0:
-                                _fb_want = max(1, min(self.max_qty, int(round(_fb_budget / existing_usd))))
-                            else:
-                                _fb_want = 1
-                            if self._needs_qty_upgrade(addr, chain, existing_usd, _fb_want):
-                                log.info("  🔄 %s: fallback price OK but qty needs upgrade to %d — will re-place",
-                                         name, _fb_want)
-                            else:
-                                log.info("  ✅ %s: our $%.4f ≥ fallback rival $%.4f, within 20%% — KEEP",
-                                         name, existing_usd, fallback_usd)
-                                self.already_winning += 1
-                                return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-                rival_above_cap = False  # resolved via fallback
-            elif our_existing:
-                log.info("  ⏸ %s: rival=%.2f$ ≥ cap=%.2f$, no fallback — keeping our offer (%.4f %s)",
-                         name, rival_usd, cap_usd,
+        if enemy_above_cap:
+            our_existing = self._find_our_offer(addr, chain)
+            if our_existing:
+                log.info("  ⏸ %s: enemy=%.2f$ ≥ cap=%.2f$ — keeping our offer (%.4f %s)",
+                         name, parasite_usd, cap_usd,
                          our_existing["price"], our_existing["currency"])
                 return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
             else:
-                log.info("  📎 %s: rival=%.2f$ ≥ cap=%.2f$ — placing at cap %.4f %s",
-                         name, rival_usd, cap_usd, our_price, our_cur)
+                log.info("  📎 %s: enemy=%.2f$ ≥ cap=%.2f$ — placing at cap %.4f %s",
+                         name, parasite_usd, cap_usd, our_price, our_cur)
 
-        # Anti-stacking cooldown check (rival path)
-        last_ts = self._last_placed.get(cache_key, 0)
+        # Anti-stacking cooldown check (enemy path)
+        cooldown_key = f"{addr}:{chain}"
+        last_ts = self._last_placed.get(cooldown_key, 0)
         if time.time() - last_ts < self._PLACE_COOLDOWN:
             mins_ago = (time.time() - last_ts) / 60
             log.info("  ⏳ %s: cooldown active (placed %.1f min ago) — SKIP to prevent stacking", name, mins_ago)
             return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
 
-        # Final same-price guard: after all capping/fallback, if our new price
-        # ≈ existing price (within 2%), don't waste gas on cancel+replace
-        # PATCH 2026-05-21: two extra guards before KEEP:
-        #   (a) reality-check: only KEEP if existing >= rival (we're truly #1).
-        #       Without this, target_usd capped at cap_usd can match existing while
-        #       rival sits above us → we keep being #2 forever.
-        #   (b) cross-currency: only KEEP if our_cur (target currency) == existing_cur.
-        #       Otherwise re-place to align with rival's currency lane in OKX orderbook.
-        if our_existing:
-            _ex_price = our_existing["price"]
-            _ex_cur = our_existing["currency"].upper()
-            _ex_usd = self.prices.to_usd(_ex_price, _ex_cur)
-            _truly_winning = (_ex_usd > 0 and rival_usd > 0 and _ex_usd >= rival_usd * 1.005)  # PATCH 2026-05-21
-            _cur_aligned = (_ex_cur == (our_cur or "").upper())  # PATCH 2026-05-21
-            if _ex_usd > 0 and our_usd > 0 and abs(our_usd - _ex_usd) / _ex_usd < 0.02:
-                if not _truly_winning:
-                    # PATCH 2026-05-21: existing offer below rival → must re-place, no KEEP
-                    log.info("  🔁 %s: no-churn SKIPPED — existing $%.4f < rival $%.4f, must outbid",
-                             name, _ex_usd, rival_usd)
-                elif not _cur_aligned:
-                    # PATCH 2026-05-21: existing in different currency than target → must re-place
-                    log.info("  💱 %s: no-churn SKIPPED — existing_cur=%s, new_cur=%s, will re-place in %s",
-                             name, _ex_cur, our_cur, our_cur)
-                elif self._needs_qty_upgrade(addr, chain, our_usd, quantity):
-                    log.info("  🔄 %s: final price same but qty needs upgrade to %d — proceeding",
-                             name, quantity)
-                else:
-                    log.info("  ✅ %s: final price $%.4f ≈ existing $%.4f (diff <2%%) — KEEP (no churn)",
-                             name, our_usd, _ex_usd)
-                    return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
-
-        # We are NOT #1 → cancel ALL old offers, then place new one above rival
+        # We are NOT #1 → cancel ALL old offers, then place new one above enemy
         cancel_ok = self._cancel_existing_offer(addr, chain, name)
         if not cancel_ok:
             log.warning("  🚫 %s: cancel failed — ABORT new offer to prevent stacking", name)
@@ -2395,9 +1727,9 @@ class CounterBidder:
 
         display_tid = offer.token_id if offer.token_id and offer.token_id != "0" else "col"
         log.info(
-            "  📎 %s #%s: соперник=%.4f %s ($%.2f) → наш=%.4f %s ($%.2f) qty=%d tier=%s%s",
+            "  📎 %s #%s: паразит=%.4f %s ($%.2f) → наш=%.4f %s ($%.2f) qty=%d tier=%s%s",
             name, display_tid,
-            offer.price, rival_cur, rival_usd,
+            offer.price, parasite_cur, parasite_usd,
             our_price, our_cur, our_usd, quantity,
             "premium" if is_premium else "basic",
             " [DRY]" if self.dry_run else ""
@@ -2408,8 +1740,8 @@ class CounterBidder:
             self._alert_undercut(
                 name, offer.token_id or "collection",
                 chain, offer.price, our_price,
-                rival_cur, our_cur,
-                rival_usd, our_usd, dry=True,
+                parasite_cur, our_cur,
+                parasite_usd, our_usd, dry=True,
                 collection_address=addr,
             )
         else:
@@ -2420,19 +1752,19 @@ class CounterBidder:
                     duration_hours=offer_duration_hours,
                 )
                 # ALWAYS set cooldown — even on failure (might have succeeded on-chain)
-                self._last_placed[cache_key] = time.time()
-                self._placed_qty_cache[cache_key] = quantity
+                self._last_placed[cooldown_key] = time.time()
                 if ok:
                     placed += 1
                     self._alert_undercut(
                         name, offer.token_id or "collection",
                         chain, offer.price, our_price,
-                        rival_cur, our_cur,
-                        rival_usd, our_usd, dry=False,
+                        parasite_cur, our_cur,
+                        parasite_usd, our_usd, dry=False,
                         collection_address=addr,
                     )
                     # Mark cache so we don't bid again this scan
-                    self._best_offer_cache[cache_key] = {
+                    cache_key_done = f"{addr}:{chain}"
+                    self._best_offer_cache[cache_key_done] = {
                         "maker": self.our_wallet,
                         "price": our_price,
                         "currency": our_cur,
@@ -2442,7 +1774,7 @@ class CounterBidder:
                     failed += 1
             except Exception as exc:
                 log.error("  Undercut failed #%s: %s", offer.token_id, exc)
-                self._last_placed[cache_key] = time.time()
+                self._last_placed[cooldown_key] = time.time()
                 failed += 1
 
             if self.delay > 0:
@@ -2524,6 +1856,8 @@ class CounterBidder:
         if cached and (time.time() - cached.get("ts", 0)) < self._COLLECTION_PAGE_TTL:
             return cached
 
+        chain_name = {"eth": "eth", "bsc": "bsc", "polygon": "polygon",
+                      "arbitrum": "arbitrum"}.get(chain, "bsc")
         slug = self._get_collection_slug(addr)
         if not slug:
             log.debug("_resolve_collection_page_data: no slug for %s", addr[:14])
@@ -2534,7 +1868,7 @@ class CounterBidder:
         except ImportError:
             import requests as http  # type: ignore
 
-        url = f"https://web3.okx.com/nft/collection/{chain}/{slug}"
+        url = f"https://web3.okx.com/nft/collection/{chain_name}/{slug}"
         try:
             resp = http.get(url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -2729,13 +2063,13 @@ class CounterBidder:
         2. priapi/v1/nft/order/offers?nftId=X → full offer list (detailed)
 
         Returns {"maker": str, "price": float, "currency": str, "usd": float,
-                 "_overall_best": dict, "_best_rival": dict}.
+                 "_overall_best": dict, "_best_enemy": dict}.
         """
         addr = collection_address.lower()
         default_currency = "ETH" if chain == "eth" else "BNB"
 
         best: dict = {"maker": "", "price": 0, "currency": "", "usd": 0}
-        best_rival: dict = {"maker": "", "price": 0, "currency": "", "usd": 0}
+        best_enemy: dict = {"maker": "", "price": 0, "currency": "", "usd": 0}
 
         # ── Source 1: Collection page (bestOffer from SSR) ──
         page_data = self._resolve_collection_page_data(addr, chain)
@@ -2760,7 +2094,7 @@ class CounterBidder:
                 usd = parsed["usd"]
                 is_protected = maker in self.protected_wallets
 
-                log.debug("  📊 offer_scan %s: maker=%s price=%.6f %s ($%.4f) %s",
+                log.info("  📊 offer_scan %s: maker=%s price=%.6f %s ($%.4f) %s",
                          addr[:14], maker[:14] if maker else "?",
                          price, currency, usd,
                          "← OURS/FRIEND" if is_protected else "")
@@ -2768,8 +2102,8 @@ class CounterBidder:
                 if usd > best["usd"]:
                     best = {"maker": maker, "price": price,
                             "currency": currency, "usd": usd}
-                if usd > best_rival["usd"] and not is_protected:
-                    best_rival = {"maker": maker, "price": price,
+                if usd > best_enemy["usd"] and not is_protected:
+                    best_enemy = {"maker": maker, "price": price,
                                   "currency": currency, "usd": usd}
         else:
             log.warning("  ⚠ No nftId for %s — cannot query offers API", addr[:14])
@@ -2779,21 +2113,6 @@ class CounterBidder:
                         "currency": page_best["currency"],
                         "usd": page_best.get("usd", 0)}
 
-        # ── Phantom verification: page_best (SSR) is ground truth ──
-        # OKX frontend shows real offers; if API returns something >2.5x
-        # the page_best, it's a stale/phantom offer.
-        page_usd = page_best.get("usd", 0)
-        if page_usd > 0 and best_rival["usd"] > page_usd * 2.5:
-            log.info("  🗑 %s: best_rival $%.2f > 2.5x page_best $%.2f — phantom, clamping to page_best",
-                     addr[:14], best_rival["usd"], page_usd)
-            # Clamp best_rival to something reasonable — use page_best as guide
-            # but keep it as "rival" so undercutting still works
-            best_rival = {"maker": best_rival.get("maker", ""), "price": 0,
-                          "currency": "", "usd": 0}
-        if page_usd > 0 and best["usd"] > page_usd * 2.5:
-            best = {"maker": best.get("maker", ""), "price": 0,
-                    "currency": "", "usd": 0}
-
         # --- Log results ---
         if best["maker"]:
             is_ours = best["maker"] in self.protected_wallets
@@ -2801,16 +2120,16 @@ class CounterBidder:
                      addr[:14],
                      best["maker"][:10], best["maker"][-4:],
                      best["usd"], best["currency"],
-                     "← OUR/FRIEND" if is_ours else "← RIVAL")
-        if best_rival["maker"]:
-            log.info("  🔍 best_offer_maker %s: BEST RIVAL=%s...%s ($%.4f %s)",
+                     "← OUR/FRIEND" if is_ours else "← ENEMY")
+        if best_enemy["maker"]:
+            log.info("  🔍 best_offer_maker %s: BEST ENEMY=%s...%s ($%.4f %s)",
                      addr[:14],
-                     best_rival["maker"][:10], best_rival["maker"][-4:],
-                     best_rival["usd"], best_rival["currency"])
+                     best_enemy["maker"][:10], best_enemy["maker"][-4:],
+                     best_enemy["usd"], best_enemy["currency"])
 
-        result = dict(best_rival) if best_rival["maker"] else dict(best)
+        result = dict(best_enemy) if best_enemy["maker"] else dict(best)
         result["_overall_best"] = best
-        result["_best_rival"] = best_rival
+        result["_best_enemy"] = best_enemy
         return result
 
     # _fetch_best_offers removed — replaced by _fetch_best_offer_maker above
@@ -2822,6 +2141,8 @@ class CounterBidder:
         Caches per-scan to avoid repeated API calls.
         """
         cache_key = f"floor:{collection_address.lower()}:{chain}"
+        if not hasattr(self, "_floor_cache"):
+            self._floor_cache: dict[str, float] = {}
         if cache_key in self._floor_cache:
             return self._floor_cache[cache_key]
 
@@ -2870,12 +2191,12 @@ class CounterBidder:
         best_our: dict | None = None
         best_usd = 0.0
 
-        def _consider(price: float, currency: str, order_id: str, count: int = 1):
+        def _consider(price: float, currency: str, order_id: str):
             nonlocal best_our, best_usd
             usd = self.prices.to_usd(price, currency.upper())
             if usd > best_usd:
                 best_usd = usd
-                best_our = {"order_id": order_id, "price": price, "currency": currency, "count": count}
+                best_our = {"order_id": order_id, "price": price, "currency": currency}
 
         # Method 1: Authenticated API (always works, no nftId needed)
         try:
@@ -2899,8 +2220,7 @@ class CounterBidder:
                     except (ValueError, TypeError):
                         price = 0.0
                     price = self._normalize_price(price, currency)
-                    count = int(item.get("count") or item.get("quantity") or 1)
-                    _consider(price, currency, order_id, count)
+                    _consider(price, currency, order_id)
         except Exception as exc:
             log.debug("_find_our_offer API failed for %s: %s", addr[:14], exc)
 
@@ -2915,142 +2235,10 @@ class CounterBidder:
                     _consider(parsed["price"], parsed["currency"],
                               parsed["order_id"] or parsed["order_hash"])
 
-        # ── PATCH 2026-04-25: DRIFT-AWARE FALLBACK ──
-        # When OKX exchange doesn't show our offer (drift / indexer lag),
-        # fall back to local DB. exchange_missing offers placed recently are
-        # signed promises we already have on-chain; bot must NOT re-submit
-        # higher prices and self-overbid.
-        if not best_our:
-            try:
-                local = self._find_local_active_offer(addr, chain, max_age_hours=48)
-                if local:
-                    log.warning("_find_our_offer %s: NO exchange data, using LOCAL %.6f %s (status=%s, age=%.1fh) — preventing self-overbid",
-                                addr[:14], local["price"], local["currency"], local["status"], local["age_hours"])
-                    return local
-            except Exception as exc:
-                log.debug("_find_our_offer local fallback err: %s", exc)
         if best_our:
             log.debug("_find_our_offer %s: found %.6f %s ($%.4f)",
                       addr[:14], best_our["price"], best_our["currency"], best_usd)
         return best_our
-
-    def _find_local_active_offer(self, collection_address: str, chain: str, max_age_hours: float = 48) -> dict | None:
-        """Read local execution.sqlite3 active_offers — fallback when OKX exchange is silent.
-
-        Returns top-priced offer with status in ('active','exchange_missing')
-        placed within max_age_hours. Used to prevent self-overbid loop.
-        """
-        import sqlite3
-        from okx_nft_bot.config import load_settings
-        try:
-            settings = load_settings()
-            db_path = getattr(settings, "execution_db_path", "data/execution.sqlite3")
-            con = sqlite3.connect(db_path)
-            cur = con.cursor()
-            # ── PATCH v2 2026-04-25: split age cutoff by status ──
-            # 'active' offers are real on-chain promises — keep within max_age_hours.
-            # 'exchange_missing' is OKX-side drift. After 6h without recovery,
-            # treat as effectively dead — let bot re-submit instead of self-blocking.
-            cur.execute("""SELECT order_hash, price_bnb, current_floor, placed_at, status
-                FROM active_offers WHERE collection=? AND chain=?
-                  AND (
-                      (status='active' AND placed_at > datetime('now', ?))
-                      OR
-                      (status='exchange_missing' AND placed_at > datetime('now', '-24 hours'))  -- PATCH 2026-04-26: 6h→24h to catch silently-dropped-then-recovered offers (self-overbid prevention)
-                  )
-                ORDER BY price_bnb DESC LIMIT 1""",
-                (collection_address.lower(), chain, f"-{int(max_age_hours)} hours"))
-            row = cur.fetchone()
-            con.close()
-            if not row: return None
-            from datetime import datetime, timezone
-            try:
-                placed = datetime.strptime(row[3], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                age_h = (datetime.now(timezone.utc) - placed).total_seconds() / 3600.0
-            except Exception:
-                age_h = 0.0
-            # Determine currency: rough — use ours_default_currency for chain
-            cur_default = "WBNB" if chain == "bsc" else "WETH"
-            return {
-                "order_id": row[0],
-                "price": float(row[1] or 0),
-                "currency": cur_default,
-                "status": row[4],
-                "age_hours": round(age_h, 2),
-            }
-        except Exception:
-            return None
-
-    def _circuit_breaker_check(self, collection_address: str) -> tuple[bool, str]:
-        """Check if collection is in circuit-breaker mode (5+ consecutive no_offer_id fails in last hour).
-        Returns (skip, reason)."""
-        try:
-            import sqlite3
-            from okx_nft_bot.config import load_settings
-            settings = load_settings()
-            db_path = getattr(settings, "execution_db_path", "data/execution.sqlite3")
-            con = sqlite3.connect(db_path)
-            cur = con.cursor()
-            # Get last 10 submits for this collection in last hour
-            cur.execute("""SELECT status, reason FROM execution_submit_log
-                WHERE collection=? AND created_at > datetime('now','-1 hour')
-                ORDER BY id DESC LIMIT 10""", (collection_address.lower(),))
-            rows = cur.fetchall()
-            con.close()
-            if not rows:
-                return (False, "")
-            # Count consecutive no_offer_id from most recent
-            consec = 0
-            for status, reason in rows:
-                if reason and "no_offer_id" in reason:
-                    consec += 1
-                else:
-                    break  # non-no_offer_id breaks streak
-            if consec >= 5:
-                return (True, f"circuit_breaker:{consec} consecutive no_offer_id")
-            return (False, "")
-        except Exception:
-            return (False, "")
-
-    def _check_okx_quota(self, threshold: int = 25) -> tuple[bool, int]:
-        """Returns (under_threshold, current_in_flight).
-        OKX silently drops new offers once active+exchange_missing exceeds ~30-40.
-        Discovered 2026-04-26: at 44 in_flight, 100% drift kicks in.
-        Conservative threshold: 25.
-        """
-        try:
-            import sqlite3
-            from okx_nft_bot.config import load_settings
-            settings = load_settings()
-            db_path = getattr(settings, "execution_db_path", "data/execution.sqlite3")
-            con = sqlite3.connect(db_path)
-            cur = con.cursor()
-            # FIX 2026-04-26: count only 'active' — exchange_missing already drifted,
-            # they don't consume actual OKX quota. Otherwise guard locks bot forever.
-            cur.execute("SELECT COUNT(*) FROM active_offers WHERE status='active'")
-            n = cur.fetchone()[0]
-            con.close()
-            return (n < threshold, n)
-        except Exception:
-            return (True, 0)  # fail-open if DB error
-
-    def _is_blacklisted(self, collection_address: str) -> bool:
-        """True if collection is in COUNTERBID_NONWL_BLACKLIST env list."""
-        return collection_address.lower() in self.nonwl_blacklist
-
-    def _is_disabled_in_config(self, collection_address: str) -> bool:
-        """True if buy_config.collections[addr].enabled is False (explicit disable)."""
-        entry = self.buy_config.get("collections", {}).get(collection_address.lower())
-        return bool(entry) and entry.get("enabled") is False
-
-    def _should_skip_nonwl_collection(self, collection_address: str) -> tuple[bool, str]:
-        """Returns (skip, reason). Used in Phase 2 (and future unified phase) dispatch."""
-        addr_lc = collection_address.lower()
-        if self._is_blacklisted(addr_lc):
-            return (True, "NONWL_BLACKLIST")
-        if self._is_disabled_in_config(addr_lc):
-            return (True, "buy_config.enabled=False")
-        return (False, "")
 
     def _find_all_our_offers(self, collection_address: str, chain: str) -> list[dict]:
         """Find ALL our active offers on this collection.
@@ -3186,92 +2374,47 @@ class CounterBidder:
         - No old offers exist (nothing to cancel), OR
         - ALL old offers were successfully cancelled AND verified gone.
         Returns False if any cancel failed → caller must NOT place new offer.
-
-        If env COUNTERBID_SKIP_CANCEL is truthy, returns True immediately
-        without cancelling — relies on short TTL (e.g. 1h) for old offers to
-        self-expire. This avoids all on-chain cancel gas in the overbid cycle.
         """
         if self.dry_run:
             return True
 
-        # Stacking mode: skip cancel, let old offers expire by TTL. Zero gas.
-        import os
-        if os.getenv("COUNTERBID_SKIP_CANCEL", "").strip().lower() in ("1", "true", "yes", "on"):
-            log.debug("  🟢 %s: COUNTERBID_SKIP_CANCEL=1 — old offers will self-expire", name)
-            return True
-
-        # Find our offers (priapi + authenticated API + local tracker).
-        # No retry needed: priapi uses per-scan cache, and authenticated API
-        # is deterministic — a 2s wait won't produce new results.
+        # Try finding our offers — retry once after 2s if first attempt returns empty
+        # (OKX API can have propagation delays)
         all_ours = self._find_all_our_offers(addr, chain)
         if not all_ours:
-            log.info("  🔄 %s: no existing offers to cancel", name)
+            # Retry after short delay — API may not have indexed new offers yet
+            time.sleep(2)
+            all_ours = self._find_all_our_offers(addr, chain)
+
+        if not all_ours:
+            log.info("  🔄 %s: no existing offers to cancel (checked 2x)", name)
             return True
 
         client = self._get_okx_client()
         if not client:
             log.error("  🚫 %s: no OKX client — cannot cancel %d old offers", name, len(all_ours))
             return False
-
         ok_count = 0
         fail_count = 0
-
-        # ── Batch path: >=2 offers → one incrementCounter() nukes them all ──
-        # Flat ~40k gas vs N*56k for per-order on-chain cancel().
-        # Nuclear: invalidates all our live Seaport orders on this chain
-        # (including other collections) — scan cycle will re-post on next pass.
-        if len(all_ours) >= 2 and hasattr(client, "cancel_all_via_counter"):
-            log.info("  🔄 %s: batch-cancel via incrementCounter for %d offers (one tx)",
-                     name, len(all_ours))
+        for offer in all_ours:
+            oid = offer.get("order_id", "")
+            if not oid:
+                fail_count += 1
+                continue
+            log.info("  🔄 %s: cancelling old offer %s (%.4f %s)",
+                     name, oid[:12], offer["price"], offer["currency"])
             try:
-                batch_ok = client.cancel_all_via_counter(chain=chain)
+                ok = client.cancel_offer(oid, chain=chain,
+                                         order_params=offer.get("order_params"))
+                if ok:
+                    ok_count += 1
+                else:
+                    log.warning("  ⚠ Cancel FAILED for %s order %s", name, oid[:12])
+                    fail_count += 1
+                time.sleep(0.3)
             except Exception as exc:
-                log.error("  batch-cancel error %s: %s", name, exc)
-                batch_ok = False
-            if batch_ok:
-                ok_count = len(all_ours)
-            else:
-                log.warning("  ⚠ %s: batch-cancel failed — falling back to per-order", name)
-                for offer in all_ours:
-                    oid = offer.get("order_id", "")
-                    if not oid:
-                        fail_count += 1
-                        continue
-                    log.info("  🔄 %s: cancelling old offer %s (%.4f %s)",
-                             name, oid[:12], offer["price"], offer["currency"])
-                    try:
-                        ok = client.cancel_offer(oid, chain=chain,
-                                                 order_params=offer.get("order_params"))
-                        if ok:
-                            ok_count += 1
-                        else:
-                            log.warning("  ⚠ Cancel FAILED for %s order %s", name, oid[:12])
-                            fail_count += 1
-                        time.sleep(0.3)
-                    except Exception as exc:
-                        log.error("  Cancel error %s order %s: %s", name, oid[:12], exc)
-                        fail_count += 1
-        else:
-            # Single-offer path — no savings from batch, use per-order cancel()
-            for offer in all_ours:
-                oid = offer.get("order_id", "")
-                if not oid:
-                    fail_count += 1
-                    continue
-                log.info("  🔄 %s: cancelling old offer %s (%.4f %s)",
-                         name, oid[:12], offer["price"], offer["currency"])
-                try:
-                    ok = client.cancel_offer(oid, chain=chain,
-                                             order_params=offer.get("order_params"))
-                    if ok:
-                        ok_count += 1
-                    else:
-                        log.warning("  ⚠ Cancel FAILED for %s order %s", name, oid[:12])
-                        fail_count += 1
-                    time.sleep(0.3)
-                except Exception as exc:
-                    log.error("  Cancel error %s order %s: %s", name, oid[:12], exc)
-                    fail_count += 1
+                log.error("  Cancel error %s order %s: %s", name, oid[:12], exc)
+                fail_count += 1
         log.info("  🔄 %s: cancelled %d/%d old offers (failed=%d)",
                  name, ok_count, len(all_ours), fail_count)
         # Clean up local tracker for successfully cancelled offers
@@ -3343,126 +2486,65 @@ class CounterBidder:
                                     quantity=quantity, duration_hours=duration_hours)
 
     # ── Balance cache + low-balance alerting ──
+    _balance_cache: dict[str, tuple[float, float]] = {}  # currency_addr → (balance_float, timestamp)
     _BALANCE_CACHE_TTL = 120  # refresh every 2 min
+    _low_balance_alerted: set[str] = set()  # currencies we already sent TG alert for
     _LOW_BALANCE_THRESHOLDS = {  # below this → send TG warning
         "WBNB": 0.01, "USDT": 5.0, "USDC": 5.0, "BUSD": 5.0,
         "WETH": 0.005, "DAI": 5.0,
     }
 
-    # RPC URLs per chain for balance checks
-    _CHAIN_RPC = {
-        "bsc": "https://bsc-dataseed.binance.org/",
-        "eth": "https://1rpc.io/eth",
-    }
-
-    # Map currency address → chain for automatic RPC selection
-    _CURRENCY_CHAIN = {
-        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "bsc",  # WBNB
-        "0x55d398326f99059ff775485246999027b3197955": "bsc",  # USDT BSC
-        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "bsc",  # USDC BSC
-        "0xe9e7cea3dedca5984780bafc599bd69add087d56": "bsc",  # BUSD
-        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "eth",  # WETH
-        "0xdac17f958d2ee523a2206206994597c13d831ec7": "eth",  # USDT ETH
-        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "eth",  # USDC ETH
-        "0x6b175474e89094c44da98b954eedeac495271d0f": "eth",  # DAI
-    }
-
     def _get_balance(self, currency_address: str) -> float:
-        """Fetch on-chain ERC20 balance (cached). Auto-detects chain from currency address."""
+        """Fetch on-chain ERC20 balance (cached)."""
+        import time as _time
         cached = self._balance_cache.get(currency_address)
-        if cached and (time.time() - cached[1]) < self._BALANCE_CACHE_TTL:
+        if cached and (_time.time() - cached[1]) < self._BALANCE_CACHE_TTL:
             return cached[0]
         from okx_nft_bot.config import load_settings
         settings = load_settings()
         wallet = settings.buyer_wallet_address
         if not wallet:
             return 999999.0  # can't check → assume enough
-        import urllib.request
+        import json, urllib.request
         addr_padded = wallet.lower().replace('0x', '').zfill(64)
         data = '0x70a08231' + addr_padded  # balanceOf(address)
-        payload = _json.dumps({
+        payload = json.dumps({
             'jsonrpc': '2.0', 'method': 'eth_call',
             'params': [{'to': currency_address, 'data': data}, 'latest'], 'id': 1,
         }).encode()
-        # Pick correct RPC based on currency address chain
-        chain = self._CURRENCY_CHAIN.get(currency_address.lower(), "bsc")
-        rpc_url = getattr(settings, f'buyer_rpc_url{"_eth" if chain == "eth" else ""}', None)
-        if not rpc_url:
-            rpc_url = self._CHAIN_RPC.get(chain, 'https://bsc-dataseed.binance.org/')
+        rpc_url = getattr(settings, 'sniper_rpc_url', None) or 'https://bsc-dataseed.binance.org/'
         req = urllib.request.Request(rpc_url, data=payload,
                                      headers={'Content-Type': 'application/json'})
-        resp = _json.loads(urllib.request.urlopen(req, timeout=5).read())
+        resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
         raw = int(resp.get('result', '0x0'), 16)
-        # USDC/USDT on ETH use 6 decimals
-        decimals = 6 if currency_address.lower() in (
-            "0xdac17f958d2ee523a2206206994597c13d831ec7",
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-        ) else 18
-        balance = raw / (10 ** decimals)
-        self._balance_cache[currency_address] = (balance, time.time())
+        balance = raw / (10 ** 18)
+        self._balance_cache[currency_address] = (balance, _time.time())
         return balance
 
     def _send_low_balance_tg(self, currency: str, balance: float, threshold: float):
         """Send Telegram alert when balance drops below threshold."""
-        msg = (
-            f"⚠️ <b>Low {currency} balance!</b>\n"
-            f"Balance: <code>{balance:.6f}</code>\n"
-            f"Threshold: <code>{threshold:.6f}</code>\n"
-            f"Top up to keep placing offers."
-        )
-        self._tg_send(msg)
-        log.info("📱 TG alert sent: %s balance=%.6f < threshold=%.6f", currency, balance, threshold)
-
-    # ── PATCH 2026-08-01: чтение вердиктов анти-wash ──────────────
-    _ANTIWASH_PATH = "/app/data/antiwash_flags.json"
-    _antiwash_cache: dict = {}
-    _antiwash_loaded_at: float = 0.0
-
-    # ── PATCH 2026-08-01 (TRAP): соперник торгует тем, чем владеет ──
-    # Схема Robert'а: паразит ставит офферы на мусорную коллекцию и тянет
-    # цену вверх. Мы видим "конкуренцию", перебиваем — и он сливает нам
-    # свой мешок по задранной цене. Подпись схемы простая: настоящий
-    # покупатель НЕ владеет тем, что покупает. Если владеет — это ловушка.
-    _trap_cache: dict = {}
-    _TRAP_TTL = 900  # 15 мин
-
-    def _is_trap(self, collection: str, maker: str) -> int:
-        """Сколько NFT этой коллекции держит соперник. >0 = ловушка."""
-        import time as _t, json as _js, urllib.request as _u
-        if not collection or not maker:
-            return 0
-        key = (collection.lower(), maker.lower())
-        hit = self._trap_cache.get(key)
-        if hit and (_t.time() - hit[1]) < self._TRAP_TTL:
-            return hit[0]
         try:
-            data = "0x70a08231" + maker[2:].rjust(64, "0")
-            body = _js.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                              "params": [{"to": collection, "data": data},
-                                         "latest"]}).encode()
-            req = _u.Request("https://bsc-dataseed.binance.org/", data=body,
-                             headers={"Content-Type": "application/json"})
-            v = _js.load(_u.urlopen(req, timeout=12)).get("result")
-            n = int(v, 16) if v and v != "0x" else 0
-        except Exception:
-            n = 0
-        type(self)._trap_cache[key] = (n, _t.time())
-        return n
-
-    def _antiwash_flag(self, maker):
-        """REAL / THIN / PHANTOM или None. Файл обновляет antiwash.py."""
-        import os as _os, json as _js, time as _t
-        try:
-            cls = type(self)
-            if _t.time() - cls._antiwash_loaded_at > 300:
-                if _os.path.exists(self._ANTIWASH_PATH):
-                    with open(self._ANTIWASH_PATH) as _f:
-                        cls._antiwash_cache = _js.load(_f)
-                    cls._antiwash_loaded_at = _t.time()
-            rec = cls._antiwash_cache.get((maker or "").lower())
-            return rec.get("verdict") if isinstance(rec, dict) else None
-        except Exception:
-            return None
+            import json, urllib.request, os
+            bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+            if not bot_token or not chat_id:
+                return
+            msg = (
+                f"⚠️ <b>Low {currency} balance!</b>\n"
+                f"Balance: <code>{balance:.6f}</code>\n"
+                f"Threshold: <code>{threshold:.6f}</code>\n"
+                f"Top up to keep placing offers."
+            )
+            payload = json.dumps({
+                "chat_id": chat_id, "text": msg, "parse_mode": "HTML",
+            }).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                data=payload, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5)
+            log.info("📱 TG alert sent: %s balance=%.6f < threshold=%.6f", currency, balance, threshold)
+        except Exception as exc:
+            log.debug("TG low-balance alert failed: %s", exc)
 
     def _check_balance_for_offer(self, currency_address: str, currency: str,
                                   offer_price: float) -> bool:
@@ -3488,87 +2570,21 @@ class CounterBidder:
                 # Balance recovered — allow future alerts
                 self._low_balance_alerted.discard(cur)
 
-            # 2026-04-26 EMPIRICAL: OKX backend DOES pre-validate balance at
-            # submitOrder step2 even though Seaport itself doesn't lock funds.
-            # Tests confirmed: offer > balance → "This order is no longer valid".
-            # Skip submits that exceed 90% of balance to save rate limit budget.
-            # PATCH 2026-07-17: allow up to $2.5 USD-eq offers regardless of balance (env floor)
-            _env_floor = float(__import__('os').getenv('MIN_OFFER_ALLOWANCE_' + str(cur).upper(), '0') or '0')
-            soft_cap = max(balance * 0.9, _env_floor)
-            # ── PATCH 2026-07-31 (ZERO-BALANCE GUARD) ──
-            # MIN_OFFER_ALLOWANCE_* задумывался как «пропускать мелкие офферы,
-            # даже если баланс чуть ниже». Но при ПУСТОМ кошельке он пропускал
-            # офферы вообще без покрытия — OKX потом отбивал их как
-            # "This order is no longer valid". Пример: USDC на BSC = 0,
-            # порог 1.0 → все офферы < $1 уходили в никуда.
-            # Теперь: нет монеты в этой сети — нет оффера в этой монете.
-            if balance <= 0.000001:
-                log.info("⛔ %s: баланс 0 в этой сети — оффер невозможен "
-                         "(порог %.4f игнорируется)", cur, _env_floor)
-                return False
-            if offer_price > soft_cap:
-                log.info("⛔ %s balance=%.6f < offer=%.6f×1.11 (%.6f cap) — skip "
-                         "(OKX rejects pre-fill if balance insufficient)",
-                         cur, balance, offer_price, soft_cap)
+            # ── Skip if can't cover even 1 acceptance ──
+            if balance < offer_price:
+                log.warning("⛔ %s balance=%.6f < offer=%.6f — SKIP (can't cover acceptance)",
+                            cur, balance, offer_price)
                 return False
             return True
         except Exception as exc:
             log.debug("Balance check failed (proceeding anyway): %s", exc)
             return True
 
-    def _normalize_to_bnb(self, price: float, currency: str) -> float:
-        """Convert a price in any currency to BNB-equivalent via USD.
-
-        Used to give the execution governor a comparable number for its
-        daily_bnb cap (max_bnb_per_day). Without normalization a $10 USDT
-        offer would be seen as "10 BNB" (~$6000) and get blocked.
-
-        Falls back to raw price if USD conversion fails — safe default since
-        a 5 BNB cap is very permissive for raw numbers anyway.
-        """
-        cur = currency.upper()
-        if cur in ("WBNB", "BNB"):
-            return price
-        try:
-            price_usd = self.prices.to_usd(price, cur)
-            bnb_usd = self.prices.get_usd_price("WBNB")
-            if bnb_usd > 0 and price_usd > 0:
-                return price_usd / bnb_usd
-        except Exception as exc:
-            log.debug("BNB-equivalent normalization failed for %s: %s", cur, exc)
-        return price
-
     def _submit_bsc(self, collection_address: str, token_id: str,
                     price: float, currency: str = "WBNB",
                     quantity: int = 1, duration_hours: int = 720) -> bool:
         """Submit BSC offers through the governed execution path."""
         try:
-            # ── PATCH 2026-04-26: Circuit breaker for no_offer_id collections ──
-            _cb_skip, _cb_reason = self._circuit_breaker_check(collection_address)
-            if _cb_skip:
-                log.warning("BSC submit BLOCKED %s: %s — saving rate limit slot",
-                            collection_address[:14], _cb_reason)
-                self._record_execution_submit_event(
-                    chain="bsc", collection=collection_address, price_bnb=price,
-                    status="blocked", reason=_cb_reason,
-                )
-                return False
-            
-            # ── PATCH 2026-04-26: OKX quota guard ──
-            _quota_threshold = _env_int("COUNTERBID_QUOTA_THRESHOLD", 25)
-            _quota_ok, _in_flight = self._check_okx_quota(_quota_threshold)
-            if not _quota_ok:
-                log.warning("BSC submit BLOCKED %s: quota guard %d >= %d (avoid drift)",
-                            collection_address[:14], _in_flight, _quota_threshold)
-                self._record_execution_submit_event(
-                    chain="bsc",
-                    collection=collection_address,
-                    price_bnb=price,
-                    status="blocked",
-                    reason=f"quota_guard:{_in_flight}/{_quota_threshold}",
-                )
-                return False
-            
             engine = self._get_bsc_engine()
             if engine is None:
                 self._record_execution_submit_event(
@@ -3593,28 +2609,7 @@ class CounterBidder:
                 return False
 
             cur_upper = currency.upper()
-            # ── PATCH 2026-07-31 (QTY-BALANCE): OKX проверяет ПОЛНУЮ сумму
-            # (цена × количество), а не цену за штуку. Раньше мы слали
-            # qty=58 × 0.15 = 8.7 USDT при балансе 3 → "order is no longer
-            # valid". Теперь режем количество до того, что реально покрываем,
-            # вместо того чтобы пропускать бой целиком.
-            try:
-                _bal_now = self._get_balance(currency_address) or 0.0
-                _floor_now = float(__import__('os').getenv(
-                    'MIN_OFFER_ALLOWANCE_' + cur_upper, '0') or '0')
-                _cap_now = max(_bal_now * 0.9, _floor_now)
-                if price > 0 and quantity > 1 and (price * quantity) > _cap_now:
-                    _afford = max(1, int(_cap_now // price))
-                    if _afford < quantity:
-                        log.info("💰 %s %s: qty %d→%d (баланс %.4f, цена %.6f, лимит %.4f)",
-                                 collection_address[:14], cur_upper,
-                                 quantity, _afford, _bal_now, price, _cap_now)
-                        quantity = _afford
-            except Exception as _qexc:
-                log.debug("qty-balance cap skipped: %s", _qexc)
-
-            if not self._check_balance_for_offer(currency_address, cur_upper,
-                                                 price * max(1, quantity)):
+            if not self._check_balance_for_offer(currency_address, cur_upper, price):
                 self._record_execution_submit_event(
                     chain="bsc",
                     collection=collection_address,
@@ -3639,12 +2634,7 @@ class CounterBidder:
                 )
                 return False
 
-            # Normalize price to BNB-equivalent for governor daily_bnb cap.
-            # max_bnb_per_day=5 otherwise blocks any USDT offer > $5 because
-            # governor compares raw token amount directly to BNB cap.
-            price_bnb_for_cap = self._normalize_to_bnb(price, cur_upper)
-
-            ok, detail = engine.place_single_offer(
+            ok = engine.place_single_offer(
                 collection_address=collection_address,
                 token_id=token_id,
                 price_wbnb=price,
@@ -3653,7 +2643,6 @@ class CounterBidder:
                 duration_hours=duration_hours,
                 dry_run=False,
                 quantity=quantity,
-                price_bnb_for_cap=price_bnb_for_cap,
             )
             if ok:
                 key = f"{collection_address.lower()}:bsc"
@@ -3664,25 +2653,13 @@ class CounterBidder:
                         self._local_placed_offers.setdefault(key, []).append(matches[-1])
                 except Exception as exc:
                     log.debug("BSC local offer tracking refresh failed: %s", exc)
-                # Record submit_log success so governor daily_bnb cap tracker works.
-                # Use price_bnb_for_cap (BNB-equivalent) not raw token price.
-                self._record_execution_submit_event(
-                    chain="bsc",
-                    collection=collection_address,
-                    price_bnb=price_bnb_for_cap,
-                    status="submitted",
-                    reason="success",
-                )
             else:
-                # Preserve the detailed failure cause from place_single_offer
-                # (rate-limit, daily-cap, api-exception, etc.) rather than the
-                # generic "governed_submit_failed" marker.
                 self._record_execution_submit_event(
                     chain="bsc",
                     collection=collection_address,
                     price_bnb=price,
                     status="failed",
-                    reason=detail or "governed_submit_failed",
+                    reason="governed_submit_failed",
                 )
             return ok
         except Exception as exc:
@@ -3714,153 +2691,26 @@ class CounterBidder:
     def _submit_eth(self, collection_address: str, token_id: str,
                     price: float, currency: str = "WETH",
                     quantity: int = 1, duration_hours: int = 720) -> bool:
-        """Submit ETH offers through the governed execution path (same as BSC)."""
-        try:
-            engine = self._get_eth_engine()
-            if engine is None:
-                self._record_execution_submit_event(
-                    chain="eth",
-                    collection=collection_address,
-                    price_bnb=price,
-                    status="failed",
-                    reason="mass_offer_engine_unavailable",
-                )
-                return False
-
-            currency_address = self._get_currency_address(currency, "eth")
-            if not currency_address:
-                log.error("ETH offer: unknown currency %s", currency)
-                self._record_execution_submit_event(
-                    chain="eth",
-                    collection=collection_address,
-                    price_bnb=price,
-                    status="failed",
-                    reason=f"unknown_currency:{currency}",
-                )
-                return False
-
-            cur_upper = currency.upper()
-            # ── PATCH 2026-07-31 (QTY-BALANCE): OKX проверяет ПОЛНУЮ сумму
-            # (цена × количество), а не цену за штуку. Раньше мы слали
-            # qty=58 × 0.15 = 8.7 USDT при балансе 3 → "order is no longer
-            # valid". Теперь режем количество до того, что реально покрываем,
-            # вместо того чтобы пропускать бой целиком.
-            try:
-                _bal_now = self._get_balance(currency_address) or 0.0
-                _floor_now = float(__import__('os').getenv(
-                    'MIN_OFFER_ALLOWANCE_' + cur_upper, '0') or '0')
-                _cap_now = max(_bal_now * 0.9, _floor_now)
-                if price > 0 and quantity > 1 and (price * quantity) > _cap_now:
-                    _afford = max(1, int(_cap_now // price))
-                    if _afford < quantity:
-                        log.info("💰 %s %s: qty %d→%d (баланс %.4f, цена %.6f, лимит %.4f)",
-                                 collection_address[:14], cur_upper,
-                                 quantity, _afford, _bal_now, price, _cap_now)
-                        quantity = _afford
-            except Exception as _qexc:
-                log.debug("qty-balance cap skipped: %s", _qexc)
-
-            if not self._check_balance_for_offer(currency_address, cur_upper,
-                                                 price * max(1, quantity)):
-                self._record_execution_submit_event(
-                    chain="eth",
-                    collection=collection_address,
-                    price_bnb=price,
-                    status="blocked",
-                    reason=f"insufficient_balance:{cur_upper}",
-                )
-                return False
-
-            if engine.governor.effective_dry_run(False):
-                reason = "execution_dry_run_enabled"
-                log.warning(
-                    "ETH governed submit BLOCKED %s token=%s price=%.6f %s: %s",
-                    collection_address[:14], token_id or "col", price, currency, reason,
-                )
-                self._record_execution_submit_event(
-                    chain="eth",
-                    collection=collection_address,
-                    price_bnb=price,
-                    status="blocked",
-                    reason=reason,
-                )
-                return False
-
-            # Normalize price to BNB-equivalent for governor daily_bnb cap
-            # (shared cap across chains; treating WETH as BNB is wrong too).
-            price_bnb_for_cap = self._normalize_to_bnb(price, cur_upper)
-
-            ok, detail = engine.place_single_offer(
-                collection_address=collection_address,
-                token_id=token_id,
-                price_wbnb=price,
-                currency_address=currency_address,
-                chain="eth",
-                duration_hours=duration_hours,
-                dry_run=False,
-                quantity=quantity,
-                price_bnb_for_cap=price_bnb_for_cap,
-            )
-            if ok:
-                key = f"{collection_address.lower()}:eth"
-                try:
-                    active = engine.state.get_active_offers(chain="eth")
-                    matches = [offer.order_hash for offer in active if offer.collection == collection_address.lower()]
-                    if matches:
-                        self._local_placed_offers.setdefault(key, []).append(matches[-1])
-                except Exception as exc:
-                    log.debug("ETH local offer tracking refresh failed: %s", exc)
-                # Record submit_log success so governor daily_bnb cap tracker works.
-                # Use price_bnb_for_cap (BNB-equivalent) not raw token price.
-                self._record_execution_submit_event(
-                    chain="eth",
-                    collection=collection_address,
-                    price_bnb=price_bnb_for_cap,
-                    status="submitted",
-                    reason="success",
-                )
-            else:
-                # Preserve the detailed failure cause from place_single_offer
-                # (rate-limit, daily-cap, api-exception, etc.) rather than the
-                # generic "governed_submit_failed" marker.
-                self._record_execution_submit_event(
-                    chain="eth",
-                    collection=collection_address,
-                    price_bnb=price,
-                    status="failed",
-                    reason=detail or "governed_submit_failed",
-                )
-            return ok
-        except Exception as exc:
-            log.error("ETH governed offer submit failed (%s): %s", currency, exc, exc_info=True)
-            self._record_execution_submit_event(
-                chain="eth",
-                collection=collection_address,
-                price_bnb=price,
-                status="failed",
-                reason=str(exc),
-            )
-            return False
-
-    def _get_eth_engine(self):
-        """Lazy-init and cache MassOfferEngine for ETH submissions."""
-        if hasattr(self, "_eth_engine") and self._eth_engine is not None:
-            return self._eth_engine
-        try:
-            from okx_nft_bot.mass_offer.engine import MassOfferEngine
-            from okx_nft_bot.config import load_settings
-            settings = load_settings()
-            self._eth_engine = MassOfferEngine(settings=settings)
-            log.info("ETH MassOfferEngine initialized OK (db=%s)", settings.execution_db_path)
-            return self._eth_engine
-        except Exception as exc:
-            log.error("ETH MassOfferEngine init failed: %s", exc, exc_info=True)
-            return None
+        """Block live ETH offers until an execution-governed ETH runtime exists."""
+        _ = token_id, quantity, duration_hours
+        reason = "eth_live_submit_disabled_until_governed_runtime"
+        log.warning(
+            "ETH governed submit BLOCKED %s token=%s price=%.6f %s: %s",
+            collection_address[:14], token_id or "col", price, currency, reason,
+        )
+        self._record_execution_submit_event(
+            chain="eth",
+            collection=collection_address,
+            price_bnb=price,
+            status="blocked",
+            reason=reason,
+        )
+        return False
 
     # ── Data conversion helpers ────────────────────────────────
 
-    def _normalized_to_rival(self, o, chain: str) -> RivalOffer:
-        """Convert NormalizedOffer → RivalOffer."""
+    def _normalized_to_parasite(self, o, chain: str) -> ParasiteOffer:
+        """Convert NormalizedOffer → ParasiteOffer."""
         addr = (o.collection_slug_or_address or "").lower()
         wl_info = self._wl_index.get(addr, {})
         name = wl_info.get("collection_name") or wl_info.get("name") or addr[:14]
@@ -3885,7 +2735,7 @@ class CounterBidder:
         elif hasattr(o, "maker_address"):
             maker = (o.maker_address or "").lower()
 
-        return RivalOffer(
+        return ParasiteOffer(
             collection_address=addr,
             collection_name=name,
             chain=chain,
@@ -3949,13 +2799,26 @@ class CounterBidder:
         if len(c) <= 10 and not c.startswith("0x"):
             return raw_currency.upper()
 
-        # Zero address = native
-        if c == "0x0000000000000000000000000000000000000000":
-            return default
-        return CounterBidder._KNOWN_ADDRESSES.get(c, default)
+        # Known token addresses
+        KNOWN = {
+            # ETH mainnet
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "WETH",
+            "0xdac17f958d2ee523a2206206994597c13d831ec7": "USDT",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC",
+            "0x6b175474e89094c44da98b954eedeac495271d0f": "DAI",
+            # BSC
+            "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "WBNB",
+            "0x55d398326f99059ff775485246999027b3197955": "USDT",
+            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",
+            "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",
+            "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3": "DAI",
+            # Zero address = native
+            "0x0000000000000000000000000000000000000000": default,
+        }
+        return KNOWN.get(c, default)
 
-    def _raw_to_rival(self, raw: dict, chain: str) -> RivalOffer:
-        """Convert raw API dict → RivalOffer."""
+    def _raw_to_parasite(self, raw: dict, chain: str) -> ParasiteOffer:
+        """Convert raw API dict → ParasiteOffer."""
         addr = (raw.get("collectionAddress") or raw.get("collection_address")
                 or raw.get("contractAddress") or "").lower()
         wl_info = self._wl_index.get(addr, {})
@@ -3996,7 +2859,7 @@ class CounterBidder:
         maker = (raw.get("maker") or raw.get("makerAddress")
                  or raw.get("ownerAddress") or "").lower()
 
-        return RivalOffer(
+        return ParasiteOffer(
             collection_address=addr,
             collection_name=name,
             chain=chain,
@@ -4036,43 +2899,175 @@ class CounterBidder:
                               max_p, cfg_cur, converted, offer_currency)
                     return converted
                 return max_p
-        # No specific config → no cap (don't use chain defaults for rival scanner)
+        # No specific config → no cap (don't use chain defaults for parasite hunter)
         return None
 
-    # ── Phase 3: Sell side ─────────────────────────────────────
+    # ── Phase 4: Parasite Intel ─────────────────────────────────
 
-    def _get_best_offer_price(
-        self, client, chain: str, collection_address: str, decimals: int = 18,
-    ) -> float:
-        """Fetch highest active offer for a collection. Returns price in native units or 0."""
+    # Known marketplace contracts for approval checks
+    _MARKETPLACE_CONTRACTS = {
+        "bsc": {
+            "0x00000000000000adc04c56bf30ac9d3c0aaf14dc": "Seaport 1.5",
+            "0x00000000000001ad428e4906ae43d8f9852d0dd6": "Seaport 1.6",
+            "0xb4a437cae9a15cde291780c65a3cf8bbe7252fcc": "Element",
+        },
+        "eth": {
+            "0x00000000000000adc04c56bf30ac9d3c0aaf14dc": "Seaport 1.5",
+            "0x00000000000001ad428e4906ae43d8f9852d0dd6": "Seaport 1.6",
+            "0x000000000000ad05ccc4f10045630fb830b95127": "Blur",
+        }
+    }
+    _CURRENCY_TOKENS = {
+        "bsc": {
+            "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": ("WBNB", 18),
+            "0x55d398326f99059ff775485246999027b3197955": ("USDT", 18),
+            "0xe9e7cea3dedca5984780bafc599bd69add087d56": ("BUSD", 18),
+        },
+        "eth": {
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": ("WETH", 18),
+            "0xdac17f958d2ee523a2206206994597c13d831ec7": ("USDT", 6),
+        }
+    }
+
+    def _run_parasite_intel(self, chain: str) -> dict:
+        """Phase 4: Gather intelligence on all parasite wallets.
+
+        Checks:
+        - Token balances (how much $ each parasite has)
+        - Active OKX offers count per parasite
+        - Sends Telegram alert with top parasites + their capital
+
+        Returns summary dict.
+        """
+        import json as _json
+        import urllib.request as _req
+
+        chain_tokens = self._CURRENCY_TOKENS.get(chain, {})
+        rpc_url = getattr(self, '_settings', None)
+        if rpc_url:
+            rpc_url = getattr(rpc_url, 'sniper_rpc_url', None)
+        if not rpc_url:
+            rpc_url = {
+                "bsc": "https://bsc-dataseed.binance.org/",
+                "eth": "https://eth.llamarpc.com",
+            }.get(chain, "https://bsc-dataseed.binance.org/")
+
+        intel = {
+            "with_balance": 0,
+            "with_offers": 0,
+            "parasites": [],
+        }
+
+        for wallet in sorted(self.target_wallets):
+            balances = {}
+
+            # Check token balances via RPC
+            for token_addr, (token_name, decimals) in chain_tokens.items():
+                try:
+                    addr_padded = wallet.lower().replace('0x', '').zfill(64)
+                    call_data = '0x70a08231' + addr_padded
+                    payload = _json.dumps({
+                        'jsonrpc': '2.0', 'method': 'eth_call',
+                        'params': [{'to': token_addr, 'data': call_data}, 'latest'], 'id': 1,
+                    }).encode()
+                    req = _req.Request(rpc_url, data=payload,
+                                       headers={'Content-Type': 'application/json'})
+                    resp = _json.loads(_req.urlopen(req, timeout=5).read())
+                    raw = int(resp.get('result', '0x0'), 16)
+                    balance = raw / (10 ** decimals)
+                    if balance > 0.001:
+                        balances[token_name] = round(balance, 6)
+                except Exception:
+                    pass
+
+            # Native balance
+            try:
+                payload = _json.dumps({
+                    'jsonrpc': '2.0', 'method': 'eth_getBalance',
+                    'params': [wallet, 'latest'], 'id': 1,
+                }).encode()
+                req = _req.Request(rpc_url, data=payload,
+                                   headers={'Content-Type': 'application/json'})
+                resp = _json.loads(_req.urlopen(req, timeout=5).read())
+                raw = int(resp.get('result', '0x0'), 16)
+                native = raw / (10 ** 18)
+                native_name = "BNB" if chain == "bsc" else "ETH"
+                if native > 0.001:
+                    balances[native_name] = round(native, 6)
+            except Exception:
+                pass
+
+            # Count active OKX offers (via authenticated API)
+            # NOTE: priapi/v5/nft/ec/ endpoints are dead (404).
+            # Use authenticated API for wallet offer count.
+            offer_count = 0
+            try:
+                client = self._get_okx_client()
+                if client:
+                    my_offers = client.get_my_offers(chain=chain)
+                    # Filter to this wallet's offers
+                    offer_count = sum(
+                        1 for o in my_offers
+                        if (o.get("maker") or o.get("makerAddress") or "").lower() == wallet
+                    )
+            except Exception:
+                pass
+
+            if balances or offer_count > 0:
+                p_info = {
+                    "wallet": wallet,
+                    "balances": balances,
+                    "offers": offer_count,
+                }
+                intel["parasites"].append(p_info)
+                if balances:
+                    intel["with_balance"] += 1
+                if offer_count > 0:
+                    intel["with_offers"] += 1
+
+                bal_str = " ".join(f"{v}{k}" for k, v in balances.items())
+                log.info("  🕷 %s...%s: %s | %d offers",
+                         wallet[:10], wallet[-4:], bal_str or "no balance", offer_count)
+
+            time.sleep(0.1)  # RPC rate limit
+
+        # Send Telegram intel report
+        if intel["parasites"]:
+            self._send_parasite_intel_tg(chain, intel)
+
+        return intel
+
+    def _send_parasite_intel_tg(self, chain: str, intel: dict):
+        """Send parasite intel summary to Telegram."""
         try:
-            for path in (
-                "/api/v5/mktplace/nft/markets/collection-offers",
-                "/api/v5/mktplace/nft/markets/offers",
-            ):
-                resp = client._request(method="GET", path=path, params={
-                    "chain": chain,
-                    "collectionAddress": collection_address,
-                    "status": "active",
-                    "limit": "10",
-                })
-                data = resp.get("data", {})
-                items = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
-                best = 0.0
-                for item in items:
-                    raw = item.get("price", "0")
-                    try:
-                        p = int(raw) / (10 ** decimals) if str(raw).isdigit() else float(raw)
-                    except (ValueError, TypeError):
-                        continue
-                    if p > best:
-                        best = p
-                if best > 0:
-                    return best
-                time.sleep(0.2)
+            import json as _json, urllib.request as _req, os
+            bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+            if not bot_token or not chat_id:
+                return
+
+            lines = [f"🕷 <b>Parasite Intel — {chain.upper()}</b>\n"]
+            lines.append(f"С балансом: {intel['with_balance']}/{len(self.target_wallets)}")
+            lines.append(f"С офферами: {intel['with_offers']}/{len(self.target_wallets)}\n")
+
+            for p in sorted(intel["parasites"], key=lambda x: x["offers"], reverse=True)[:10]:
+                w = p["wallet"]
+                bal = " ".join(f"{v}{k}" for k, v in p["balances"].items()) or "—"
+                lines.append(f"<code>{w[:8]}...{w[-4:]}</code> | {p['offers']} offers | {bal}")
+
+            msg = "\n".join(lines)
+            payload = _json.dumps({
+                "chat_id": chat_id, "text": msg, "parse_mode": "HTML",
+            }).encode()
+            req = _req.Request(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                data=payload, headers={"Content-Type": "application/json"})
+            _req.urlopen(req, timeout=5)
+            log.info("📱 Parasite intel TG alert sent")
         except Exception as exc:
-            log.warning("_get_best_offer_price %s: %s", collection_address[:14], exc)
-        return 0.0
+            log.debug("Parasite intel TG failed: %s", exc)
+
+    # ── Phase 3: Sell side ─────────────────────────────────────
 
     def _run_sell_phase(self, chain: str) -> int:
         """Scan our wallet NFTs, list them at lowest_listing - step but above low_price.
@@ -4157,42 +3152,36 @@ class CounterBidder:
             log.warning("SELL PHASE %s: %d/%d NFTs DROPPED (no collection address field found!)",
                         chain.upper(), dropped_count, len(all_nfts))
 
-        # Safe default listing price for collections NOT in buy_config
-        _SELL_DEFAULT_PRICE = 0.1  # 0.1 BNB or 0.1 ETH
+        # Default prices from config (used when collection has no specific config)
+        chain_defaults = self.buy_config.get("defaults", {}).get(chain, {})
+        default_max_op = chain_defaults.get("max_offer_price", 0)
+        default_currency = chain_defaults.get("currency", "BNB" if chain == "bsc" else "ETH")
 
-        log.info("SELL PHASE %s: %d unique collections in wallet (default_price=%.2f)",
-                 chain.upper(), len(nfts_by_collection), _SELL_DEFAULT_PRICE)
+        log.info("SELL PHASE %s: %d unique collections in wallet (default max=%.4f %s)",
+                 chain.upper(), len(nfts_by_collection), default_max_op, default_currency)
         for col_addr, nfts in nfts_by_collection.items():
             cfg = collections_cfg.get(col_addr, {})
-            has_config = bool(cfg)
-
-            # ── Floor price: ONLY from collection-specific config, never chain defaults ──
-            sell_currency = cfg.get("currency", "WBNB" if chain == "bsc" else "WETH")
-            sell_decimals_pre = 18
-            if sell_currency.upper() in ("USDT", "USDC") and chain == "eth":
-                sell_decimals_pre = 6
-
             low_price = cfg.get("low_price")
             if not low_price:
+                # Auto-calculate: low_price = max_offer_price * 1.1
                 max_op = cfg.get("max_offer_price", 0)
+                if not max_op or max_op <= 0:
+                    # No collection-specific config — use chain defaults
+                    max_op = default_max_op
                 if max_op and max_op > 0:
                     low_price = round(max_op * 1.1, 6)
+                else:
+                    wl_info = self._wl_index.get(col_addr, {})
+                    coll_name = cfg.get("name") or wl_info.get("collection_name") or col_addr[:14]
+                    log.info("  SELL SKIP %s (%s): no low_price/max_offer_price in config (%d NFTs)",
+                             col_addr[:14], coll_name, len(nfts))
+                    continue  # No max_offer_price either → skip selling
 
-            if not low_price or low_price <= 0:
-                # PATCH 2026-05-29 (NO_CONFIG_DEFAULT_PRICE): collections without
-                # buy_config OR without price fields default to _SELL_DEFAULT_PRICE
-                # (0.1 BNB/ETH = "на шару"). No more market-floor lookup — the
-                # best_offer-as-floor path led to listing below low_price. ANTI_DUMP
-                # then handles undercut/refuse based on this default.
-                low_price = _SELL_DEFAULT_PRICE
-                log.info("  SELL %s: no config or no low_price → default %.4f %s",
-                         col_addr[:14], low_price, sell_currency)
-
+            sell_currency = cfg.get("currency", "WBNB" if chain == "bsc" else "WETH")
             currency_address = self._get_currency_address(sell_currency, chain)
             coll_name = cfg.get("name") or self._wl_index.get(col_addr, {}).get("collection_name") or col_addr[:14]
-            log.info("  SELL PROCESS %s (%s): %d NFTs, low_price=%.6f %s (config=%s)",
-                     col_addr[:14], coll_name, len(nfts), low_price, sell_currency,
-                     "yes" if has_config else "DEFAULT")
+            log.info("  SELL PROCESS %s (%s): %d NFTs, low_price=%.4f %s",
+                     col_addr[:14], coll_name, len(nfts), low_price, sell_currency)
 
             # Decimals for this currency
             sell_decimals = 18
@@ -4212,19 +3201,9 @@ class CounterBidder:
                 log.warning("SELL PHASE: listings fetch error for %s: %s", col_addr[:14], e)
                 continue
 
-            # Separate our listings vs rival listings
+            # Separate our listings vs enemy listings
             our_listings: list[dict] = []
-            cheapest_rival_price = None
-
-            # Debug: log first listing structure
-            if listings:
-                sample = listings[0]
-                log.info("  SELL DEBUG %s: %d listings, first keys=%s",
-                         col_addr[:14], len(listings), sorted(sample.keys()))
-                sample_seller = (sample.get("makerAddress") or sample.get("maker") or "MISSING")
-                log.info("  SELL DEBUG %s: wallet=%s, first_seller=%s",
-                         col_addr[:14], wallet[:14], str(sample_seller)[:14].lower())
-
+            cheapest_enemy_price = None
             for listing in listings:
                 seller = (listing.get("makerAddress") or listing.get("maker") or "").lower()
                 price_raw = listing.get("price", "0")
@@ -4242,89 +3221,34 @@ class CounterBidder:
                         "price": lprice,
                     })
                 else:
-                    if cheapest_rival_price is None or lprice < cheapest_rival_price:
-                        cheapest_rival_price = lprice
-
-            log.info("  SELL %s: %d our listings, cheapest_rival=%s",
-                     col_addr[:14], len(our_listings),
-                     f"{cheapest_rival_price:.6f}" if cheapest_rival_price else "NONE")
+                    if cheapest_enemy_price is None or lprice < cheapest_enemy_price:
+                        cheapest_enemy_price = lprice
 
             # Determine our target sell price
-            if cheapest_rival_price is None:
-                # No rival listings → list at safe default or low_price (whichever higher)
-                our_sell_price = max(low_price, _SELL_DEFAULT_PRICE) if not has_config else low_price
-                log.info("  SELL %s: no rival listings → price=%.6f (low_price=%.6f)",
-                         col_addr[:14], our_sell_price, low_price)
+            if cheapest_enemy_price is None:
+                # No enemy listings → list at low_price
+                our_sell_price = low_price
+                log.info("  SELL %s: no enemy listings → price=%.4f (low_price)",
+                         col_addr[:14], our_sell_price)
             else:
-                # Undercut cheapest rival by step
+                # Undercut cheapest enemy by step
                 step_factor = 1 - sell_bps / 10000
-                our_sell_price = cheapest_rival_price * step_factor
-                # Floor at low_price — never sell below what we'd buy at.
-                # PHANTOM-OFFER GUARD: if low_price comes from best_offer heuristic
-                # (no config), and it's more than 2x above cheapest rival listing,
-                # the "best offer" is almost certainly a phantom/troll bid. Don't
-                # let it clamp our listing to an unsellable price. (Real market
-                # bids never exceed the cheapest ask.)
+                our_sell_price = cheapest_enemy_price * step_factor
+                # Floor at low_price
                 if our_sell_price < low_price:
-                    # PATCH 2026-05-29 (ANTI_DUMP): always honor low_price as hard floor.
-                    # Previous behaviour ignored low_price for no-config when "looks phantom"
-                    # — that path is what listed our товар at $0.45 / $3.18. No more.
-                    log.warning(
-                        "  SELL %s: rival-undercut %.6f BELOW low_price %.6f → clamp to low_price (anti-dump). has_config=%s",
-                        col_addr[:14], our_sell_price, low_price, has_config,
-                    )
                     our_sell_price = low_price
-                # HARD FLOOR-CAP (patch #6): regardless of config / low_price,
-                # our listing must be strictly BELOW the cheapest rival ask.
-                # If anything earlier clamped us to >= cheapest_rival_price,
-                # the listing would be unsellable (real floor = cheapest_rival).
-                # Force-undercut rival by at least sell_bps. This protects
-                # against stale config low_price > current market floor (CR7
-                # Forever incident: config said 3.41 USDT but market crashed).
-                # PATCH 2026-05-29 (ANTI_DUMP): if rival is below low_price, REFUSE to
-                # list rather than chase them to the bottom. The previous FLOOR-CAP
-                # OVERRIDE would force our price below low_price to "stay sellable",
-                # which dumped good NFTs at $0.45 / $3.18.
-                floor_cap = cheapest_rival_price * step_factor
-                if low_price and floor_cap < low_price:
-                    log.warning(
-                        "  SELL %s: REFUSE LIST — to undercut rival %.6f we'd need %.6f < low_price %.6f. "
-                        "Holding inventory (anti-dump).",
-                        col_addr[:14], cheapest_rival_price, floor_cap, low_price,
-                    )
-                    continue
-                if our_sell_price > floor_cap:
-                    log.warning(
-                        "  SELL %s: our=%.6f > cheapest_rival_undercut=%.6f "
-                        "(low_price=%.6f, config=%s) — FLOOR-CAP OVERRIDE: "
-                        "rival above low_price, undercut OK",
-                        col_addr[:14], our_sell_price, floor_cap, low_price,
-                        "yes" if has_config else "no",
-                    )
-                    our_sell_price = floor_cap
-                # ── PATCH 2026-04-25: NEVER sell below low_price (profit-guard) ──
-                # Robert: blucamon was sold at 0.001442 < low_price 0.00145.
-                # The rival-undercut override IGNORED low_price. Hard-clamp now.
-                if has_config and low_price and our_sell_price < low_price:
-                    log.warning(
-                        "  SELL %s: rival-undercut=%.6f < low_price=%.6f — "
-                        "CLAMP TO LOW_PRICE (profit-guard active)",
-                        col_addr[:14], our_sell_price, low_price,
-                    )
-                    our_sell_price = low_price
-                log.info("  SELL %s: rival_cheapest=%.6f → our=%.6f (floor=%.6f)",
-                         col_addr[:14], cheapest_rival_price, our_sell_price, low_price)
+                log.info("  SELL %s: enemy_cheapest=%.4f → our=%.4f (floor=%.4f)",
+                         col_addr[:14], cheapest_enemy_price, our_sell_price, low_price)
 
-            # ── Re-list: cancel our listings that are ABOVE target price ──
-            # Only re-list if our price is >0.5% above the target.
-            # If we're already at floor (target), don't cancel — we can't go lower.
+            # ── Re-list: cancel our listings that are MORE expensive than target ──
             our_listed_token_ids = set()
             for ol in our_listings:
                 our_listed_token_ids.add(ol["token_id"])
-                if our_sell_price > 0 and ol["price"] > our_sell_price * 1.005:
-                    # Our listing is significantly above target → cancel and re-list lower
-                    log.info("  SELL RE-LIST %s #%s: our=%.6f > target=%.6f → cancel & re-list",
-                             col_addr[:14], ol["token_id"], ol["price"], our_sell_price)
+                if cheapest_enemy_price is not None and ol["price"] > cheapest_enemy_price:
+                    # Enemy undercut us! Cancel and re-list
+                    log.info("  SELL RE-LIST %s #%s: our=%.4f > enemy=%.4f → cancel & re-list at %.4f",
+                             col_addr[:14], ol["token_id"], ol["price"],
+                             cheapest_enemy_price, our_sell_price)
                     if not self.dry_run:
                         try:
                             client.cancel_listing(ol["order_id"])
@@ -4334,9 +3258,9 @@ class CounterBidder:
                         time.sleep(0.5)
                     # Will be re-listed below as if unlisted
                     our_listed_token_ids.discard(ol["token_id"])
-                else:
-                    # Our listing is at or below target — keep it
-                    log.debug("  SELL KEEP %s #%s: listed at %.6f ≤ target %.6f",
+                elif ol["price"] <= our_sell_price:
+                    # Our listing is already cheapest or at/below target — keep it
+                    log.debug("  SELL %s #%s: already listed at %.4f ≤ target %.4f — keep",
                               col_addr[:14], ol["token_id"], ol["price"], our_sell_price)
 
             # ── List unlisted NFTs + re-list cancelled ones ──
@@ -4347,7 +3271,7 @@ class CounterBidder:
                 if token_id in our_listed_token_ids:
                     continue  # Already listed at good price
 
-                if self.dry_run or self._sell_dry_run:
+                if self.dry_run:
                     log.info("  SELL DRY-RUN: %s #%s at %.4f %s",
                              col_addr[:14], token_id, our_sell_price, sell_currency)
                     placed += 1
@@ -4411,9 +3335,9 @@ class CounterBidder:
             pass
 
     def _alert_undercut(self, collection_name: str, token_id: str,
-                        chain: str, rival_price: float, our_price: float,
-                        rival_cur: str, our_cur: str,
-                        rival_usd: float, our_usd: float,
+                        chain: str, parasite_price: float, our_price: float,
+                        parasite_cur: str, our_cur: str,
+                        parasite_usd: float, our_usd: float,
                         dry: bool = False,
                         collection_address: str = ""):
         dry_tag = " [DRY]" if dry else ""
@@ -4441,14 +3365,14 @@ class CounterBidder:
                 display_name = f"{full_addr[:8]}…{full_addr[-4:]}" if len(full_addr) > 14 else full_addr
 
         # Currency display
-        if rival_cur == our_cur:
+        if parasite_cur == our_cur:
             price_line = (
-                f"Соперник: {rival_price:.4f} {rival_cur} (${rival_usd:.2f})\n"
+                f"Паразит: {parasite_price:.4f} {parasite_cur} (${parasite_usd:.2f})\n"
                 f"Наш: {our_price:.4f} {our_cur} (${our_usd:.2f})"
             )
         else:
             price_line = (
-                f"Соперник: {rival_price:.4f} {rival_cur} (${rival_usd:.2f})\n"
+                f"Паразит: {parasite_price:.4f} {parasite_cur} (${parasite_usd:.2f})\n"
                 f"Наш: {our_price:.4f} {our_cur} (${our_usd:.2f}) ⚡️конверт"
             )
 
@@ -4465,7 +3389,7 @@ class CounterBidder:
             msg = (
                 f"🎯 Скан v4 — чисто\n"
                 f"Чейны: {', '.join(c.upper() for c in report.chains_scanned)}\n"
-                f"Соперников: {len(self.target_wallets)} | Друзей: {len(self.friend_wallets)}\n"
+                f"Паразитов: {len(self.target_wallets)} | Друзей: {len(self.friend_wallets)}\n"
                 f"Время: {report.scan_duration_sec:.1f}с | #{self.total_scans}"
             )
             self._tg_send(msg)
@@ -4507,7 +3431,7 @@ class CounterBidder:
             f"  ✅ Уже лучшие: {report.wl_already_best}\n"
             f"  🤝 Друзья/свои: {self._friend_skipped_count}\n"
             f"{'─' * 22}\n"
-            f"🕷 Фаза 2 — non-WL соперникы:\n"
+            f"🕷 Фаза 2 — non-WL паразиты:\n"
             f"  Коллекций: {report.nonwl_collections}\n"
             f"  Офферов: {report.nonwl_offers_found}\n"
             f"  Перебито: {report.nonwl_undercuts_placed}\n"
@@ -4515,7 +3439,7 @@ class CounterBidder:
             + "\n".join(coll_lines) + "\n"
             f"{'─' * 22}\n"
             f"💰 BNB=${bnb:.0f} ETH=${eth:.0f}\n"
-            f"Соперников: {len(self.target_wallets)} | Друзей: {len(self.friend_wallets)}\n"
+            f"Паразитов: {len(self.target_wallets)} | Друзей: {len(self.friend_wallets)}\n"
             f"Макс WL: ${self.max_usd:.2f} | non-WL: ${self.nonwl_max_usd:.4f}\n"
             f"Валюты: {','.join(self.offer_currencies)}\n"
             f"Чейны: {', '.join(c.upper() for c in report.chains_scanned)}\n"
@@ -4526,7 +3450,7 @@ class CounterBidder:
     # ── Dashboard / status ─────────────────────────────────────
 
     def get_status(self) -> dict[str, Any]:
-        """Return current scanner status for API/dashboard."""
+        """Return current hunter status for API/dashboard."""
         report = self.last_report
         return {
             "enabled": self.enabled,
