@@ -1,0 +1,196 @@
+# Public-repository gates.
+#
+# R1 could not go green here: `compileall -q src tests scripts` named a
+# `tests/` directory that does not exist, and a bare recursive `pytest -q`
+# collected the vendored duplicate of the whole project under
+# config/okx_nft_bot_v13_hardened/ and failed with 4 collection errors.
+#
+# R2 fixed those but left two holes, both closed below:
+#
+#   * `branches-ignore: [master, main]` meant a direct push to the default
+#     branch ran no gates at all -- exactly the push that matters most. The
+#     workflow now runs on every push and on pull requests, and assumes no
+#     branch protection exists.
+#   * the import smoke test ran against the editable source checkout, so it
+#     proved the repository imports, not that the artifact does. It now
+#     installs dist/*.whl into a throwaway venv and imports from a directory
+#     outside the repository, asserting every module resolves inside that
+#     venv.
+#
+# Nothing is installed in editable mode anywhere in this workflow, so the
+# checkout cannot satisfy an import by accident.
+
+name: public-repo-gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install build tooling only
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Compile sources that actually exist
+        run: |
+          set -euo pipefail
+          targets=""
+          for d in src scripts; do
+            if [ -d "$d" ]; then targets="$targets $d"; fi
+          done
+          if [ -z "$targets" ]; then
+            echo "no compile targets found" >&2
+            exit 1
+          fi
+          echo "compiling:$targets"
+          # shellcheck disable=SC2086
+          python -m compileall -q $targets
+
+      - name: Scanner self-tests
+        run: python scripts/ci_public_repo_scan.py --self-test
+
+      - name: Public repository scan
+        run: |
+          python scripts/ci_public_repo_scan.py \
+            --root . \
+            --output PUBLIC_REPO_SCAN_RECEIPT.json
+
+      - name: Repository-owned tests or explicit NO_ROOT_TESTS
+        env:
+          DRY_RUN: "1"
+          SELL_DRY_RUN: "1"
+        run: |
+          set -euo pipefail
+          # Only tests this repository owns. The vendored copy under
+          # config/okx_nft_bot_v13_hardened/ belongs to a bundled snapshot and
+          # is deliberately out of scope.
+          git ls-files -z 'test_*.py' '*/test_*.py' '*_test.py' '*/*_test.py' \
+            | tr '\0' '\n' \
+            | grep -v '^config/okx_nft_bot_v13_hardened/' \
+            | sort -u > owned_tests.txt || true
+          count=$(wc -l < owned_tests.txt | tr -d ' ')
+          echo "owned test files: $count"
+          if [ "$count" -gt 0 ]; then
+            echo '{"test_mode":"OWNED_TESTS","count":'"$count"'}' > TEST_MODE_RECEIPT.json
+            python -m pip install ".[dev]"
+            xargs -a owned_tests.txt python -m pytest -q
+          else
+            echo '{"test_mode":"NO_ROOT_TESTS","count":0,"reason":"repository owns no test files outside the vendored snapshot"}' > TEST_MODE_RECEIPT.json
+            echo "NO_ROOT_TESTS"
+          fi
+
+      - name: Build wheel and verify CRC
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          python -m pip wheel . --no-deps -w dist
+          python - <<'PY'
+          import hashlib
+          import json
+          import zipfile
+          from pathlib import Path
+
+          wheels = list(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          wheel = wheels[0]
+          with zipfile.ZipFile(wheel) as zf:
+              assert zf.testzip() is None, "wheel CRC check failed"
+              members = len(zf.namelist())
+          json.dump({"wheel": wheel.name, "crc": "OK", "members": members,
+                     "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()},
+                    open("WHEEL_RECEIPT.json", "w"), indent=2)
+          print(wheel, "members:", members)
+          PY
+
+      - name: Import smoke against the built wheel in a fresh venv
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/*.whl)
+          wheel_abs=$(readlink -f "$wheel")
+          repo_root=$(pwd)
+          venv_dir="${RUNNER_TEMP:-/tmp}/wheel-smoke-venv"
+          probe_dir="${RUNNER_TEMP:-/tmp}/wheel-smoke-cwd"
+          rm -rf "$venv_dir" "$probe_dir"
+          mkdir -p "$probe_dir"
+
+          # No --system-site-packages: the venv sees only what we install.
+          python -m venv "$venv_dir"
+          "$venv_dir/bin/python" -m pip install --upgrade pip >/dev/null
+          "$venv_dir/bin/python" -m pip install "$wheel_abs"
+
+          # Run from outside the repository so the checkout cannot satisfy an
+          # import, and write the receipt back into the repo root.
+          cd "$probe_dir"
+          REPO_ROOT="$repo_root" WHEEL_PATH="$wheel_abs" VENV_DIR="$venv_dir" \
+            "$venv_dir/bin/python" - <<'PY'
+          import hashlib
+          import importlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          repo_root = Path(os.environ["REPO_ROOT"]).resolve()
+          wheel = Path(os.environ["WHEEL_PATH"]).resolve()
+          venv_dir = Path(os.environ["VENV_DIR"]).resolve()
+
+          assert repo_root not in Path.cwd().parents and Path.cwd() != repo_root, \
+              "smoke test must run outside the repository"
+
+          modules = ["okx_nft_bot", "okx_nft_bot.config", "okx_nft_bot.clients.http"]
+          resolved = {}
+          for name in modules:
+              module = importlib.import_module(name)
+              origin = Path(getattr(module, "__file__", "") or "").resolve()
+              # The import must come from the venv, never from the checkout.
+              assert venv_dir in origin.parents, f"{name} resolved outside venv: {origin}"
+              assert repo_root not in origin.parents, f"{name} resolved from checkout: {origin}"
+              resolved[name] = str(origin)
+
+          receipt = {
+              "import_smoke": "PASS",
+              "source": "built wheel installed into a throwaway venv",
+              "wheel": wheel.name,
+              "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+              "venv_interpreter": sys.executable,
+              "cwd": str(Path.cwd()),
+              "repository_root": str(repo_root),
+              "editable_install": False,
+              "modules": resolved,
+          }
+          out = repo_root / "IMPORT_SMOKE_RECEIPT.json"
+          out.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(receipt, indent=2))
+          PY
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-repo-gates-py${{ matrix.python-version }}
+          path: |
+            PUBLIC_REPO_SCAN_RECEIPT.json
+            TEST_MODE_RECEIPT.json
+            IMPORT_SMOKE_RECEIPT.json
+            WHEEL_RECEIPT.json
+          if-no-files-found: warn
