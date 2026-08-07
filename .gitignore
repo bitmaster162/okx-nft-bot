@@ -12,9 +12,30 @@ config/okx_cookies.json
 config/*.bak
 config/*_export.json
 
-# Kimi/Cowork scratch scripts and timestamp backups
+# Local agent settings and host-only permissions
+.claude/settings.local.json
+.claude/*.local.json
+
+# Runtime state and local evidence
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.log
+*.pid
+*.sock
+audit_chain*.jsonl
+
+# Scratch patches, backups, exports, and local copies
+*.bak
+*.bak-*
 *.bak.*
+_patch_*.py
+patch_*.py
 arm_*.py
 find_*.py
 check_*.py
 stats.py
+config/*cookies*.json
+config/*secret*.json
+config/*token*.json
