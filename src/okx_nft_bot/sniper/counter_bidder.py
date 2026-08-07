@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import math
 import os
 import re as _re
 import threading
@@ -132,6 +133,20 @@ class PriceFetcher:
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
+
+
+def _finite_positive(value) -> bool:
+    """True только для конечного числа строго больше нуля.
+
+    PATCH 2026-08-07 (BALANCE_CAP_FAIL_CLOSED): один предикат на все проверки
+    достоверности баланса, чтобы None, "", NaN, inf, 0 и отрицательные значения
+    отсекались единообразно и ни одно из них не могло стать разрешением.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and v > 0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -1789,6 +1804,74 @@ class CounterBidder:
 
     # ── Undercut logic ────────────────────────────────────────
 
+    # ── PATCH 2026-08-07 (BALANCE_CAP_FAIL_CLOSED) ──
+    # Ревизия: прежний код при недоступном балансе откатывался на потолок из
+    # .env. Это fail-OPEN — не зная баланса, инвариант "cap <= баланс × ratio"
+    # доказать невозможно, то есть балансный гейт в этот момент выключался, а
+    # оффер всё равно уходил. Финансовое действие с неизвестным обеспечением
+    # должно НЕ ОТПРАВЛЯТЬСЯ, а не исполняться по запасному потолку.
+    #
+    # Возвращать 0 как признак "нельзя" нельзя: в этом коде 0 исторически
+    # значит "лимит не задан" (ср. `_chain_max if _chain_max > 0 else ...`),
+    # и ноль здесь СНЯЛ БЫ ограничение вместо запрета. Поэтому отдельный
+    # sentinel-объект: сравнивается по identity, ни во что не приводится и
+    # вызывающий обязан трактовать его как запрет.
+    BALANCE_CAP_UNAVAILABLE = object()
+
+    def _resolve_balance_cap(self, our_cur: str, chain: str, env_cap: float):
+        """Эффективный потолок в USD либо BALANCE_CAP_UNAVAILABLE.
+
+        Инвариант при включённом балансовом потолке:
+            баланс достоверен   -> min(env_cap, баланс × ratio)
+            баланс недостоверен -> BALANCE_CAP_UNAVAILABLE, submit запрещён
+
+        Недостоверным считается всё, что не является конечным положительным
+        числом: исключение RPC, пустой адрес валюты, None, ноль, отрицательное,
+        NaN, inf, нечисловое, а также сбой пересчёта в USD.
+
+        COUNTERBID_BALANCE_CAP_ENABLED=0 — единственный путь вернуться к режиму
+        .env как самостоятельному. Это осознанный выбор конфигурации, а не
+        молчаливый откат при отказе.
+        """
+        if not _env_bool("COUNTERBID_BALANCE_CAP_ENABLED", True):
+            return float(env_cap)
+
+        ratio = _env_float("COUNTERBID_BALANCE_CAP_RATIO", 0.95)
+        if not _finite_positive(ratio):
+            log.warning("[BALANCE_CAP] некорректный ratio %r — запрещаю оффер", ratio)
+            return self.BALANCE_CAP_UNAVAILABLE
+
+        try:
+            addr = self._get_currency_address(our_cur, chain)
+        except Exception as exc:
+            log.debug("[BALANCE_CAP] адрес валюты не получен: %s", exc)
+            return self.BALANCE_CAP_UNAVAILABLE
+        if not addr:
+            return self.BALANCE_CAP_UNAVAILABLE
+
+        try:
+            units = self._get_balance(addr)
+        except Exception as exc:
+            log.debug("[BALANCE_CAP] баланс не прочитан: %s", exc)
+            return self.BALANCE_CAP_UNAVAILABLE
+        if not _finite_positive(units):
+            return self.BALANCE_CAP_UNAVAILABLE
+
+        try:
+            usd = self.prices.to_usd(float(units), our_cur)
+        except Exception as exc:
+            log.debug("[BALANCE_CAP] пересчёт в USD не удался: %s", exc)
+            return self.BALANCE_CAP_UNAVAILABLE
+        if not _finite_positive(usd):
+            return self.BALANCE_CAP_UNAVAILABLE
+
+        bal_cap = float(usd) * float(ratio)
+        if not _finite_positive(bal_cap):
+            return self.BALANCE_CAP_UNAVAILABLE
+
+        _env = float(env_cap) if _finite_positive(env_cap) else 0.0
+        return min(_env, bal_cap) if _env > 0 else bal_cap
+
     def _undercut_collection(self, collection_address: str,
                               offers: list[RivalOffer],
                               chain: str,
@@ -1974,13 +2057,61 @@ class CounterBidder:
         # Determine cap
         # PATCH 2026-04-26: pick chain-specific max for WL (Phase 1)
         _chain_max = self.max_usd_eth if chain == "eth" else self.max_usd
-        global_cap = _chain_max if is_wl else self.nonwl_max_usd
+
+        # PATCH 2026-08-06 (BALANCE_CAP): потолок считаем ОТ БАЛАНСА, а не от
+        # фиксированного числа в .env.
+        #
+        # Офферы Seaport не морозят средства: подписанный оффер ничего не
+        # блокирует, деньги лежат свободно и списываются только когда кто-то
+        # оффер принимает. Значит ограничение "суммарно по всем офферам" не
+        # существует — ограничение ровно одно: ОДИН оффер должен быть покрыт
+        # балансом в момент исполнения.
+        #
+        # Из этого следует, что жёсткие COUNTERBID_MAX_USD / _MAX_USD_ETH были
+        # не тем инструментом: при балансе $5.36 потолок $3 оставлял треть
+        # средств неиспользованной, а при падении баланса ниже $3 — наоборот
+        # пропускал офферы, которые нечем обеспечить.
+        #
+        # Теперь: потолок = баланс рабочей валюты × BALANCE_CAP_RATIO. Значение
+        # из .env остаётся ВЕРХНЕЙ границей (страховка от опечатки в ратио), но
+        # НЕ является запасным вариантом: если баланс недостоверен, оффер не
+        # отправляется вовсе — см. _resolve_balance_cap.
+        _env_cap_before = float(_chain_max or 0)
+        _cap_res = self._resolve_balance_cap(our_cur, chain, _chain_max)
+        if _cap_res is self.BALANCE_CAP_UNAVAILABLE:
+            # fail-closed: обеспечение неизвестно -> действие запрещено.
+            # Это штатный пропуск коллекции (skipped=1), не ошибка.
+            log.warning(
+                "  ⛔ %s: баланс %s недостоверен — оффер ЗАПРЕЩЁН (fail-closed); "
+                "потолок $%.2f из .env намеренно НЕ применяется",
+                name, our_cur, _env_cap_before)
+            return HuntResult(addr, name, chain, len(offers), 0, 0, 1)
+        _chain_max = float(_cap_res)
+        if abs(_chain_max - _env_cap_before) > 1e-9:
+            log.info("  💰 %s: потолок по балансу (%s) — из .env $%.2f, беру $%.2f",
+                     name, our_cur, _env_cap_before, _chain_max)
+
+        global_cap = _chain_max if is_wl else min(self.nonwl_max_usd,
+                                                 _chain_max if _chain_max > 0 else self.nonwl_max_usd)
         coll_max = self._get_max_price(addr, chain, our_cur)
         has_collection_config = coll_max is not None
         if has_collection_config:
             coll_max_usd = self.prices.to_usd(coll_max, our_cur)
             cap_usd = coll_max_usd if coll_max_usd > 0 else global_cap
         else:
+            cap_usd = global_cap
+
+        # PATCH 2026-08-06 (CAP_CLAMP): глобальный потолок должен быть ПОТОЛКОМ.
+        # Раньше конфиг коллекции полностью перебивал COUNTERBID_MAX_USD / _MAX_USD_ETH,
+        # и величина с именем "максимум" работала как значение по умолчанию.
+        # Замер 2026-08-06: из 303 эфирных коллекций у 217 (72%) потолок выше $3,
+        # у 182 (60%) выше всего баланса WETH ($5.36), медиана $8.23, максимум $2000.
+        # Бот подписывал офферы, которые не мог обеспечить, OKX отклонял их с
+        # "This order is no longer valid" — 4722 неудачных оффера за сутки.
+        # Теперь конфиг коллекции может только ОПУСКАТЬ потолок, не поднимать.
+        if global_cap and global_cap > 0 and cap_usd > global_cap:
+            log.info("  🧢 %s: потолок коллекции $%.2f выше глобального $%.2f — зажимаю",
+                     name, cap_usd, global_cap)
             cap_usd = global_cap
 
         # ── DYNAMIC QTY (B1 restored, 3-pool 2026-04-25): qty = budget_usd / cap_usd ──
@@ -3338,9 +3469,142 @@ class CounterBidder:
         if chain == "bsc":
             return self._submit_bsc(collection_address, token_id, price, currency,
                                     quantity=quantity, duration_hours=duration_hours)
-        else:
-            return self._submit_eth(collection_address, token_id, price, currency,
-                                    quantity=quantity, duration_hours=duration_hours)
+
+        _ok = self._submit_eth(collection_address, token_id, price, currency,
+                               quantity=quantity, duration_hours=duration_hours)
+        # PATCH 2026-08-06 (OPENSEA_MIRROR): тот же оффер дублируем на OpenSea.
+        # Зеркалим ТОЛЬКО после успеха на OKX — так наследуется взвод (не взведён →
+        # _submit_eth вернёт False → на OpenSea тоже ничего не уйдёт) и все проверки
+        # выше по стеку: потолок $3, защита от пола, анти-вошь, релевантность 20%.
+        if _ok:
+            try:
+                self._mirror_to_opensea(collection_address, price, currency, duration_hours)
+            except Exception as _e_os:
+                log.warning("[OPENSEA] зеркало упало: %s", _e_os)
+        return _ok
+
+    def _mirror_to_opensea(self, collection_address: str, price: float,
+                           currency: str, duration_hours: int = 720) -> bool:
+        """PATCH 2026-08-06: коллекционный оффер на OpenSea тем же ордером Seaport.
+
+        Клиент okx_nft_bot.clients.opensea был полностью написан (484 строки,
+        сборка ордера, подпись EIP-712, отправка), создавался при старте и писал
+        в лог "OpenSea offers: ENABLED" — но НИ ОДИН его метод нигде не вызывался.
+        Проверка 2026-08-06: 36 упоминаний opensea_client во всём src, все до
+        единого — присваивания, проверки на None и лог. Ноль вызовов.
+
+        Рубильники (оба выключены по умолчанию, включать осознанно):
+          OPENSEA_OFFERS_ENABLED=1  — вообще разрешить зеркало
+          OPENSEA_DRY_RUN=0         — перестать притворяться и слать по-настоящему
+
+        Помни про кошелёк: оффер на OKX и оффер на OpenSea живут одновременно и
+        оба тянут из одного баланса WETH. Принять могут любой.
+        """
+        if not self.opensea_enabled or self.opensea_client is None:
+            return False
+        if _env("OPENSEA_OFFERS_ENABLED", "0") not in ("1", "true", "yes", "on"):
+            return False
+
+        cur = (currency or "").upper()
+        if cur != "WETH":
+            # OpenSea принимает коллекционные офферы только в ERC-20 (WETH).
+            log.info("  [OPENSEA] %s: валюта %s не WETH — зеркалить нечем",
+                     collection_address[:14], cur)
+            return False
+
+        # Кулдаун на коллекцию, чтобы не наставить дублей за один проход.
+        if not hasattr(self, "_opensea_last"):
+            self._opensea_last = {}
+        _key = collection_address.lower()
+        _now = time.time()
+        _cool = float(_env("OPENSEA_COOLDOWN_S", "600") or 600)
+        if _now - self._opensea_last.get(_key, 0) < _cool:
+            return False
+
+        currency_address = self._get_currency_address("WETH", "eth")
+        if not currency_address:
+            log.warning("  [OPENSEA] не нашёл адрес WETH — пропуск")
+            return False
+
+        # PATCH 2026-08-07 (OPENSEA_TICK): OpenSea принимает биды только по сетке.
+        # Ответ API дословно: "Bids at this price are not allowed. Please place a bid
+        # in the nearest allowed increment. 4 decimals allowed. Received 0.000101 per
+        # unit, expected 0.0001." Наш перебой в 50 bps (COUNTERBID_UNDERCUT_BPS) даёт
+        # шестой знак, поэтому зеркало падало на КАЖДОЙ попытке: 10 из 10 за 12 часов,
+        # все с HTTP 400. На OKX шаг мелкий и те же 50 bps проходят — отсюда и разница.
+        #
+        # Округляем ВВЕРХ (решение Роберта 2026-08-07): вниз — это ровно цена соперника,
+        # а при равной цене выигрывает вставший раньше, то есть он. Вверх мы реально
+        # перебиваем, но на таких величинах шаг сетки почти удваивает бид, поэтому
+        # результат проверяется по потолку = min(баланс WETH x ratio, COUNTERBID_MAX_USD_ETH).
+        # Не прошло — лот пропускаем, а не режем цену обратно под сетку.
+        _tick = _env_float("OPENSEA_TICK_WETH", 0.0001)
+        if _tick > 0:
+            _steps = int(float(price) / _tick)
+            if _steps * _tick < float(price) - 1e-12:
+                _steps += 1
+            _snapped = round(_steps * _tick, 8)
+            if _snapped > float(price):
+                _os_cap = _env_float("COUNTERBID_MAX_USD_ETH", 0.0)
+                try:
+                    _os_bal = self._get_balance(currency_address)
+                    _os_bal_cap = (self.prices.to_usd(_os_bal, "WETH")
+                                   * _env_float("COUNTERBID_BALANCE_CAP_RATIO", 0.95))
+                    if _os_bal_cap > 0:
+                        _os_cap = min(_os_cap, _os_bal_cap) if _os_cap > 0 else _os_bal_cap
+                except Exception as _e_oc:
+                    log.debug("  [OPENSEA] баланс для потолка не прочитан: %s", _e_oc)
+                try:
+                    _snap_usd = self.prices.to_usd(_snapped, "WETH")
+                except Exception:
+                    _snap_usd = 0.0
+                if _os_cap > 0 and _snap_usd > _os_cap:
+                    log.info("  [OPENSEA] %s: сетка поднимает %.6f -> %.6f WETH ($%.4f) "
+                             "выше потолка $%.2f — пропускаю",
+                             collection_address[:14], price, _snapped, _snap_usd, _os_cap)
+                    return False
+                log.info("  [OPENSEA] %s: %.6f -> %.6f WETH по сетке %.4f ($%.4f, потолок $%.2f)",
+                         collection_address[:14], price, _snapped, _tick, _snap_usd, _os_cap)
+            price = _snapped
+
+        price_wei = int(round(float(price) * 1e18))
+        if price_wei <= 0:
+            return False
+        valid_time = int(_now) + int(duration_hours) * 3600
+
+        _dry = _env("OPENSEA_DRY_RUN", "1") in ("1", "true", "yes", "on")
+        if _dry:
+            log.info("  🌊 [OPENSEA][DRY] %s: поставил бы коллекционный оффер "
+                     "%.6f WETH (%d wei), срок %d ч",
+                     collection_address[:14], price, price_wei, duration_hours)
+            self._opensea_last[_key] = _now
+            return True
+
+        try:
+            resp = self.opensea_client.create_opensea_offer(
+                chain="eth",
+                collection_address=collection_address,
+                token_id=None,
+                price_wei=price_wei,
+                currency_address=currency_address,
+                valid_time=valid_time,
+            )
+        except Exception as exc:
+            log.warning("  ❌ [OPENSEA] %s: оффер не ушёл: %s",
+                        collection_address[:14], exc)
+            self._record_execution_submit_event(
+                chain="eth", collection=collection_address, price_bnb=price,
+                status="failed", reason=f"opensea: {exc}"[:200])
+            return False
+
+        self._opensea_last[_key] = _now
+        _oid = (resp or {}).get("order_id") or (resp or {}).get("offer_id") or "?"
+        log.info("  🌊 [OPENSEA] %s: оффер принят %.6f WETH, id=%s",
+                 collection_address[:14], price, _oid)
+        self._record_execution_submit_event(
+            chain="eth", collection=collection_address, price_bnb=price,
+            status="submitted", reason=f"opensea order_id={_oid}")
+        return True
 
     # ── Balance cache + low-balance alerting ──
     _BALANCE_CACHE_TTL = 120  # refresh every 2 min
