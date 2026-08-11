@@ -146,7 +146,7 @@ def test_collection_cap_cannot_raise_global_cap(monkeypatch):
 
     def capture_alert(*args, **kwargs):
         observed["our_usd"] = args[8]
-        observed["our_price"] = args[5]
+        observed["our_price"] = args[4]
 
     bidder._alert_undercut = capture_alert
     offer = RivalOffer(
