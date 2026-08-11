@@ -301,6 +301,7 @@ class ExecutionGovernor:
 
         completed_at = datetime.now(timezone.utc).isoformat()
         self.state.set_runtime_value("last_reconcile_at", completed_at)
+        self.state.set_runtime_value(f"last_reconcile_at_{resolved_chain}", completed_at)
         self.state.set_runtime_value("last_reconcile_chain", resolved_chain)
         self.state.set_runtime_value("last_reconcile_exchange_seen", exchange_seen := len(exchange_offers))
         self.state.set_runtime_value("last_reconcile_local_active_seen", len(local_active))
