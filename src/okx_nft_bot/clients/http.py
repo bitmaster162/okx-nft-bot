@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 import threading
 import time
 from typing import Any, Mapping
@@ -59,7 +60,7 @@ _rpc_global_lock = threading.Lock()
 
 
 def get_rpc_global_limiter(rate_per_sec: float = 10.0) -> RateLimiter:
-    """Get or create the shared RPC rate limiter (uses slowest rate)."""
+    """Get the shared RPC rate limiter (uses slowest rate)."""
     global _rpc_global_limiter
     with _rpc_global_lock:
         if _rpc_global_limiter is None:
@@ -85,6 +86,28 @@ def get_rpc_transport(timeout: int = 5, max_retries: int = 2, rate_per_sec: floa
     return _rpc_transport
 
 
+_TELEGRAM_BOT_TOKEN_PATH_RE = re.compile(r"^/bot[^/]+")
+
+
+def _redact_sensitive_url(url: str) -> str:
+    """Return a log-safe URL without path-embedded credentials.
+
+    Telegram embeds the bot token directly in the request path as
+    ``/bot<TOKEN>/method``. HTTP requests must keep using the original URL,
+    but structured logs must never persist that credential.
+    """
+    try:
+        parsed = parse.urlsplit(url)
+    except (TypeError, ValueError):
+        return url
+    if (parsed.hostname or "").lower() != "api.telegram.org":
+        return url
+    redacted_path = _TELEGRAM_BOT_TOKEN_PATH_RE.sub("/bot<redacted>", parsed.path, count=1)
+    if redacted_path == parsed.path:
+        return url
+    return parse.urlunsplit((parsed.scheme, parsed.netloc, redacted_path, parsed.query, parsed.fragment))
+
+
 @dataclass(slots=True)
 class StdlibHttpTransport:
     timeout: int
@@ -107,6 +130,7 @@ class StdlibHttpTransport:
         body: str = "",
     ) -> dict[str, Any]:
         method = method.upper()
+        log_url = _redact_sensitive_url(url)
         for attempt in range(1, self.max_retries + 1):
             self._rate_limiter.wait()
             started = time.monotonic()
@@ -120,17 +144,17 @@ class StdlibHttpTransport:
                 )
                 latency_ms = round((time.monotonic() - started) * 1000, 2)
                 if resp.ok:
-                    log_event("http_ok", method=method, url=url, status=resp.status_code, latency_ms=latency_ms)
+                    log_event("http_ok", method=method, url=log_url, status=resp.status_code, latency_ms=latency_ms)
                     return resp.json()
                 body_text = resp.text
-                log_event("http_error", method=method, url=url, status=resp.status_code, attempt=attempt, latency_ms=latency_ms, body=body_text[:300])
+                log_event("http_error", method=method, url=log_url, status=resp.status_code, attempt=attempt, latency_ms=latency_ms, body=body_text[:300])
                 if resp.status_code == 429 or 500 <= resp.status_code < 600:
                     if attempt < self.max_retries:
                         self._sleep_backoff(attempt, resp.headers)
                         continue
                 raise HTTPStatusError(status=resp.status_code, body=body_text, headers=dict(resp.headers))
             except _curl_requests.errors.RequestsError as exc:
-                log_event("http_transport_error", method=method, url=url, attempt=attempt, detail=str(exc))
+                log_event("http_transport_error", method=method, url=log_url, attempt=attempt, detail=str(exc))
                 if attempt < self.max_retries:
                     self._sleep_backoff(attempt, None)
                     continue
