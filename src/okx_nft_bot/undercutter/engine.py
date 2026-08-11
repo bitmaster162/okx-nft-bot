@@ -140,52 +140,124 @@ class UndercutEngine:
             self._apply_action(action)
         return actions
 
+    def _live_withdraw_block_reason(self) -> str | None:
+        """Gate ordinary live withdrawals without applying offer spend/rate caps.
+
+        A normal undercutter withdrawal is still an external execution effect, so
+        it must not run while configured/forced dry-run is active or outside the
+        explicit live-arm window.  Emergency killswitch cancellation deliberately
+        uses its separate coordinator and does not call this helper.
+        """
+        if self.governor.effective_dry_run():
+            return "dry_run_enabled"
+        arm_state = self.governor.get_live_arm_state(now=datetime.now(timezone.utc))
+        if not arm_state["armed"]:
+            if arm_state.get("expires_at"):
+                return "live arm expired"
+            return "live arm required"
+        return None
+
     def _apply_action(self, action: UndercutAction) -> None:
         effective_dry_run = self.governor.effective_dry_run()
         if action.action_type == "WITHDRAW":
-            logged_action_type = "LIVE_WITHDRAW" if not effective_dry_run else "DRY_WITHDRAW"
-            if not effective_dry_run and action.order_hash:
-                try:
-                    # Try to fetch order_params for on-chain cancel fallback
-                    _order_params = self._fetch_order_params(action.order_hash, action.chain)
-                    action.executed = self.offer_client.cancel_offer(
-                        action.order_hash,
-                        chain=action.chain or self.settings.execution_chain,
-                        order_params=_order_params,
+            order_hash = action.order_hash or ""
+            is_dry_run_offer = order_hash.startswith("dryrun-")
+            logged_action_type = "DRY_WITHDRAW" if is_dry_run_offer else "LIVE_WITHDRAW"
+
+            if is_dry_run_offer:
+                action.executed = self.state.mark_offer_status(
+                    order_hash=order_hash,
+                    status="cancelled",
+                )
+                if not action.executed:
+                    action.error = "Offer not found"
+            elif not order_hash:
+                action.executed = False
+                action.error = "Offer not found"
+            else:
+                blocked_reason = self._live_withdraw_block_reason()
+                if blocked_reason:
+                    action.executed = False
+                    action.error = blocked_reason
+                    self.state.record_submit_event(
+                        engine="undercutter",
+                        action_type=f"{logged_action_type}_BLOCKED",
+                        collection=action.collection,
+                        chain=action.chain,
+                        price_bnb=action.old_price_bnb,
+                        status="blocked",
+                        reason=blocked_reason,
                     )
-                    if action.executed:
+                else:
+                    try:
+                        # Fetching order parameters is read-only. Re-check the gate
+                        # immediately before the external cancel to narrow a race
+                        # with disarm/killswitch activation.
+                        order_params = self._fetch_order_params(order_hash, action.chain)
+                        blocked_reason = self._live_withdraw_block_reason()
+                        if blocked_reason:
+                            action.executed = False
+                            action.error = blocked_reason
+                            self.state.record_submit_event(
+                                engine="undercutter",
+                                action_type=f"{logged_action_type}_BLOCKED",
+                                collection=action.collection,
+                                chain=action.chain,
+                                price_bnb=action.old_price_bnb,
+                                status="blocked",
+                                reason=blocked_reason,
+                            )
+                        else:
+                            action.executed = self.offer_client.cancel_offer(
+                                order_hash,
+                                chain=action.chain or self.settings.execution_chain,
+                                order_params=order_params,
+                            )
+                            if action.executed:
+                                local_marked = self.state.mark_offer_status(
+                                    order_hash=order_hash,
+                                    status="cancelled",
+                                )
+                                self.state.record_submit_event(
+                                    engine="undercutter",
+                                    action_type=logged_action_type,
+                                    collection=action.collection,
+                                    chain=action.chain,
+                                    price_bnb=action.old_price_bnb,
+                                    status="cancelled",
+                                    reason=f"order_hash={order_hash};local_marked={1 if local_marked else 0}",
+                                )
+                                self._send_live_notification(
+                                    action_type=logged_action_type,
+                                    collection=action.collection,
+                                    price_bnb=action.old_price_bnb,
+                                    detail=f"order_hash={order_hash}",
+                                )
+                            else:
+                                action.error = "Exchange cancel failed"
+                                self.state.record_submit_event(
+                                    engine="undercutter",
+                                    action_type=logged_action_type,
+                                    collection=action.collection,
+                                    chain=action.chain,
+                                    price_bnb=action.old_price_bnb,
+                                    status="failed",
+                                    reason=action.error,
+                                )
+                    except Exception as exc:
+                        action.executed = False
+                        action.error = str(exc)
+                        logger.warning("Live withdraw failed for %s: %s", action.collection, exc)
                         self.state.record_submit_event(
                             engine="undercutter",
                             action_type=logged_action_type,
                             collection=action.collection,
                             chain=action.chain,
                             price_bnb=action.old_price_bnb,
-                            status="cancelled",
-                            reason=f"order_hash={action.order_hash}",
+                            status="failed",
+                            reason=str(exc),
                         )
-                        self._send_live_notification(
-                            action_type=logged_action_type,
-                            collection=action.collection,
-                            price_bnb=action.old_price_bnb,
-                            detail=f"order_hash={action.order_hash}",
-                        )
-                except Exception as exc:
-                    action.executed = False
-                    action.error = str(exc)
-                    logger.warning("Live withdraw failed for %s: %s", action.collection, exc)
-                    self.state.record_submit_event(
-                        engine="undercutter",
-                        action_type=logged_action_type,
-                        collection=action.collection,
-                        chain=action.chain,
-                        price_bnb=action.old_price_bnb,
-                        status="failed",
-                        reason=str(exc),
-                    )
-            else:
-                action.executed = self.state.mark_offer_status(order_hash=action.order_hash or "", status="cancelled")
-            if not action.executed:
-                action.error = action.error or "Offer not found"
+
             self.state.log_action(
                 action_type=logged_action_type,
                 collection=action.collection,
@@ -472,11 +544,18 @@ class UndercutEngine:
     ) -> None:
         if action_type != "DEFENSE" or not previous_order_hash:
             return
-        if effective_dry_run or previous_order_hash.startswith("dryrun-"):
-            # In dry-run mode (or for dryrun-prefixed hashes), just mark as
-            # retired in local state so zombie offers don't accumulate.
+        if previous_order_hash.startswith("dryrun-"):
             self.state.mark_offer_status(order_hash=previous_order_hash, status="retired")
             logger.info("Retired dry-run offer %s during defense re-bid", previous_order_hash)
+            return
+        if effective_dry_run:
+            # A preview/dry-run must never hide a real exchange offer from local
+            # state. Keeping it active is required so reconcile/killswitch can
+            # still see and cancel the live exposure if needed.
+            logger.info(
+                "Keeping live offer %s active during dry-run defense preview",
+                previous_order_hash,
+            )
             return
         resolved_chain = chain or self.settings.execution_chain
         try:
