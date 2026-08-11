@@ -241,16 +241,19 @@ def _build_execution_snapshot(settings: Settings) -> dict[str, Any]:
             dry_run_active_offer_count = sum(
                 1 for offer in active_offers if offer.order_hash.startswith('dryrun-')
             )
-            last_reconcile_at = runtime.get(f'last_reconcile_at_{chain}')
-            if not last_reconcile_at and legacy_last_reconcile_chain == chain:
-                last_reconcile_at = legacy_last_reconcile_at
-            reconcile_at = _parse_iso_utc(last_reconcile_at)
+            last_reconcile_at_raw = runtime.get(f'last_reconcile_at_{chain}')
+            if not last_reconcile_at_raw and legacy_last_reconcile_chain == chain:
+                last_reconcile_at_raw = legacy_last_reconcile_at
+            reconcile_at = _parse_iso_utc(last_reconcile_at_raw)
+            last_reconcile_at = last_reconcile_at_raw if reconcile_at is not None else None
             chain_snapshots[chain] = {
                 'active_offer_count': len(active_offers),
                 'live_active_offer_count': live_active_offer_count,
                 'dry_run_active_offer_count': dry_run_active_offer_count,
                 'killswitch_failed_count': len(state.get_killswitch_failed_offers(chain=chain)),
                 'last_reconcile_at': last_reconcile_at,
+                'last_reconcile_at_raw': last_reconcile_at_raw,
+                'reconcile_timestamp_invalid': bool(last_reconcile_at_raw and reconcile_at is None),
                 'reconcile_age_seconds': (
                     max((now - reconcile_at).total_seconds(), 0.0) if reconcile_at is not None else None
                 ),
