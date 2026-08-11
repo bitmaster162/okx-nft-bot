@@ -11,12 +11,12 @@ Cycle:
   3. Sleep SCAN_INTERVAL seconds
   4. Repeat
 
-Env vars (from .env):
-  EXECUTION_DAEMON_ENABLED=1
+Env vars (from .env; execution paths are opt-in / fail-closed):
+  EXECUTION_DAEMON_ENABLED=0
   EXECUTION_SCAN_INTERVAL=300  # seconds between full cycles
-  COUNTERBID_ENABLED=1
-  UNDERCUTTER_ENABLED=1
-  DRY_RUN=0
+  COUNTERBID_ENABLED=0
+  UNDERCUTTER_ENABLED=0
+  DRY_RUN=1
 """
 from __future__ import annotations
 import logging
@@ -52,9 +52,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def main():
     scan_interval = int(os.getenv("EXECUTION_SCAN_INTERVAL", "300"))
-    rival_enabled = _env_bool("COUNTERBID_ENABLED", True)
-    undercut_enabled = _env_bool("UNDERCUTTER_ENABLED", True)
-    daemon_enabled = _env_bool("EXECUTION_DAEMON_ENABLED", True)
+    rival_enabled = _env_bool("COUNTERBID_ENABLED", False)
+    undercut_enabled = _env_bool("UNDERCUTTER_ENABLED", False)
+    daemon_enabled = _env_bool("EXECUTION_DAEMON_ENABLED", False)
 
     if not daemon_enabled:
         log.info("Execution daemon disabled (EXECUTION_DAEMON_ENABLED=0). Exiting.")
