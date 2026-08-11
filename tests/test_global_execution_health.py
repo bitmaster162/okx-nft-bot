@@ -160,3 +160,30 @@ def test_healthcheck_uses_reconcile_age_of_chain_with_live_offers(monkeypatch, t
     assert result.reason == "execution_reconcile_stale"
     assert result.payload["execution"]["chains"]["bsc"]["live_active_offer_count"] == 0
     assert result.payload["execution"]["chains"]["eth"]["live_active_offer_count"] == 1
+
+
+def test_healthcheck_fails_closed_on_invalid_reconcile_timestamp_with_live_offers(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    _SnapshotState.runtime = {
+        "last_reconcile_at_bsc": now,
+        "last_reconcile_at_eth": "not-a-timestamp",
+    }
+    _SnapshotState.active = {
+        "bsc": [],
+        "eth": [SimpleNamespace(order_hash="0xlive")],
+    }
+    _SnapshotState.failed = {"bsc": [], "eth": []}
+    monkeypatch.setattr(ops, "PositionState", _SnapshotState)
+
+    result = ops.run_healthcheck(_settings(tmp_path), _HealthStore(), require_fresh_metrics=False)
+    eth = result.payload["execution"]["chains"]["eth"]
+
+    assert result.healthy is False
+    assert result.reason == "execution_never_reconciled"
+    assert eth["last_reconcile_at"] is None
+    assert eth["last_reconcile_at_raw"] == "not-a-timestamp"
+    assert eth["reconcile_timestamp_invalid"] is True
+    assert eth["reconcile_age_seconds"] is None
