@@ -305,19 +305,56 @@ class OpenSeaClient:
             }
         ]
 
+        # ── PATCH 2026-08-06 (OPENSEA_ORDER_SHAPE) ──
+        # Ордер собирался в форме, которую OpenSea не принимает. Сверка с пятью
+        # живыми офферами из их же API (get_offers → protocol_data.parameters):
+        #
+        #                             было у нас        у живых OpenSea
+        #   zone                      0x0000…0000       0x000056f7…ffd100
+        #   totalOriginalConsider…    1                 2
+        #   consideration             [NFT]             [NFT, комиссия]
+        #
+        # 1) orderType=2 это FULL_RESTRICTED — такой ордер обязан утверждать zone.
+        #    С нулевым адресом утверждать его некому, исполнить оффер не смог бы
+        #    никто. Живые ордера стоят на OpenSea SignedZone.
+        # 2) Обязательная комиссия OpenSea в consideration отсутствовала.
+        #    get_collection(fees) отдаёт: 1.0%, получатель 0x0000a26b…faa719,
+        #    "required": true. Замер по пяти живым офферам — ровно 100 bps
+        #    у всех пяти (38.38 → 0.3838, 13.5 → 0.135, 9.57 → 0.0957 …).
+        #    Ордер без обязательной комиссии их API отклоняет.
+        #
+        # Комиссия берётся ИЗ суммы оффера: предлагаем price_wei, продавец
+        # получает 99%, 1% уходит OpenSea. Наш потолок при этом не двигается.
+        _fee_bps = int(os.environ.get("OPENSEA_FEE_BPS", "100") or 100)
+        _fee_recipient = os.environ.get(
+            "OPENSEA_FEE_RECIPIENT", "0x0000a26b00c1f0df003000390027140000faa719")
+        _fee_wei = (int(price_wei) * _fee_bps) // 10000
+        if _fee_wei > 0 and _fee_recipient:
+            consideration.append({
+                "itemType": 1,  # ERC20
+                "token": currency_address,
+                "identifierOrCriteria": 0,
+                "startAmount": str(_fee_wei),
+                "endAmount": str(_fee_wei),
+                "recipient": _fee_recipient,
+            })
+
+        _zone = os.environ.get(
+            "OPENSEA_ZONE", "0x000056f7000000ece9003ca63978907a00ffd100")
+
         return {
             "offerer": offerer,
-            "zone": ZERO_ADDRESS,
+            "zone": _zone,
             "offer": offer,
             "consideration": consideration,
-            "orderType": 2,  # FULL_RESTRICTED
+            "orderType": 2,  # FULL_RESTRICTED — утверждает SignedZone
             "startTime": str(now),
             "endTime": str(valid_time),
             "zoneHash": ZERO_BYTES32,
             "salt": str(salt),
             "conduitKey": SEAPORT_CONDUIT_KEY,
             "counter": str(counter),
-            "totalOriginalConsiderationItems": 1,
+            "totalOriginalConsiderationItems": len(consideration),
         }
 
     def _sign_seaport_order(self, parameters: dict[str, Any], private_key: str, chain_id: int = 1) -> str:
@@ -418,10 +455,16 @@ class OpenSeaClient:
         else:
             raise ValueError(f"Unsupported chain: {chain}")
 
-        # Build request body
+        # Build request body.
+        # PATCH 2026-08-06 (OPENSEA_PROTOCOL_ADDRESS): без protocol_address
+        # OpenSea отвечает HTTP 400 "Missing required field 'protocol_address'".
+        # За первый живой прогон так отвалились все 23 попытки. Значение —
+        # адрес Seaport 1.6, тот же, что стоит verifyingContract в подписи
+        # EIP-712 и что отдают их собственные живые ордера в protocol_address.
         body = {
             "parameters": parameters,
             "signature": signature,
+            "protocol_address": SEAPORT_ADDRESS_ETH,
         }
 
         # POST to OpenSea API
