@@ -315,12 +315,17 @@ def get_rpc_urls(chain: str) -> tuple[str, ...]:
 
 
 def load_settings(profile_override: str | None = None) -> Settings:
+    # Preserve the environment provided by the process/container. Base .env is
+    # allowed to fill gaps and the selected profile may override those defaults,
+    # but a profile must never weaken an explicit runtime safety override.
+    process_env = dict(os.environ)
     load_dotenv(override=False)
     profile = (profile_override or os.getenv('APP_PROFILE') or 'dev').strip().lower()
     profiles_dir = Path(os.getenv('PROFILES_DIR', './deploy/profiles'))
     profile_path = profiles_dir / f'{profile}.env'
     if profile_path.exists():
         load_dotenv(profile_path, override=True)
+        os.environ.update(process_env)
 
     db_path = Path(os.getenv('DB_PATH', './data/okx_nft_bot.sqlite3'))
     db_path.parent.mkdir(parents=True, exist_ok=True)
