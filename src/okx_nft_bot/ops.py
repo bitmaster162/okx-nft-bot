@@ -11,7 +11,7 @@ from urllib import parse
 from okx_nft_bot.analytics.cross_market import detect_spreads, rank_collections
 from okx_nft_bot.clients.http import StdlibHttpTransport
 from okx_nft_bot.analytics import ExecutionHealthAnalyzer, PnlGuardAnalyzer, PortfolioRiskAnalyzer, WalletPnlAnalyzer
-from okx_nft_bot.config import Settings
+from okx_nft_bot.config import SUPPORTED_EXECUTION_CHAINS, Settings
 from okx_nft_bot.storage.sqlite import SQLiteStore
 from okx_nft_bot.undercutter.state import PositionState
 
@@ -230,26 +230,54 @@ def _build_execution_snapshot(settings: Settings) -> dict[str, Any]:
         integrity = state.audit_integrity().to_dict()
         runtime = state.get_runtime_state()
         now = _utc_now()
-        last_reconcile_at = runtime.get('last_reconcile_at')
-        reconcile_at = _parse_iso_utc(last_reconcile_at)
-        active_offers = state.get_active_offers(chain=settings.execution_chain)
-        live_active_offer_count = sum(1 for offer in active_offers if not offer.order_hash.startswith('dryrun-'))
-        dry_run_active_offer_count = sum(1 for offer in active_offers if offer.order_hash.startswith('dryrun-'))
+        legacy_last_reconcile_at = runtime.get('last_reconcile_at')
+        legacy_last_reconcile_chain = str(runtime.get('last_reconcile_chain') or '').strip().lower()
+        chain_snapshots: dict[str, dict[str, Any]] = {}
+        for chain in SUPPORTED_EXECUTION_CHAINS:
+            active_offers = state.get_active_offers(chain=chain)
+            live_active_offer_count = sum(
+                1 for offer in active_offers if not offer.order_hash.startswith('dryrun-')
+            )
+            dry_run_active_offer_count = sum(
+                1 for offer in active_offers if offer.order_hash.startswith('dryrun-')
+            )
+            last_reconcile_at = runtime.get(f'last_reconcile_at_{chain}')
+            if not last_reconcile_at and legacy_last_reconcile_chain == chain:
+                last_reconcile_at = legacy_last_reconcile_at
+            reconcile_at = _parse_iso_utc(last_reconcile_at)
+            chain_snapshots[chain] = {
+                'active_offer_count': len(active_offers),
+                'live_active_offer_count': live_active_offer_count,
+                'dry_run_active_offer_count': dry_run_active_offer_count,
+                'killswitch_failed_count': len(state.get_killswitch_failed_offers(chain=chain)),
+                'last_reconcile_at': last_reconcile_at,
+                'reconcile_age_seconds': (
+                    max((now - reconcile_at).total_seconds(), 0.0) if reconcile_at is not None else None
+                ),
+                'fills': state.get_fill_summary(chain=chain),
+            }
+        selected = chain_snapshots.get(settings.execution_chain, {})
         payload.update(
             {
                 'effective_dry_run': state.effective_dry_run(settings.dry_run),
                 'forced_dry_run': state.is_force_dry_run(),
                 'integrity': integrity,
                 'live_arm': state.get_live_arm_state(now=now),
-                'active_offer_count': len(active_offers),
-                'live_active_offer_count': live_active_offer_count,
-                'dry_run_active_offer_count': dry_run_active_offer_count,
-                'killswitch_failed_count': len(state.get_killswitch_failed_offers(chain=settings.execution_chain)),
-                'last_reconcile_at': last_reconcile_at,
-                'reconcile_age_seconds': (
-                    max((now - reconcile_at).total_seconds(), 0.0) if reconcile_at is not None else None
+                'chains': chain_snapshots,
+                'active_offer_count': sum(item['active_offer_count'] for item in chain_snapshots.values()),
+                'live_active_offer_count': sum(
+                    item['live_active_offer_count'] for item in chain_snapshots.values()
                 ),
-                'fills': state.get_fill_summary(chain=settings.execution_chain),
+                'dry_run_active_offer_count': sum(
+                    item['dry_run_active_offer_count'] for item in chain_snapshots.values()
+                ),
+                'killswitch_failed_count': sum(
+                    item['killswitch_failed_count'] for item in chain_snapshots.values()
+                ),
+                # Backward-compatible selected-chain fields for existing dashboards.
+                'last_reconcile_at': selected.get('last_reconcile_at'),
+                'reconcile_age_seconds': selected.get('reconcile_age_seconds'),
+                'fills': selected.get('fills', {}),
                 'last_fill_reconcile_at': runtime.get('last_fill_reconcile_at'),
                 'last_confirmed_fill_at': runtime.get('last_confirmed_fill_at'),
             }
@@ -459,13 +487,37 @@ def run_healthcheck(settings: Settings, store: SQLiteStore, *, require_fresh_met
         return HealthResult(False, 'execution_integrity_issues', None, payload)
     if int(execution.get('killswitch_failed_count', 0) or 0) > 0:
         return HealthResult(False, 'execution_killswitch_failed', None, payload)
-    live_active_offer_count = int(execution.get('live_active_offer_count', 0) or 0)
-    reconcile_age_seconds = execution.get('reconcile_age_seconds')
-    if live_active_offer_count > 0:
-        if not execution.get('last_reconcile_at'):
+
+    chain_snapshots = execution.get('chains')
+    if isinstance(chain_snapshots, dict):
+        missing_reconcile: list[str] = []
+        stale_reconcile: dict[str, float] = {}
+        for chain, snapshot in chain_snapshots.items():
+            if not isinstance(snapshot, dict):
+                continue
+            if int(snapshot.get('live_active_offer_count', 0) or 0) <= 0:
+                continue
+            if not snapshot.get('last_reconcile_at'):
+                missing_reconcile.append(str(chain))
+                continue
+            age = snapshot.get('reconcile_age_seconds')
+            if isinstance(age, (int, float)) and age > settings.execution_reconcile_max_staleness_seconds:
+                stale_reconcile[str(chain)] = float(age)
+        if missing_reconcile:
+            execution['reconcile_missing_chains'] = missing_reconcile
             return HealthResult(False, 'execution_never_reconciled', None, payload)
-        if isinstance(reconcile_age_seconds, (int, float)) and reconcile_age_seconds > settings.execution_reconcile_max_staleness_seconds:
-            return HealthResult(False, 'execution_reconcile_stale', float(reconcile_age_seconds), payload)
+        if stale_reconcile:
+            execution['reconcile_stale_chains'] = stale_reconcile
+            return HealthResult(False, 'execution_reconcile_stale', max(stale_reconcile.values()), payload)
+    else:
+        # Backward-compatible fallback for snapshots produced by older code.
+        live_active_offer_count = int(execution.get('live_active_offer_count', 0) or 0)
+        reconcile_age_seconds = execution.get('reconcile_age_seconds')
+        if live_active_offer_count > 0:
+            if not execution.get('last_reconcile_at'):
+                return HealthResult(False, 'execution_never_reconciled', None, payload)
+            if isinstance(reconcile_age_seconds, (int, float)) and reconcile_age_seconds > settings.execution_reconcile_max_staleness_seconds:
+                return HealthResult(False, 'execution_reconcile_stale', float(reconcile_age_seconds), payload)
 
     if not require_fresh_metrics:
         return HealthResult(True, 'db_only', None, payload)
