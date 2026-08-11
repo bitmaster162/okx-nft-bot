@@ -1,0 +1,20 @@
+{
+  "Arshad-1221": {
+    "USDT_records": 111,
+    "all_prices_exactly_0_11": true,
+    "Arshad_to_FanToken4_unique_items_with_first_high_within_24h": 52,
+    "Arshad_to_FanToken4_unique_items_with_transition_within_10m": 11
+  },
+  "Fan-Token-4": {
+    "USDT_records": 143,
+    "median_price_usdt": 45.0,
+    "records_ge_20_usdt": 86,
+    "records_le_0_2_usdt": 41
+  },
+  "Asim80903": {
+    "USDT_records": 75,
+    "low_records_le_0_2": 43,
+    "unique_items_low_then_ge20_within_10m": 7,
+    "max_seconds_for_those_items": 22.0
+  }
+}
