@@ -302,7 +302,11 @@ class ExecutionGovernor:
         completed_at = datetime.now(timezone.utc).isoformat()
         self.state.set_runtime_value("last_reconcile_at", completed_at)
         self.state.set_runtime_value(f"last_reconcile_at_{resolved_chain}", completed_at)
-        self.state.set_runtime_value("last_reconcile_chain", resolved_chain)
+        # `last_reconcile_chain` is a legacy BSC-only runtime key whose integrity
+        # validator rejects `eth`.  Multi-chain reconciliation already has
+        # canonical per-chain timestamps above, so keep the incompatible legacy
+        # key absent instead of writing a valid ETH reconciliation into quarantine.
+        self.state.set_runtime_value("last_reconcile_chain", None)
         self.state.set_runtime_value("last_reconcile_exchange_seen", exchange_seen := len(exchange_offers))
         self.state.set_runtime_value("last_reconcile_local_active_seen", len(local_active))
         self.state.set_runtime_value("last_reconcile_local_marked_missing", local_marked_missing)
