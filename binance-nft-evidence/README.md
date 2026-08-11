@@ -28,15 +28,16 @@ Strict rule: same Binance NFT item has a USDT record at **≤ $0.20**, followed 
 - T-Mac Time #12073589 — $0.15 → $25.1384 in 10 sec — https://www.binance.com/ru/nft/item/12073589
 - APOKI #975397 — $0.18 → $21.32 in 23 sec — https://www.binance.com/ru/nft/item/975397
 
-## Files
+## Files published in this mirror
 
-- `data/TOP20.csv` — high-signal audited examples.
-- `data/ALL_344_part01.csv` … `part05.csv` — complete audited candidate set.
-- `data/TOP20_RAW_TELEGRAM_RECORDS.json` — raw export records for TOP20 examples.
-- `data/ACCOUNT_CLUSTER_SUMMARY_v1_1.json` — recurring label statistics.
-- `METHODOLOGY.md` — reproducible detection rule.
+- `data/TOP20.csv` — high-signal audited examples with timestamps, message IDs, account labels and direct Binance item URLs.
+- `data/ALL_344_part01.csv` … `part05.csv` — complete normalized audited candidate set.
+- `data/ACCOUNT_CLUSTER_SUMMARY_v1_1.json` — recurring account-label statistics.
+- `METHODOLOGY.md` — reproducible detection and chronology rule.
 - `AUDIT_CORRECTION_v1_1.md` — documented 345→344 publication correction.
-- `PUBLIC_MANIFEST.sha256` — integrity references.
+- `PUBLIC_MIRROR_MANIFEST.sha256` — integrity references for the public mirror plus hashes of the retained source archive/full evidence pack.
+
+The raw Telegram records for the selected TOP20 examples are retained in the full authority evidence pack (`BINANCE_NFT_WASH_TRADING_EVIDENCE_PACK_v1_1.zip`, SHA-256 recorded in the manifest) but are **not duplicated in this public mirror**. The public CSVs preserve the corresponding export timestamps and Telegram message IDs for audit/reference.
 
 ## Evidence boundary
 
