@@ -34,6 +34,7 @@ from okx_nft_bot.deploy_ops import (
     restore_database,
     set_desired_profile,
 )
+from okx_nft_bot.killswitch import activate_multichain_killswitch, format_killswitch_result
 from okx_nft_bot.mass_offer import (
     MassOfferAllocator,
     MassOfferBatchRunner,
@@ -1298,139 +1299,8 @@ class TelegramCommandProcessor:
     def _killswitch_command(self, args: list[str]) -> str:
         if args:
             return 'Usage: /killswitch'
-        state = PositionState(self.settings.execution_db_path)
-        state.audit_integrity()
-        api = OKXAPIClient(settings=self.settings)
-        active_offers = state.get_active_offers(chain=self.settings.execution_chain)
-
-        exchange_lookup_failed = False
-        exchange_lookup_error: str | None = None
-        exchange_order_hashes: list[str] = []
-        # Map order_hash → protocolData.parameters for on-chain cancel fallback
-        exchange_order_params: dict[str, dict] = {}
-        try:
-            seen: set[str] = set()
-            for row in api.get_my_offers(
-                chain=self.settings.execution_chain,
-                require_all_endpoints=True,
-            ):
-                order_hash = str(row.get('offerId') or row.get('orderHash') or row.get('id') or '').strip()
-                if not order_hash or order_hash in seen:
-                    continue
-                seen.add(order_hash)
-                exchange_order_hashes.append(order_hash)
-                # Extract protocolData.parameters for on-chain cancel fallback
-                proto = row.get('protocolData', {})
-                if isinstance(proto, str):
-                    try:
-                        proto = __import__('json').loads(proto)
-                    except Exception:
-                        proto = {}
-                params = proto.get('parameters') if isinstance(proto, dict) else None
-                if params:
-                    exchange_order_params[order_hash] = params
-        except Exception as exc:
-            exchange_lookup_failed = True
-            exchange_lookup_error = str(exc)
-            logger.warning("Kill switch exchange lookup failed: %s", exc)
-            exchange_order_hashes = [
-                offer.order_hash for offer in active_offers if not offer.order_hash.startswith("dryrun-")
-            ]
-
-        live_cancelled = 0
-        local_cancelled = 0
-        already_gone = 0
-        failed: list[str] = []
-        failed_order_hashes: list[str] = []
-        successful_live_cancels: set[str] = set()
-        for order_hash in exchange_order_hashes:
-            try:
-                ok = api.cancel_offer(
-                    order_hash,
-                    chain=self.settings.execution_chain,
-                    order_params=exchange_order_params.get(order_hash),
-                )
-            except Exception as exc:
-                failed_order_hashes.append(order_hash)
-                failed.append(f'{order_hash}:{exc}')
-                logger.warning("Kill switch cancel failed for %s: %s", order_hash, exc)
-                continue
-            if ok:
-                live_cancelled += 1
-                successful_live_cancels.add(order_hash)
-            else:
-                failed_order_hashes.append(order_hash)
-                failed.append(f'{order_hash}:cancel_failed')
-
-        failed_hash_set = set(failed_order_hashes)
-        for offer in active_offers:
-            if offer.order_hash.startswith("dryrun-"):
-                if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
-                    local_cancelled += 1
-                continue
-            if offer.order_hash in successful_live_cancels:
-                state.mark_offer_status(order_hash=offer.order_hash, status="cancelled")
-                continue
-            if offer.order_hash in failed_hash_set:
-                state.mark_offer_status(order_hash=offer.order_hash, status="killswitch_failed")
-                continue
-            if not exchange_lookup_failed:
-                if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
-                    already_gone += 1
-
-        # Also mark any exchange-only hashes that failed but weren't in active_offers
-        active_hash_set = {offer.order_hash for offer in active_offers}
-        for order_hash in failed_order_hashes:
-            if order_hash not in active_hash_set:
-                state.mark_offer_status(order_hash=order_hash, status="killswitch_failed")
-        state.disarm_live(actor='telegram_killswitch', reason='telegram_killswitch')
-        state.set_force_dry_run(True, reason='telegram_killswitch')
-        state.set_runtime_value('killswitch_activated_at', datetime.now(timezone.utc).isoformat())
-        state.set_runtime_value('killswitch_source', 'telegram')
-        state.record_submit_event(
-            engine='runtime',
-            action_type='KILLSWITCH',
-            collection='*',
-            chain=self.settings.execution_chain,
-            price_bnb=None,
-            status='killswitch',
-            reason=(
-                f'exchange_seen={len(exchange_order_hashes)};live_cancelled={live_cancelled};'
-                f'local_cancelled={local_cancelled};already_gone={already_gone};failed={len(failed)};'
-                f'exchange_lookup_failed={1 if exchange_lookup_failed else 0}'
-            ),
-        )
-        state.log_action(
-            action_type='KILLSWITCH',
-            collection='*',
-            chain=self.settings.execution_chain,
-            order_hash=None,
-            old_price_bnb=None,
-            new_price_bnb=None,
-            reason='CRITICAL: operator kill switch activated',
-            executed=len(failed) == 0,
-            error='; '.join(failed) if failed else None,
-            payload={
-                'exchange_seen': len(exchange_order_hashes),
-                'live_cancelled': live_cancelled,
-                'local_cancelled': local_cancelled,
-                'already_gone': already_gone,
-                'exchange_lookup_failed': exchange_lookup_failed,
-                'exchange_lookup_error': exchange_lookup_error,
-                'failed': failed,
-            },
-        )
-        return (
-            'killswitch_activated\n'
-            'dry_run=true\n'
-            f'active_offers_seen={len(active_offers)}\n'
-            f'exchange_seen={len(exchange_order_hashes)}\n'
-            f'live_cancelled={live_cancelled}\n'
-            f'local_cancelled={local_cancelled}\n'
-            f'already_gone={already_gone}\n'
-            f'failed={len(failed)}\n'
-            f'zombies={len(failed)} (marked killswitch_failed, need manual cancel)'
-        )
+        result = activate_multichain_killswitch(settings=self.settings)
+        return format_killswitch_result(result)
 
     def _parasite_detected_count(self) -> int | None:
         if not self.settings.parasite_wallets:
