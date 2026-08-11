@@ -23,7 +23,10 @@ class _ReconcileState:
     def get_active_offers(self, *, chain: str):
         return []
 
-    def set_runtime_value(self, key: str, value: object):
+    def set_runtime_value(self, key: str, value: object | None):
+        if value is None:
+            self.runtime.pop(key, None)
+            return
         self.runtime[key] = value
 
 
@@ -98,7 +101,7 @@ def test_reconcile_persists_chain_scoped_timestamp(tmp_path: Path) -> None:
     result = governor.reconcile_active_offers(chain="eth")
 
     assert result.chain == "eth"
-    assert state.runtime["last_reconcile_chain"] == "eth"
+    assert "last_reconcile_chain" not in state.runtime
     assert state.runtime["last_reconcile_at"] == result.completed_at
     assert state.runtime["last_reconcile_at_eth"] == result.completed_at
 
