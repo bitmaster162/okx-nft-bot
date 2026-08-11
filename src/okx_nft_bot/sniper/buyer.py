@@ -25,6 +25,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import time
 import threading
@@ -172,7 +173,7 @@ class OKXInstantBuyer:
         self._w3: dict[str, Any] = {}  # chain -> Web3 instance
         self._lock = threading.Lock()
         self._failed_orders: set[str] = set()  # orderIds that returned errors (stale/unavailable)
-        self._governor: Any | None = None  # lazy-initialized ExecutionGovernor for nonce allocation
+        self._governor: Any | None = None  # lazy-initialized ExecutionGovernor for safety + nonce allocation
 
         # Stats
         self.total_attempts = 0
@@ -200,7 +201,7 @@ class OKXInstantBuyer:
             log.info("OKXInstantBuyer: DISABLED via env (set AUTO_BUY_ENABLED=1); web3 still initialised for counter_bidder use")
 
     def _get_governor(self):
-        """Lazy-initialize ExecutionGovernor for atomic nonce allocation (RISK-1)."""
+        """Lazy-initialize ExecutionGovernor for live gating and atomic nonce allocation."""
         if self._governor is None:
             from okx_nft_bot.config import load_settings
             from okx_nft_bot.execution_governor import ExecutionGovernor
@@ -221,6 +222,121 @@ class OKXInstantBuyer:
             )
             return True
         return bool(self.dry_run or global_dry_run or forced_dry_run)
+
+    def _live_buy_gate(
+        self,
+        *,
+        collection_address: str,
+        chain: str,
+        price: float,
+        currency: str,
+    ) -> tuple[str | None, float | None, float | None]:
+        """Fail-closed live gate for every capital-moving instant-buy path.
+
+        Returns ``(blocked_reason, price_bnb_equiv, price_usd)``.  Multi-engine
+        execution governance uses BNB-equivalent accounting for the shared daily
+        cap, so ETH/stablecoin buys must be normalized before the governor check.
+        """
+        if not self.enabled:
+            return "auto_buy_disabled", None, None
+        if self._effective_dry_run():
+            return "dry_run_enabled", None, None
+
+        try:
+            from okx_nft_bot.config import validate_execution_chain
+            resolved_chain = validate_execution_chain(chain)
+        except Exception as exc:
+            return f"invalid_chain:{exc}", None, None
+
+        resolved_collection = str(collection_address or "").strip().lower()
+        if not resolved_collection:
+            return "collection_required", None, None
+
+        try:
+            resolved_price = float(price)
+        except (TypeError, ValueError):
+            return "invalid_price", None, None
+        if not math.isfinite(resolved_price) or resolved_price <= 0:
+            return "invalid_price", None, None
+
+        resolved_currency = str(currency or "").strip().upper()
+        if not resolved_currency:
+            return "currency_required", None, None
+
+        try:
+            from okx_nft_bot.prices import get_usd_price
+            currency_usd = float(get_usd_price(resolved_currency))
+            bnb_usd = float(get_usd_price("BNB"))
+        except Exception as exc:
+            return f"price_oracle_error:{type(exc).__name__}", None, None
+
+        if (
+            not math.isfinite(currency_usd)
+            or not math.isfinite(bnb_usd)
+            or currency_usd <= 0
+            or bnb_usd <= 0
+        ):
+            return "price_oracle_unavailable", None, None
+
+        price_usd = resolved_price * currency_usd
+        price_bnb_equiv = price_usd / bnb_usd
+        if (
+            not math.isfinite(price_usd)
+            or not math.isfinite(price_bnb_equiv)
+            or price_usd <= 0
+            or price_bnb_equiv <= 0
+        ):
+            return "invalid_normalized_price", None, None
+
+        governor = self._get_governor()
+        blocked = governor.check_live_submit_allowed(
+            action_type="LIVE_BUY",
+            collection=resolved_collection,
+            chain=resolved_chain,
+            price_bnb=price_bnb_equiv,
+            price_usd=price_usd,
+        )
+        return blocked, price_bnb_equiv, price_usd
+
+    @staticmethod
+    def _record_live_buy_submit(
+        governor: Any,
+        *,
+        collection_address: str,
+        chain: str,
+        price_bnb_equiv: float,
+        price_usd: float,
+        tx_hash: str,
+    ) -> None:
+        """Record a submitted buy so shared cooldown/daily caps include it.
+
+        A transaction is already on-chain when this runs.  If persistence fails,
+        force dry-run immediately so an unaccounted submit cannot be followed by
+        additional capital-moving actions under stale rate-limit state.
+        """
+        try:
+            governor.state.record_submit_event(
+                engine="instant_buyer",
+                action_type="LIVE_BUY",
+                collection=collection_address,
+                chain=chain,
+                price_bnb=float(price_bnb_equiv),
+                status="submitted",
+                reason=f"tx_hash={tx_hash};price_usd={float(price_usd):.6f}",
+            )
+        except Exception as exc:
+            log.critical("Instant buyer submit audit write failed after tx broadcast: %s", exc, exc_info=True)
+            try:
+                governor.state.set_force_dry_run(
+                    True,
+                    reason="instant_buyer_submit_log_failure",
+                )
+            except Exception as force_exc:
+                log.critical(
+                    "Instant buyer could not force dry-run after submit audit failure: %s",
+                    force_exc,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _estimate_usd(price: float, currency: str, chain: str) -> float:
@@ -412,12 +528,12 @@ class OKXInstantBuyer:
         # USD safety cap: estimate buy cost in USD and reject if above limit
         usd_estimate = self._estimate_usd(cheapest_price, currency, chain_lower)
         if usd_estimate > self.max_usd_per_buy:
-            log.warning("� %s #%s @ %.6f %s (~$%.2f) EXCEEDS safety cap $%.2f — SKIP",
+            log.warning("🛑 %s #%s @ %.6f %s (~$%.2f) EXCEEDS safety cap $%.2f — SKIP",
                         collection_name, token_id, cheapest_price, currency,
                         usd_estimate, self.max_usd_per_buy)
             return None
 
-        log.warning("�🔥 BUY TARGET: %s #%s @ %.6f %s (~$%.2f, cap=$%.2f) [%s]",
+        log.warning("🎯🔥 BUY TARGET: %s #%s @ %.6f %s (~$%.2f, cap=$%.2f) [%s]",
                     collection_name, token_id, cheapest_price, currency,
                     usd_estimate, self.max_usd_per_buy, chain_lower)
 
@@ -445,7 +561,13 @@ class OKXInstantBuyer:
 
         # LIVE buy
         try:
-            result = self._execute_buy(cheapest, chain_lower, cheapest_price)
+            result = self._execute_buy(
+                cheapest,
+                chain_lower,
+                cheapest_price,
+                collection_address=collection_address,
+                currency=currency,
+            )
             attempt.success = result.get("success", False)
             attempt.tx_hash = result.get("tx_hash")
             attempt.error = result.get("error")
@@ -466,12 +588,53 @@ class OKXInstantBuyer:
         """Return human-readable price (already normalised by _fetch_listings)."""
         return listing.get("_price_human", 999999.0)
 
-    def _execute_buy(self, listing: dict, chain: str, price: float) -> dict[str, Any]:
+    def _execute_buy(
+        self,
+        listing: dict,
+        chain: str,
+        price: float,
+        *,
+        collection_address: str | None = None,
+        currency: str | None = None,
+    ) -> dict[str, Any]:
         """Execute buy via OKX v5 API → on-chain tx.
 
-        1. Call OKX /api/v5/mktplace/nft/markets/buy to get tx calldata
-        2. Build + sign + submit the transaction on-chain via web3
+        Every call, including direct/internal calls that bypass ``try_buy()``, is
+        gated through ExecutionGovernor before nonce allocation/sign/broadcast.
         """
+        chain = str(chain or "").strip().lower()
+        if chain == "ethereum":
+            chain = "eth"
+
+        resolved_collection = str(
+            collection_address
+            or listing.get("collectionAddress")
+            or listing.get("contractAddress")
+            or listing.get("collection_address")
+            or ""
+        ).strip().lower()
+        resolved_currency = str(
+            currency
+            or listing.get("currency")
+            or listing.get("currencySymbol")
+            or CHAIN_CONFIG.get(chain, {}).get("native", "")
+        ).strip().upper()
+
+        blocked, price_bnb_equiv, price_usd = self._live_buy_gate(
+            collection_address=resolved_collection,
+            chain=chain,
+            price=price,
+            currency=resolved_currency,
+        )
+        if blocked:
+            log.warning(
+                "LIVE BUY blocked before execution for %s [%s]: %s",
+                resolved_collection or "unknown",
+                chain or "unknown",
+                blocked,
+            )
+            return {"success": False, "error": f"LIVE_GATE_BLOCKED:{blocked}"}
+
         if not self.buyer_address or not self.buyer_key:
             return {"success": False, "error": "BUYER_WALLET not configured"}
 
@@ -512,11 +675,25 @@ class OKXInstantBuyer:
             if buy_data.get("approval_needed"):
                 return {"success": False, "error": "ERC20 approval needed — not yet automated for buy"}
 
+            # Re-check immediately before nonce allocation.  This closes the
+            # window where live arm can expire or a killswitch/rate limit can
+            # become active while OKX calldata is being fetched.
+            governor = self._get_governor()
+            final_blocked = governor.check_live_submit_allowed(
+                action_type="LIVE_BUY",
+                collection=resolved_collection,
+                chain=chain,
+                price_bnb=float(price_bnb_equiv or 0.0),
+                price_usd=float(price_usd or 0.0),
+            )
+            if final_blocked:
+                return {"success": False, "error": f"LIVE_GATE_BLOCKED:{final_blocked}"}
+
             # Step 2: Build on-chain transaction
-            chain_cfg = CHAIN_CONFIG.get(chain, CHAIN_CONFIG.get("eth", {}))
+            chain_cfg = CHAIN_CONFIG[chain]
             value_wei = int(value_str) if value_str.isdigit() else int(float(value_str) * 10**18)
 
-            nonce = self._get_governor().allocate_nonce(self.buyer_address, chain)
+            nonce = governor.allocate_nonce(self.buyer_address, chain)
 
             gas_price = w3.eth.gas_price
             max_gas_wei = int(self.max_gas_gwei * 10**9)
@@ -529,7 +706,7 @@ class OKXInstantBuyer:
                 "data": input_data,
                 "value": value_wei,
                 "nonce": nonce,
-                "chainId": chain_cfg.get("chain_id", 56),
+                "chainId": chain_cfg["chain_id"],
             }
 
             # Gas: try EIP-1559, fall back to legacy
@@ -553,6 +730,15 @@ class OKXInstantBuyer:
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
             tx_hash_hex = tx_hash.hex()
             explorer = chain_cfg.get("explorer", "")
+
+            self._record_live_buy_submit(
+                governor,
+                collection_address=resolved_collection,
+                chain=chain,
+                price_bnb_equiv=float(price_bnb_equiv or 0.0),
+                price_usd=float(price_usd or 0.0),
+                tx_hash=tx_hash_hex,
+            )
 
             log.warning("🚀 BUY TX SUBMITTED: %s%s", explorer, tx_hash_hex)
 
@@ -674,4 +860,3 @@ class OKXInstantBuyer:
                 urllib.request.urlopen(req, timeout=10)
             except Exception as exc:
                 log.warning("Telegram notify failed: %s", exc)
-    
