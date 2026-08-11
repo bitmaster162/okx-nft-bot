@@ -13,6 +13,7 @@ from okx_nft_bot.clients.http import StdlibHttpTransport
 from okx_nft_bot.analytics import ExecutionHealthAnalyzer, PnlGuardAnalyzer, PortfolioRiskAnalyzer, WalletPnlAnalyzer
 from okx_nft_bot.config import Settings
 from okx_nft_bot.storage.sqlite import SQLiteStore
+from okx_nft_bot.undercutter.state import PositionState
 
 logger = logging.getLogger(__name__)
 _HEALTH_ALERT_CHANNEL = 'ops_health'
@@ -215,8 +216,6 @@ def is_alertable_health_result(result: HealthResult) -> bool:
 
 
 def _build_execution_snapshot(settings: Settings) -> dict[str, Any]:
-    from okx_nft_bot.undercutter.state import PositionState
-
     payload: dict[str, Any] = {
         'db_path': str(settings.execution_db_path),
         'db_exists': settings.execution_db_path.exists(),
