@@ -11,6 +11,8 @@ Do not rely on the infographic alone.
 5. Read [`METHODOLOGY.md`](METHODOLOGY.md) for the strict low→later-high rule.
 6. Inspect `data/ALL_344_part01.csv` through `part05.csv` for the complete normalized set.
 7. Check [`PUBLIC_MIRROR_MANIFEST.sha256`](PUBLIC_MIRROR_MANIFEST.sha256) for integrity references.
+8. Read [`BINANCE_MARKET_SURVEILLANCE_2023.md`](BINANCE_MARKET_SURVEILLANCE_2023.md) for Binance's own primary-source NFT wash-trading standard.
+9. Read [`HISTORY_ALPINE_RACE_2026-03.md`](HISTORY_ALPINE_RACE_2026-03.md) for the separately classified March 2026 historical continuity evidence.
 
 ## Example
 
@@ -20,6 +22,12 @@ Denmark #47065203:
 - later high record: `$45`, `Fan-Token-4`, `2026-08-08 22:18:38`, message `1518333`
 - interval: `27 seconds`
 - Binance item: https://www.binance.com/ru/nft/item/47065203
+
+## Evidence hierarchy
+
+- **Primary-source verified:** Binance Market Surveillance emails from 17 February and 10 March 2023.
+- **Dataset-derived:** August 2026 `PURCHASED LOTS` export and strict 344-candidate audit.
+- **Historical continuity:** March 2026 Alpine Race Collectibles video-backed archive analysis; not promoted to independently verified marketplace data.
 
 ## What the evidence supports
 
