@@ -1,0 +1,7 @@
+from __future__ import annotations
+
+from okx_nft_bot.sniper.offer_blaster_accounting import install_offer_blaster_accounting
+from okx_nft_bot.sniper.offer_blaster import OfferBlaster
+from okx_nft_bot.counterbid.okx_api import OKXAPIClient
+
+install_offer_blaster_accounting(OfferBlaster, OKXAPIClient)
