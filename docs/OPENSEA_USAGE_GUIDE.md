@@ -50,7 +50,7 @@ print(result)
 result = client.create_opensea_offer(
     chain="eth",
     collection_address="0x...",
-    token_id=None,  # or "0" or "" - signals collection offer
+    token_id=None,  # or "" - explicit absence signals collection offer; 0/"0" is item #0
     price_wei=int(2 * 10**18),  # 2 WETH
     currency_address="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
 )
