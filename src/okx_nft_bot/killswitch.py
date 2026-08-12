@@ -225,6 +225,20 @@ def _unidentified_exchange_id(row: dict) -> str:
     return f"exchange_unidentified_{digest}"
 
 
+def _local_offer_marketplace(offer: object) -> str:
+    """Return explicit local marketplace; legacy rows default to OKX.
+
+    active_offers predates marketplace-aware inventory. Existing rows without a
+    tag are therefore OKX by construction. A present non-OKX tag must never be
+    routed through OKX cancellation merely because it shares the same chain.
+    """
+    payload = getattr(offer, "preview_payload", None)
+    if not isinstance(payload, dict):
+        return "okx"
+    value = str(payload.get("marketplace") or "").strip().lower()
+    return value or "okx"
+
+
 def _cancel_chain(
     *,
     state: PositionState | None,
@@ -250,6 +264,19 @@ def _cancel_chain(
                 chain,
                 exc,
             )
+
+    # R40: local inventory is multi-marketplace. The exchange API below is OKX
+    # only, so only legacy/explicit OKX rows may participate in OKX fallback or
+    # reconciliation. Every other active marketplace remains unresolved until a
+    # separately verified cancellation adapter exists and is marked failed-closed.
+    okx_active_offers = []
+    unsupported_active_offers: list[tuple[object, str]] = []
+    for offer in active_offers:
+        marketplace = _local_offer_marketplace(offer)
+        if marketplace == "okx":
+            okx_active_offers.append(offer)
+        else:
+            unsupported_active_offers.append((offer, marketplace))
 
     exchange_lookup_failed = False
     exchange_lookup_error: str | None = None
@@ -307,7 +334,7 @@ def _cancel_chain(
             )
         exchange_order_hashes = [
             offer.order_hash
-            for offer in active_offers
+            for offer in okx_active_offers
             if not offer.order_hash.startswith("dryrun-")
         ]
 
@@ -318,6 +345,10 @@ def _cancel_chain(
         f"{quarantine_id}:missing_order_id"
         for quarantine_id in unidentified_exchange_orders
     ]
+    for offer, marketplace in unsupported_active_offers:
+        failed.append(
+            f"{offer.order_hash}:{marketplace}_cancel_unavailable"
+        )
     failed_order_hashes: list[str] = []
     successful_live_cancels: set[str] = set()
 
@@ -360,8 +391,23 @@ def _cancel_chain(
         )
 
     if state is not None:
+        # R40: unsupported marketplace exposure is not "already gone" merely
+        # because OKX inventory cannot see it. Persist an explicit zombie state
+        # so every later live-submit boundary remains fail-closed.
+        for offer, marketplace in unsupported_active_offers:
+            try:
+                state.mark_offer_status(
+                    order_hash=offer.order_hash,
+                    status="killswitch_failed",
+                )
+            except Exception as exc:
+                note_state_persistence_failure(
+                    f"mark_{marketplace}_killswitch_failed[{offer.order_hash}]",
+                    exc,
+                )
+
         failed_hash_set = set(failed_order_hashes)
-        for offer in active_offers:
+        for offer in okx_active_offers:
             if offer.order_hash.startswith("dryrun-"):
                 try:
                     marked = state.mark_offer_status(
@@ -416,7 +462,7 @@ def _cancel_chain(
                     if marked:
                         already_gone += 1
 
-        active_hash_set = {offer.order_hash for offer in active_offers}
+        active_hash_set = {offer.order_hash for offer in okx_active_offers}
         for order_hash in failed_order_hashes:
             if order_hash in active_hash_set:
                 continue
