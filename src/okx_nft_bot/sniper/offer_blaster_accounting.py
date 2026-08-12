@@ -127,20 +127,20 @@ def install_offer_blaster_accounting(
     blaster_class: type[Any],
     okx_client_class: type[Any],
 ) -> None:
-    """Account every durable ETH OfferBlaster submit exactly at its caller boundary.
+    """Track every durable ETH OfferBlaster submit at its caller boundary.
 
-    Other OKX callers already own their execution_submit_log rows. ContextVar
-    scoping keeps this patch specific to OfferBlaster._blast_eth so those paths
-    are not double-counted.
+    Other OKX callers already own their execution_submit_log and active-offer
+    state. ContextVar scoping keeps this patch specific to OfferBlaster._blast_eth
+    so those paths are not double-counted.
     """
     current_blast = blaster_class._blast_eth
     current_submit = okx_client_class.submit_offer
-    blast_installed = bool(getattr(current_blast, "_r26_accounting_context", False))
-    submit_installed = bool(getattr(current_submit, "_r26_accounting_guard", False))
+    blast_installed = bool(getattr(current_blast, "_r27_active_offer_tracking", False))
+    submit_installed = bool(getattr(current_submit, "_r27_active_offer_tracking", False))
     if blast_installed and submit_installed:
         return
     if blast_installed != submit_installed:
-        raise RuntimeError("partial R26 OfferBlaster accounting installation detected")
+        raise RuntimeError("partial R27 OfferBlaster state installation detected")
 
     original_blast = current_blast
     original_submit = current_submit
@@ -184,6 +184,17 @@ def install_offer_blaster_accounting(
             from okx_nft_bot.undercutter.state import PositionState
 
             state = PositionState(_execution_db_path(context, self))
+            # R27: the kill switch falls back to local active_offers when the
+            # exchange lookup is unavailable. Persist the durable ETH offer
+            # before the submit-ledger row so a later ledger-write failure still
+            # leaves the live offer visible to that degraded emergency path.
+            state.upsert_active_offer(
+                order_hash=offer_id,
+                collection=collection,
+                chain="eth",
+                price_bnb=price_bnb,
+                status="active",
+            )
             state.record_submit_event(
                 engine="offer_blaster",
                 action_type="LIVE_OFFER_BLAST",
@@ -210,5 +221,7 @@ def install_offer_blaster_accounting(
 
     guarded_blast_eth._r26_accounting_context = True
     guarded_submit_offer._r26_accounting_guard = True
+    guarded_blast_eth._r27_active_offer_tracking = True
+    guarded_submit_offer._r27_active_offer_tracking = True
     blaster_class._blast_eth = guarded_blast_eth
     okx_client_class.submit_offer = guarded_submit_offer
