@@ -247,9 +247,7 @@ def test_missing_durable_receipt_fails_safe_after_submit(monkeypatch):
     assert FakeClient.submit_calls == 1
     assert "durable OKX offer receipt unavailable" in str(results[0])
     assert client.settings.dry_run is True
-    # Receipt validation occurs before PositionState exists; local settings dry-run
-    # still protects subsequent clients sharing the same Settings object.
-    assert forced == []
+    assert forced == [(True, "offer_blaster_submit_log_failure")]
 
 
 def test_unexpected_chain_blocks_before_okx_effect():
