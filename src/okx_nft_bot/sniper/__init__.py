@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from okx_nft_bot.sniper.offer_blaster_accounting import install_offer_blaster_accounting
+from okx_nft_bot.sniper.opensea_mirror_safety import install_opensea_mirror_safety
 from okx_nft_bot.sniper.offer_blaster import OfferBlaster
+from okx_nft_bot.sniper.counter_bidder import CounterBidder
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient
+from okx_nft_bot.clients.opensea import OpenSeaClient
 
 install_offer_blaster_accounting(OfferBlaster, OKXAPIClient)
+install_opensea_mirror_safety(CounterBidder, OpenSeaClient)
