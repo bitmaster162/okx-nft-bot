@@ -17,10 +17,12 @@ class _Governor:
 
 
 def _install_governor(monkeypatch, blocked=None):
+    import okx_nft_bot.counterbid.submit_safety as safety
     import okx_nft_bot.execution_governor as governor_module
 
     _Governor.blocked = blocked
     monkeypatch.setattr(governor_module, "ExecutionGovernor", _Governor)
+    monkeypatch.setattr(safety, "_bsc_quota_block_reason", lambda _client: None)
 
 
 def _buy_payload(*, chain=56, wallet=None, offerer=None, amount=100):
