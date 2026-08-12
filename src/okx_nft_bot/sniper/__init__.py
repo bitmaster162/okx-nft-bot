@@ -4,6 +4,7 @@ from okx_nft_bot.sniper.offer_blaster_accounting import install_offer_blaster_ac
 from okx_nft_bot.sniper.opensea_mirror_safety import install_opensea_mirror_safety
 from okx_nft_bot.sniper.opensea_submit_route_safety import install_opensea_submit_route_safety
 from okx_nft_bot.sniper.opensea_effect_boundary_safety import install_opensea_effect_boundary_safety
+from okx_nft_bot.sniper.opensea_conduit_allowance_safety import install_opensea_conduit_allowance_safety
 from okx_nft_bot.sniper.opensea_receipt_reconciliation import install_opensea_receipt_reconciliation
 from okx_nft_bot.sniper.offer_blaster import OfferBlaster
 from okx_nft_bot.sniper.counter_bidder import CounterBidder
@@ -13,5 +14,6 @@ from okx_nft_bot.clients.opensea import OpenSeaClient
 install_offer_blaster_accounting(OfferBlaster, OKXAPIClient)
 install_opensea_submit_route_safety(OpenSeaClient)
 install_opensea_effect_boundary_safety(OpenSeaClient)
+install_opensea_conduit_allowance_safety(OpenSeaClient)
 install_opensea_mirror_safety(CounterBidder, OpenSeaClient)
 install_opensea_receipt_reconciliation(CounterBidder, OpenSeaClient)
