@@ -396,12 +396,7 @@ class UndercutEngine:
                                 chain=action.chain or "",
                             )
                         else:
-                            logger.warning(
-                                "submit_offer returned empty offer_id for %s — "
-                                "skipping state write AND keeping old offer "
-                                "(reconcile will recover)",
-                                action.collection,
-                            )
+                            raise RuntimeError("no_offer_id_in_response")
                         self.state.record_submit_event(
                             engine="undercutter",
                             action_type=logged_action_type,
