@@ -6,6 +6,19 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 
+class _SettingsProxy:
+    """Read through to settings while overriding only the OpenSea API base."""
+
+    __slots__ = ("_wrapped", "opensea_api_base")
+
+    def __init__(self, wrapped: Any, *, opensea_api_base: str) -> None:
+        self._wrapped = wrapped
+        self.opensea_api_base = opensea_api_base
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+
 def canonical_opensea_api_base(value: Any) -> str:
     """Return an OpenSea API base that ends in exactly one ``/api`` segment.
 
@@ -61,13 +74,15 @@ def install_opensea_submit_route_safety(client_class: type[Any]) -> None:
             getattr(settings, "opensea_api_base", None)
         )
 
-        # Do not mutate the live client/settings object.  CounterBidder may reuse
-        # it across cycles, and a route-normalization safety patch must not become
-        # a hidden runtime configuration write or a cross-call race.
+        # Do not mutate the live client/settings object. CounterBidder may reuse
+        # it across cycles, and test/runtime settings may expose read-only
+        # properties. A read-through proxy overrides exactly one value without
+        # requiring a setter or creating a hidden configuration write.
         cloned_client = copy(self)
-        cloned_settings = copy(settings)
-        cloned_settings.opensea_api_base = canonical_base
-        cloned_client.settings = cloned_settings
+        cloned_client.settings = _SettingsProxy(
+            settings,
+            opensea_api_base=canonical_base,
+        )
         return original(cloned_client, *args, **kwargs)
 
     canonical_submit._r41_opensea_canonical_submit_route = True
