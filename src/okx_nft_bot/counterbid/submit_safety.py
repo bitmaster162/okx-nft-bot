@@ -52,6 +52,43 @@ def _item_type(item: Mapping[str, Any]) -> int | None:
         return None
 
 
+def _submit_item_parameters(advanced: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Extract signed Seaport parameters from an OKX submitOrder item.
+
+    Repository callers/tests historically used ``items[].parameters`` directly,
+    while the real two-step OKX flow writes the signed message into
+    ``items[].protocolData`` as JSON just before the final POST. Supporting both
+    shapes keeps the guard compatible while ensuring the production payload is
+    actually inspected.
+    """
+    direct = advanced.get("parameters")
+    if isinstance(direct, Mapping):
+        return direct
+
+    if "protocolData" not in advanced:
+        return None
+
+    protocol_data = advanced.get("protocolData")
+    if isinstance(protocol_data, str):
+        import json
+
+        try:
+            decoded = json.loads(protocol_data)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("submit item protocolData is invalid JSON") from exc
+    elif isinstance(protocol_data, Mapping):
+        decoded = protocol_data
+    else:
+        raise ValueError("submit item protocolData has invalid type")
+
+    if not isinstance(decoded, Mapping):
+        raise ValueError("submit item protocolData must decode to an object")
+    parameters = decoded.get("parameters")
+    if not isinstance(parameters, Mapping):
+        raise ValueError("submit item protocolData missing Seaport parameters")
+    return parameters
+
+
 def _buy_erc20_requirements(
     payload: Mapping[str, Any] | None,
 ) -> tuple[str, dict[str, int]] | None:
@@ -75,8 +112,8 @@ def _buy_erc20_requirements(
     for advanced in raw_items:
         if not isinstance(advanced, Mapping):
             continue
-        parameters = advanced.get("parameters")
-        if not isinstance(parameters, Mapping):
+        parameters = _submit_item_parameters(advanced)
+        if parameters is None:
             continue
 
         consideration = parameters.get("consideration")
@@ -222,7 +259,7 @@ def _bsc_quota_block_reason(client: Any) -> str | None:
 def install_submit_safety(client_class: type[Any]) -> None:
     """Gate OKX Seaport submitOrder at the final HTTP effect boundary."""
     original_request = client_class._request
-    if getattr(original_request, "_r21_quota_guard", False):
+    if getattr(original_request, "_r22_protocoldata_guard", False):
         return
 
     original_complete = client_class._complete_two_step_offer
@@ -291,11 +328,10 @@ def install_submit_safety(client_class: type[Any]) -> None:
                     f"submitOrder live gate blocked: {blocked}"
                 )
 
-            # R20: CounterBidder historically treated balance-read failures as
-            # permission to proceed. Reconstruct the actual signed BUY-side
-            # ERC20 requirement at the final submit boundary and compare raw
-            # token units directly against on-chain balanceOf. No price oracle,
-            # decimals conversion, or upstream cache is trusted here.
+            # R20/R22: reconstruct the actual signed BUY-side ERC20 requirement
+            # from either direct parameters or the protocolData JSON emitted by
+            # the real OKX two-step flow. No upstream cache/price conversion is
+            # trusted at this final effect boundary.
             try:
                 balance_gate = _buy_erc20_requirements(payload)
             except Exception as exc:
@@ -354,6 +390,7 @@ def install_submit_safety(client_class: type[Any]) -> None:
     guarded_request._r16_submit_guard = True
     guarded_request._r20_balance_guard = True
     guarded_request._r21_quota_guard = True
+    guarded_request._r22_protocoldata_guard = True
     guarded_complete_two_step_offer._r16_submit_context = True
 
     client_class._request = guarded_request
