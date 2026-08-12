@@ -11,8 +11,12 @@ _STRICT_INVENTORY: ContextVar[bool] = ContextVar(
 )
 _STRICT_ENDPOINTS = frozenset(
     {
+        # Legacy/private inventory routes retained for compatibility.
         "/priapi/v1/nft/trading/offer/token/list",
         "/priapi/v1/nft/trading/offer/collection/list",
+        # Current OKXAPIClient.get_my_offers() authoritative read routes.
+        "/api/v5/mktplace/nft/markets/offers",
+        "/api/v5/mktplace/nft/markets/collection-offers",
     }
 )
 
