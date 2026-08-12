@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 from typing import Iterable
@@ -110,6 +111,17 @@ def _exchange_collection(row: dict) -> str:
     return collection or "exchange_unknown"
 
 
+def _unidentified_exchange_id(row: dict) -> str:
+    canonical = json.dumps(
+        row,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()[:20]
+    return f"exchange_unidentified_{digest}"
+
+
 def _cancel_chain(
     *,
     state: PositionState,
@@ -122,6 +134,7 @@ def _cancel_chain(
     exchange_order_hashes: list[str] = []
     exchange_order_params: dict[str, dict] = {}
     exchange_order_collections: dict[str, str] = {}
+    unidentified_exchange_orders: dict[str, str] = {}
 
     try:
         seen: set[str] = set()
@@ -129,7 +142,14 @@ def _cancel_chain(
             order_hash = str(
                 row.get("offerId") or row.get("orderHash") or row.get("id") or ""
             ).strip()
-            if not order_hash or order_hash in seen:
+            if not order_hash:
+                quarantine_id = _unidentified_exchange_id(row)
+                unidentified_exchange_orders.setdefault(
+                    quarantine_id,
+                    _exchange_collection(row),
+                )
+                continue
+            if order_hash in seen:
                 continue
             seen.add(order_hash)
             exchange_order_hashes.append(order_hash)
@@ -156,7 +176,10 @@ def _cancel_chain(
     live_cancelled = 0
     local_cancelled = 0
     already_gone = 0
-    failed: list[str] = []
+    failed: list[str] = [
+        f"{quarantine_id}:missing_order_id"
+        for quarantine_id in unidentified_exchange_orders
+    ]
     failed_order_hashes: list[str] = []
     successful_live_cancels: set[str] = set()
 
@@ -219,10 +242,23 @@ def _cancel_chain(
             status="killswitch_failed",
         )
 
+    # R29: an exchange row without any durable order identifier is not a clean
+    # cancellation result. It cannot safely be sent to cancel_offer, so persist
+    # a deterministic quarantine fingerprint instead. This keeps the governor
+    # vetoed until the unidentified exchange object is investigated manually.
+    for quarantine_id, collection in unidentified_exchange_orders.items():
+        state.upsert_active_offer(
+            order_hash=quarantine_id,
+            collection=collection,
+            chain=chain,
+            price_bnb=0.0,
+            status="killswitch_failed",
+        )
+
     result = KillSwitchChainResult(
         chain=chain,
         active_offers_seen=len(active_offers),
-        exchange_seen=len(exchange_order_hashes),
+        exchange_seen=len(exchange_order_hashes) + len(unidentified_exchange_orders),
         live_cancelled=live_cancelled,
         local_cancelled=local_cancelled,
         already_gone=already_gone,
