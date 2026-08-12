@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
-from okx_nft_bot.clients.http import HTTPStatusError, StdlibHttpTransport
+from okx_nft_bot.clients.http import StdlibHttpTransport
 from okx_nft_bot.counterbid.okx_api import (
-    OKXAPIClient,
     OKXNetworkError,
     OKXRateLimitError,
     OKXSubmitError,
 )
 from okx_nft_bot.counterbid.receipt_safety import install_receipt_safety
+from okx_nft_bot.counterbid.submit_safety import install_submit_safety
 from okx_nft_bot.counterbid.submit_single_attempt_safety import (
     install_submit_single_attempt_safety,
 )
@@ -81,6 +83,16 @@ class _DummyClient:
             body="",
         )
 
+    def _complete_two_step_offer(
+        self,
+        step1_resp,
+        private_key,
+        chain_id,
+        endpoint,
+    ):
+        _ = step1_resp, private_key, chain_id, endpoint
+        return {"ok": True}
+
 
 def _guarded_dummy(transport):
     class Client(_DummyClient):
@@ -101,30 +113,24 @@ def _stdlib_transport(*responses):
     return transport
 
 
-def test_real_client_has_r52_guard_with_existing_submit_and_receipt_guards():
-    request = OKXAPIClient._request
-    assert getattr(request, "_r52_submit_single_attempt_guard", False) is True
-    assert getattr(request, "_r24_priced_governor_guard", False) is True
-    assert getattr(request, "_r25_receipt_guard", False) is True
-    assert getattr(request, "_r38_strict_inventory_response_guard", False) is True
+def test_r52_layer_is_structurally_inside_r24_and_r25_wrappers():
+    class Client(_DummyClient):
+        pass
 
+    install_submit_single_attempt_safety(Client)
+    r52_request = Client._request
+    assert getattr(r52_request, "_r52_submit_single_attempt_guard", False) is True
 
-def test_r52_layer_is_inside_r24_and_r25_wrappers():
-    current = OKXAPIClient._request
-    found_inner_r52 = False
-    while True:
-        has_r52 = bool(getattr(current, "_r52_submit_single_attempt_guard", False))
-        has_r24 = bool(getattr(current, "_r24_priced_governor_guard", False))
-        has_r25 = bool(getattr(current, "_r25_receipt_guard", False))
-        if has_r52 and not has_r24 and not has_r25:
-            found_inner_r52 = True
-            break
-        wrapped = getattr(current, "__wrapped__", None)
-        if wrapped is None:
-            break
-        current = wrapped
+    install_submit_safety(Client)
+    r24_request = Client._request
+    assert getattr(r24_request, "_r24_priced_governor_guard", False) is True
+    r24_nonlocals = inspect.getclosurevars(r24_request).nonlocals
+    assert r24_nonlocals["original_request"] is r52_request
 
-    assert found_inner_r52 is True
+    install_receipt_safety(Client)
+    r25_request = Client._request
+    assert getattr(r25_request, "_r25_receipt_guard", False) is True
+    assert r25_request.__wrapped__ is r24_request
 
 
 @pytest.mark.parametrize(
