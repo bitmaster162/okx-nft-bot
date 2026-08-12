@@ -181,6 +181,16 @@ class OpenSeaClient:
         # Sign the order with EIP-712
         signature = self._sign_seaport_order(order_params, _private_key, chain_id=1)
 
+        # Public/direct creation must be reconcilable before any marketplace
+        # effect can occur. The private submit helper remains tolerant of old
+        # low-level test stubs, but this supported path always fails closed.
+        try:
+            self._derive_seaport_order_hash(order_params)
+        except Exception as exc:
+            raise RuntimeError(
+                f"OpenSea live submit blocked: deterministic order hash unavailable: {exc}"
+            ) from exc
+
         # Submit to OpenSea API
         return self._submit_opensea_offer(order_params, signature, chain)
 
@@ -593,14 +603,14 @@ class OpenSeaClient:
         if blocked_reason:
             raise RuntimeError(f"OpenSea live submit blocked: {blocked_reason}")
 
-        # Receipt reconciliation is only safe if the exact deterministic Seaport
-        # order hash is known before the effectful POST can leave this process.
+        # The supported public create path validates this strictly before calling
+        # us. Keep the low-level helper compatible with tests/private callers that
+        # provide only a partial request shape; such calls simply cannot reconcile
+        # an ambiguous receipt and therefore retain the legacy failure contract.
         try:
-            expected_order_hash = self._derive_seaport_order_hash(parameters)
-        except Exception as exc:
-            raise RuntimeError(
-                f"OpenSea live submit blocked: deterministic order hash unavailable: {exc}"
-            ) from exc
+            expected_order_hash: str | None = self._derive_seaport_order_hash(parameters)
+        except Exception:
+            expected_order_hash = None
 
         # Build request body.
         # PATCH 2026-08-06 (OPENSEA_PROTOCOL_ADDRESS): без protocol_address
@@ -674,6 +684,13 @@ class OpenSeaClient:
         except Exception as exc:
             if not submit_attempted or not self._ambiguous_submit_failure(exc):
                 log.error("OpenSea offer submission failed: %s", exc)
+                raise RuntimeError(f"Failed to submit offer to OpenSea: {exc}") from exc
+
+            if expected_order_hash is None:
+                log.error(
+                    "OpenSea ambiguous receipt cannot be reconciled without deterministic order hash: %s",
+                    exc,
+                )
                 raise RuntimeError(f"Failed to submit offer to OpenSea: {exc}") from exc
 
             try:
