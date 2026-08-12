@@ -28,12 +28,15 @@ class KillSwitchChainResult:
     fatal_error: str | None = None
     local_state_lookup_failed: bool = False
     local_state_lookup_error: str | None = None
+    local_state_persistence_failed: bool = False
+    local_state_persistence_error: str | None = None
 
     @property
     def failure_count(self) -> int:
+        state_degraded = self.local_state_lookup_failed or self.local_state_persistence_failed
         return (
             len(self.failed)
-            + (1 if self.local_state_lookup_failed else 0)
+            + (1 if state_degraded else 0)
             + (1 if self.fatal_error else 0)
         )
 
@@ -117,7 +120,6 @@ def activate_multichain_killswitch(
         try:
             resolved_state.audit_integrity()
         except Exception as exc:
-            # Preserve R31's plain audit error when it is the only preflight failure.
             preflight_errors.append(str(exc))
             logger.exception(
                 "Kill switch integrity preflight failed after safety latch; continuing cancellation"
@@ -196,8 +198,8 @@ def _cancel_chain(
     chain: str,
     state_unavailable_error: str | None = None,
 ) -> KillSwitchChainResult:
-    # R33: local SQLite is fallback/accounting input, not a prerequisite for
-    # exchange discovery. R34 extends this to total state-constructor failure.
+    # R33/R34: local SQLite is fallback/accounting input, not a prerequisite for
+    # exchange discovery or cancellation.
     local_state_lookup_failed = False
     local_state_lookup_error: str | None = None
     if state is None:
@@ -254,8 +256,6 @@ def _cancel_chain(
         exchange_lookup_error = str(exc)
         logger.warning("Kill switch exchange lookup failed chain=%s: %s", chain, exc)
         if state is None:
-            # No local fallback exists at all. This chain could not discover any
-            # cancellation targets, so surface a fatal chain result explicitly.
             return KillSwitchChainResult(
                 chain=chain,
                 active_offers_seen=0,
@@ -311,49 +311,112 @@ def _cancel_chain(
             failed_order_hashes.append(order_hash)
             failed.append(f"{order_hash}:cancel_failed")
 
-    # Local state reconciliation/quarantine is impossible in R34 exchange-only
-    # mode. Never simulate successful persistence; the global state_init
-    # preflight failure plus any per-order failure remains visible in the result.
+    # R35: after exchange effects, local state persistence is secondary. Failure
+    # to mark/upsert must not erase real exchange_seen/live_cancelled/failed data.
+    local_state_persistence_errors: list[str] = []
+
+    def note_state_persistence_failure(operation: str, exc: Exception) -> None:
+        message = f"{operation}: {exc}"
+        local_state_persistence_errors.append(message)
+        logger.warning(
+            "Kill switch local state persistence failed chain=%s operation=%s: %s",
+            chain,
+            operation,
+            exc,
+        )
+
     if state is not None:
         failed_hash_set = set(failed_order_hashes)
         for offer in active_offers:
             if offer.order_hash.startswith("dryrun-"):
-                if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
-                    local_cancelled += 1
+                try:
+                    marked = state.mark_offer_status(
+                        order_hash=offer.order_hash,
+                        status="cancelled",
+                    )
+                except Exception as exc:
+                    note_state_persistence_failure(
+                        f"mark_dryrun_cancelled[{offer.order_hash}]",
+                        exc,
+                    )
+                else:
+                    if marked:
+                        local_cancelled += 1
                 continue
             if offer.order_hash in successful_live_cancels:
-                state.mark_offer_status(order_hash=offer.order_hash, status="cancelled")
+                try:
+                    state.mark_offer_status(
+                        order_hash=offer.order_hash,
+                        status="cancelled",
+                    )
+                except Exception as exc:
+                    note_state_persistence_failure(
+                        f"mark_cancelled[{offer.order_hash}]",
+                        exc,
+                    )
                 continue
             if offer.order_hash in failed_hash_set:
-                state.mark_offer_status(
-                    order_hash=offer.order_hash,
-                    status="killswitch_failed",
-                )
+                try:
+                    state.mark_offer_status(
+                        order_hash=offer.order_hash,
+                        status="killswitch_failed",
+                    )
+                except Exception as exc:
+                    note_state_persistence_failure(
+                        f"mark_killswitch_failed[{offer.order_hash}]",
+                        exc,
+                    )
                 continue
             if not exchange_lookup_failed:
-                if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
-                    already_gone += 1
+                try:
+                    marked = state.mark_offer_status(
+                        order_hash=offer.order_hash,
+                        status="cancelled",
+                    )
+                except Exception as exc:
+                    note_state_persistence_failure(
+                        f"mark_already_gone[{offer.order_hash}]",
+                        exc,
+                    )
+                else:
+                    if marked:
+                        already_gone += 1
 
         active_hash_set = {offer.order_hash for offer in active_offers}
         for order_hash in failed_order_hashes:
             if order_hash in active_hash_set:
                 continue
-            state.upsert_active_offer(
-                order_hash=order_hash,
-                collection=exchange_order_collections.get(order_hash, "exchange_unknown"),
-                chain=chain,
-                price_bnb=0.0,
-                status="killswitch_failed",
-            )
+            try:
+                state.upsert_active_offer(
+                    order_hash=order_hash,
+                    collection=exchange_order_collections.get(order_hash, "exchange_unknown"),
+                    chain=chain,
+                    price_bnb=0.0,
+                    status="killswitch_failed",
+                )
+            except Exception as exc:
+                note_state_persistence_failure(
+                    f"upsert_killswitch_failed[{order_hash}]",
+                    exc,
+                )
 
         for quarantine_id, collection in unidentified_exchange_orders.items():
-            state.upsert_active_offer(
-                order_hash=quarantine_id,
-                collection=collection,
-                chain=chain,
-                price_bnb=0.0,
-                status="killswitch_failed",
-            )
+            try:
+                state.upsert_active_offer(
+                    order_hash=quarantine_id,
+                    collection=collection,
+                    chain=chain,
+                    price_bnb=0.0,
+                    status="killswitch_failed",
+                )
+            except Exception as exc:
+                note_state_persistence_failure(
+                    f"upsert_unidentified[{quarantine_id}]",
+                    exc,
+                )
+
+    local_state_persistence_error = "; ".join(local_state_persistence_errors) or None
+    local_state_persistence_failed = bool(local_state_persistence_errors)
 
     result = KillSwitchChainResult(
         chain=chain,
@@ -367,6 +430,8 @@ def _cancel_chain(
         exchange_lookup_error=exchange_lookup_error,
         local_state_lookup_failed=local_state_lookup_failed,
         local_state_lookup_error=local_state_lookup_error,
+        local_state_persistence_failed=local_state_persistence_failed,
+        local_state_persistence_error=local_state_persistence_error,
     )
     if state is None:
         if state_unavailable_error:
@@ -376,7 +441,7 @@ def _cancel_chain(
                 state_unavailable_error,
             )
         return result
-    if local_state_lookup_failed:
+    if local_state_lookup_failed or local_state_persistence_failed:
         _record_chain_audit_best_effort(state, result)
     else:
         _record_chain_audit(state, result)
@@ -384,6 +449,11 @@ def _cancel_chain(
 
 
 def _record_chain_audit(state: PositionState, result: KillSwitchChainResult) -> None:
+    persistence_suffix = (
+        ";local_state_persistence_failed=1"
+        if result.local_state_persistence_failed
+        else ""
+    )
     state.record_submit_event(
         engine="runtime",
         action_type="KILLSWITCH",
@@ -397,14 +467,31 @@ def _record_chain_audit(state: PositionState, result: KillSwitchChainResult) -> 
             f"failed={result.failure_count};"
             f"local_state_lookup_failed={1 if result.local_state_lookup_failed else 0};"
             f"exchange_lookup_failed={1 if result.exchange_lookup_failed else 0};"
-            f"fatal={1 if result.fatal_error else 0}"
+            f"fatal={1 if result.fatal_error else 0}{persistence_suffix}"
         ),
     )
     errors = list(result.failed)
     if result.local_state_lookup_failed:
         errors.append(f"local_state_lookup:{result.local_state_lookup_error}")
+    if result.local_state_persistence_failed:
+        errors.append(f"local_state_persistence:{result.local_state_persistence_error}")
     if result.fatal_error:
         errors.append(f"fatal:{result.fatal_error}")
+    payload = {
+        "exchange_seen": result.exchange_seen,
+        "live_cancelled": result.live_cancelled,
+        "local_cancelled": result.local_cancelled,
+        "already_gone": result.already_gone,
+        "local_state_lookup_failed": result.local_state_lookup_failed,
+        "local_state_lookup_error": result.local_state_lookup_error,
+        "exchange_lookup_failed": result.exchange_lookup_failed,
+        "exchange_lookup_error": result.exchange_lookup_error,
+        "failed": list(result.failed),
+        "fatal_error": result.fatal_error,
+    }
+    if result.local_state_persistence_failed:
+        payload["local_state_persistence_failed"] = True
+        payload["local_state_persistence_error"] = result.local_state_persistence_error
     state.log_action(
         action_type="KILLSWITCH",
         collection="*",
@@ -415,18 +502,7 @@ def _record_chain_audit(state: PositionState, result: KillSwitchChainResult) -> 
         reason="CRITICAL: operator kill switch activated",
         executed=result.failure_count == 0,
         error="; ".join(errors) if errors else None,
-        payload={
-            "exchange_seen": result.exchange_seen,
-            "live_cancelled": result.live_cancelled,
-            "local_cancelled": result.local_cancelled,
-            "already_gone": result.already_gone,
-            "local_state_lookup_failed": result.local_state_lookup_failed,
-            "local_state_lookup_error": result.local_state_lookup_error,
-            "exchange_lookup_failed": result.exchange_lookup_failed,
-            "exchange_lookup_error": result.exchange_lookup_error,
-            "failed": list(result.failed),
-            "fatal_error": result.fatal_error,
-        },
+        payload=payload,
     )
 
 
@@ -455,12 +531,18 @@ def format_killswitch_result(result: KillSwitchResult) -> str:
         if item.fatal_error:
             lines.append(f"chain={item.chain} fatal_error={item.fatal_error}")
             continue
+        persistence_suffix = (
+            " state_persist_failed=1"
+            if item.local_state_persistence_failed
+            else ""
+        )
         lines.append(
             f"chain={item.chain} active_offers_seen={item.active_offers_seen} "
             f"exchange_seen={item.exchange_seen} live_cancelled={item.live_cancelled} "
             f"local_cancelled={item.local_cancelled} already_gone={item.already_gone} "
             f"failed={len(item.failed)} zombies={len(item.failed)} "
             f"state_lookup_failed={1 if item.local_state_lookup_failed else 0}"
+            f"{persistence_suffix}"
         )
     lines.append(f"total_failed={result.total_failed}")
     return "\n".join(lines)
