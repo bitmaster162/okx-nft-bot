@@ -801,7 +801,7 @@ class OKXInstantBuyer:
                 "OK-ACCESS-PASSPHRASE": self.okx_api_passphrase,
             }
 
-            resp = transport.request_json(method="GET", url=url, headers=headers, body=body)
+            resp = transport.request_json(method="GET", url=url, headers=headers, body="")
             data = resp.get("data", [])
             if isinstance(data, list) and data:
                 return data[0]
