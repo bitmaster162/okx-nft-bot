@@ -36,10 +36,11 @@ class KillSwitchChainResult:
 class KillSwitchResult:
     activated_at: str
     chains: tuple[KillSwitchChainResult, ...]
+    preflight_error: str | None = None
 
     @property
     def total_failed(self) -> int:
-        return sum(item.failure_count for item in self.chains)
+        return sum(item.failure_count for item in self.chains) + (1 if self.preflight_error else 0)
 
 
 def activate_multichain_killswitch(
@@ -52,17 +53,29 @@ def activate_multichain_killswitch(
     """Disarm execution first, then cancel offers on every supported chain.
 
     A failure on one chain is isolated and does not prevent the remaining
-    chains from being processed. This is intentionally fail-closed: forced
-    dry-run and live disarm happen before the first exchange/RPC lookup.
+    chains from being processed. This is intentionally fail-closed: process
+    dry-run, persistent disarm and forced dry-run happen before integrity audit
+    and before the first exchange/RPC lookup.
     """
+    # R31: give the invoking process an immediate local safety latch before any
+    # state construction/audit. Persistent state is written immediately after.
+    settings.dry_run = True
     resolved_state = state or PositionState(settings.execution_db_path)
-    resolved_state.audit_integrity()
 
     activated_at = datetime.now(timezone.utc).isoformat()
     resolved_state.disarm_live(actor="telegram_killswitch", reason="telegram_killswitch")
     resolved_state.set_force_dry_run(True, reason="telegram_killswitch")
     resolved_state.set_runtime_value("killswitch_activated_at", activated_at)
     resolved_state.set_runtime_value("killswitch_source", "telegram")
+
+    preflight_error: str | None = None
+    try:
+        resolved_state.audit_integrity()
+    except Exception as exc:
+        preflight_error = str(exc)
+        logger.exception(
+            "Kill switch integrity preflight failed after safety latch; continuing cancellation"
+        )
 
     resolved_api = api or OKXAPIClient(settings=settings)
     resolved_chains = tuple(
@@ -100,7 +113,11 @@ def activate_multichain_killswitch(
             continue
         results.append(result)
 
-    return KillSwitchResult(activated_at=activated_at, chains=tuple(results))
+    return KillSwitchResult(
+        activated_at=activated_at,
+        chains=tuple(results),
+        preflight_error=preflight_error,
+    )
 
 
 def _exchange_collection(row: dict) -> str:
@@ -334,6 +351,8 @@ def format_killswitch_result(result: KillSwitchResult) -> str:
         "dry_run=true",
         f"chains={','.join(item.chain for item in result.chains)}",
     ]
+    if result.preflight_error:
+        lines.append(f"preflight_error={result.preflight_error}")
     for item in result.chains:
         if item.fatal_error:
             lines.append(f"chain={item.chain} fatal_error={item.fatal_error}")
