@@ -89,6 +89,75 @@ def _submit_item_parameters(advanced: Mapping[str, Any]) -> Mapping[str, Any] | 
     return parameters
 
 
+def _signed_counter_requirements(
+    payload: Mapping[str, Any] | None,
+) -> dict[str, int]:
+    """Return signed Seaport counter per offerer for recognized submit items.
+
+    Production two-step payloads always carry the signed message in
+    ``protocolData``. If protocolData is present, offerer/counter are mandatory;
+    malformed signed data is never silently treated as an unrelated submit.
+    Legacy direct test/helper payloads that omit counter remain outside this
+    gate unless they explicitly provide one.
+    """
+    if payload is None:
+        return {}
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, (list, tuple)):
+        return {}
+
+    counters: dict[str, int] = {}
+    for advanced in raw_items:
+        if not isinstance(advanced, Mapping):
+            continue
+        parameters = _submit_item_parameters(advanced)
+        if parameters is None:
+            continue
+
+        has_protocol_data = "protocolData" in advanced
+        raw_offerer = parameters.get("offerer")
+        raw_counter = parameters.get("counter")
+        if raw_offerer is None or raw_counter is None:
+            if has_protocol_data:
+                raise ValueError("signed protocolData missing offerer or counter")
+            continue
+
+        offerer = _canonical_address(raw_offerer, label="offerer")
+        try:
+            counter = int(raw_counter)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("signed Seaport counter is invalid") from exc
+        if counter < 0:
+            raise ValueError("signed Seaport counter must be non-negative")
+
+        previous = counters.get(offerer)
+        if previous is not None and previous != counter:
+            raise ValueError(
+                f"submit batch has conflicting counters for offerer {offerer}"
+            )
+        counters[offerer] = counter
+    return counters
+
+
+def _read_seaport_counter(
+    client: Any,
+    *,
+    chain_name: str,
+    offerer: str,
+) -> int:
+    """Read the current on-chain Seaport counter with configured RPC failover."""
+    from okx_nft_bot.config import get_rpc_urls
+    from okx_nft_bot.signing.seaport_signer import get_counter
+
+    rpc_urls = get_rpc_urls(chain_name)
+    if not rpc_urls:
+        raise RuntimeError(f"no RPC endpoints configured for chain {chain_name}")
+    current = get_counter(offerer, rpc_urls=rpc_urls)
+    if int(current) < 0:
+        raise RuntimeError("on-chain Seaport counter is negative")
+    return int(current)
+
+
 def _buy_erc20_requirements(
     payload: Mapping[str, Any] | None,
 ) -> tuple[str, dict[str, int]] | None:
@@ -259,7 +328,7 @@ def _bsc_quota_block_reason(client: Any) -> str | None:
 def install_submit_safety(client_class: type[Any]) -> None:
     """Gate OKX Seaport submitOrder at the final HTTP effect boundary."""
     original_request = client_class._request
-    if getattr(original_request, "_r22_protocoldata_guard", False):
+    if getattr(original_request, "_r23_counter_guard", False):
         return
 
     original_complete = client_class._complete_two_step_offer
@@ -328,6 +397,29 @@ def install_submit_safety(client_class: type[Any]) -> None:
                     f"submitOrder live gate blocked: {blocked}"
                 )
 
+            # R23: upstream counter synchronization is best-effort and can log
+            # "counter sync skipped" while continuing to sign. At the final
+            # effect boundary, compare every recognized signed Seaport counter
+            # with fresh on-chain state. Unknown or stale counter state blocks.
+            try:
+                signed_counters = _signed_counter_requirements(payload)
+                for offerer, signed_counter in signed_counters.items():
+                    current_counter = _read_seaport_counter(
+                        self,
+                        chain_name=chain_name,
+                        offerer=offerer,
+                    )
+                    if current_counter != signed_counter:
+                        raise RuntimeError(
+                            "stale Seaport counter "
+                            f"offerer={offerer} signed={signed_counter} "
+                            f"on_chain={current_counter}"
+                        )
+            except Exception as exc:
+                raise OKXSubmitError(
+                    f"submitOrder counter gate blocked: {exc}"
+                ) from exc
+
             # R20/R22: reconstruct the actual signed BUY-side ERC20 requirement
             # from either direct parameters or the protocolData JSON emitted by
             # the real OKX two-step flow. No upstream cache/price conversion is
@@ -391,6 +483,7 @@ def install_submit_safety(client_class: type[Any]) -> None:
     guarded_request._r20_balance_guard = True
     guarded_request._r21_quota_guard = True
     guarded_request._r22_protocoldata_guard = True
+    guarded_request._r23_counter_guard = True
     guarded_complete_two_step_offer._r16_submit_context = True
 
     client_class._request = guarded_request
