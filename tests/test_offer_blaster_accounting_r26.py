@@ -10,6 +10,9 @@ from okx_nft_bot.sniper.offer_blaster_accounting import install_offer_blaster_ac
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient
 
 
+WETH_ADDRESS = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+
+
 def _payload(*, chain="eth", offer_id="offer-1"):
     _ = offer_id
     wallet = "0x" + "1" * 40
@@ -25,7 +28,7 @@ def _payload(*, chain="eth", offer_id="offer-1"):
             "offer": [
                 {
                     "itemType": 1,
-                    "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                    "token": WETH_ADDRESS,
                     "identifierOrCriteria": 0,
                     "startAmount": str(10**18),
                     "endAmount": str(10**18),
@@ -176,9 +179,7 @@ def test_accounting_uses_signed_erc20_requirement_for_r24_normalization(monkeypa
     assert observed == [
         {
             "chain_name": "eth",
-            "requirements": {
-                "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": 10**18
-            },
+            "requirements": {WETH_ADDRESS: 10**18},
         }
     ]
 
