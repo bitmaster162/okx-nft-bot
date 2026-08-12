@@ -14,11 +14,14 @@ WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 ZONE = "0x000056f7000000ece9003ca63978907a00ffd100"
 CONDUIT = "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000"
 ZERO32 = "0x" + "00" * 32
+PRIVATE_KEY = "0x" + "01" * 32
 
 
 class _Settings:
     opensea_api_key = "test-key"
     opensea_api_base = "https://api.opensea.test/api"
+    buyer_wallet_private_key = PRIVATE_KEY
+    buyer_wallet_address = None
 
 
 class _Transport:
@@ -147,17 +150,52 @@ def test_r51_direct_deterministic_400_is_not_reconciled(monkeypatch):
     assert [call["method"] for call in transport.calls] == ["POST"]
 
 
-def test_r51_hash_preflight_blocks_before_effect(monkeypatch):
+def test_r51_partial_private_submit_keeps_legacy_failure_without_readback(monkeypatch):
+    transport = _Transport(post_result={"status": "accepted"})
+    client = _client(transport, monkeypatch)
+    partial = {
+        "offerer": OFFERER,
+        "offer": [{"startAmount": "500"}],
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="Failed to submit offer to OpenSea: OpenSea submit response missing order id",
+    ):
+        _base_submit()(client, partial, "0xsig", "eth")
+
+    assert [call["method"] for call in transport.calls] == ["POST"]
+
+
+def test_r51_public_create_hash_preflight_blocks_before_submit(monkeypatch):
     transport = _Transport()
     client = _client(transport, monkeypatch)
     malformed = {
         "offerer": OFFERER,
         "offer": [{"startAmount": "500"}],
     }
+    submit_calls = []
+
+    monkeypatch.setattr(client, "get_seaport_counter", lambda *args, **kwargs: 7)
+    monkeypatch.setattr(client, "_build_seaport_offer", lambda **kwargs: malformed)
+    monkeypatch.setattr(client, "_sign_seaport_order", lambda *args, **kwargs: "0xsig")
+    monkeypatch.setattr(
+        client,
+        "_submit_opensea_offer",
+        lambda *args, **kwargs: submit_calls.append((args, kwargs)),
+    )
 
     with pytest.raises(RuntimeError, match="deterministic order hash unavailable"):
-        _base_submit()(client, malformed, "0xsig", "eth")
+        client.create_opensea_offer(
+            chain="eth",
+            collection_address=COLLECTION,
+            token_id=42,
+            price_wei=500,
+            currency_address=WETH,
+            private_key=PRIVATE_KEY,
+        )
 
+    assert submit_calls == []
     assert transport.calls == []
 
 
