@@ -92,7 +92,10 @@ def activate_multichain_killswitch(
                 failed=(),
                 fatal_error=str(exc),
             )
-            _record_chain_audit(resolved_state, failure)
+            # R30: audit persistence must not break multichain isolation. If the
+            # same state/DB failure that killed this chain also prevents audit
+            # writes, log that secondary failure and continue to the next chain.
+            _record_chain_audit_best_effort(resolved_state, failure)
             results.append(failure)
             continue
         results.append(result)
@@ -310,6 +313,19 @@ def _record_chain_audit(state: PositionState, result: KillSwitchChainResult) -> 
             "fatal_error": result.fatal_error,
         },
     )
+
+
+def _record_chain_audit_best_effort(
+    state: PositionState,
+    result: KillSwitchChainResult,
+) -> None:
+    try:
+        _record_chain_audit(state, result)
+    except Exception:
+        logger.exception(
+            "Kill switch audit persistence failed chain=%s; continuing remaining chains",
+            result.chain,
+        )
 
 
 def format_killswitch_result(result: KillSwitchResult) -> str:
