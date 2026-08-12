@@ -219,11 +219,6 @@ class MassOfferEngine:
         price_wei = to_wei(resolved_price_bnb)
 
         for index, target in enumerate(selected_targets):
-            # Allocate Seaport counter atomically from governor on every iteration.
-            # This serialises with any other engine on the same wallet+chain
-            # (e.g. CounterBidder counter-bids) via SQLite BEGIN IMMEDIATE in
-            # PositionState.allocate_seaport_counter. A local `counter += 1`
-            # would race if two processes are submitting concurrently.
             counter = self.governor.allocate_seaport_counter(
                 account.address, resolved_chain
             )
@@ -294,31 +289,6 @@ class MassOfferEngine:
         quantity: int = 1,
         price_bnb_for_cap: float | None = None,
     ) -> tuple[bool, str | None]:
-        """Place a single token-level offer.  Used by CounterBidder for BSC undercuts.
-
-        Args:
-            collection_address: NFT collection contract address.
-            token_id: Token ID (str or int).
-            price_wbnb: Offer price in native units (e.g. BNB for WBNB, or amount for USDT).
-            currency_address: ERC-20 token address to bid with.
-                              Defaults to WBNB if not provided.
-            chain: Blockchain (only 'bsc' supported for now).
-            duration_hours: Offer duration; defaults to settings.mass_offer_duration_hours.
-            dry_run: Override dry-run flag; defaults to settings.mass_offer_dry_run.
-            quantity: Number of items to buy in this offer (default 1).
-            price_bnb_for_cap: Optional BNB-equivalent of the offer for governor
-                daily cap check. Required when currency is not WBNB/BNB (e.g.
-                USDT/USDC), otherwise the cap (max_bnb_per_day) treats the raw
-                token amount as BNB and incorrectly blocks legitimate offers.
-                If None, falls back to price_wbnb.
-
-        Returns:
-            (ok, detail) — ok=True if submitted (or dry-run recorded);
-            detail=None on success or a human-readable cause string on failure
-            (e.g. governor block reason, api exception). Callers should
-            propagate `detail` into submit_log.reason so operators can see
-            why a submit failed without grepping container logs.
-        """
         resolved_chain = chain.lower()
         resolved_duration = int(
             duration_hours if duration_hours is not None else self.settings.mass_offer_duration_hours
@@ -331,8 +301,6 @@ class MassOfferEngine:
 
         price_wei = to_wei(price_wbnb)
         account = self._load_buyer_account()
-
-        # Determine if this is a token-level or collection-level offer
         is_collection_offer = not token_id or str(token_id) in ("", "0", "col", "collection")
         int_token_id = 0 if is_collection_offer else int(token_id)
 
@@ -358,8 +326,6 @@ class MassOfferEngine:
             )
             return True, None
 
-        # Use BNB-equivalent for daily cap check when currency is not WBNB.
-        # Falls back to price_wbnb for backward compatibility (mass_offer campaigns).
         cap_check_price = price_bnb_for_cap if price_bnb_for_cap is not None else price_wbnb
         blocked_reason = self.governor.check_live_submit_allowed(
             action_type="LIVE_SINGLE_OFFER",
@@ -377,7 +343,6 @@ class MassOfferEngine:
             )
             return False, blocked_reason
 
-        # Use OKX high-level create-offer API (same pattern as create-listing)
         try:
             result = self.api_client.create_offer(
                 chain=resolved_chain,
@@ -411,12 +376,12 @@ class MassOfferEngine:
                 collection_address[:14], int_token_id, price_wbnb, offer_id,
             )
             return True, None
-        else:
-            logger.warning(
-                "place_single_offer FAILED %s token=%s price=%.6f — no offer_id in response",
-                collection_address[:14], int_token_id, price_wbnb,
-            )
-            return False, "no_offer_id_in_response"
+
+        logger.warning(
+            "place_single_offer FAILED %s token=%s price=%.6f — no offer_id in response",
+            collection_address[:14], int_token_id, price_wbnb,
+        )
+        return False, "no_offer_id_in_response"
 
     def status(self, *, chain: str = "bsc", limit: int = 5) -> dict[str, Any]:
         resolved_chain = chain.lower()
@@ -476,6 +441,87 @@ class MassOfferEngine:
             "cancelled": cancelled,
             "failed": failed,
             "collection": collection.lower() if collection else None,
+        }
+
+    def _live_selected_cancel_block_reason(self) -> str | None:
+        if self.governor.effective_dry_run(False):
+            return "dry_run_enabled"
+        arm_state = self.governor.get_live_arm_state(now=datetime.now(timezone.utc))
+        if not arm_state["armed"]:
+            if arm_state.get("expires_at"):
+                return "live arm expired"
+            return "live arm required"
+        return None
+
+    def cancel_selected(self, *, chain: str = "bsc", order_hashes: list[str] | tuple[str, ...]) -> dict[str, Any]:
+        """Cancel only explicitly selected active mass offers, fail-closed.
+
+        This is the execution primitive used by the planned unwind flow. Unlike
+        ``cancel_active`` (an explicit manual safety-cancel command), scheduled or
+        planned selected cancellation requires effective live mode and an active
+        live-arm window. The gate is re-checked immediately before each external
+        cancel so force-dry/disarm changes cannot silently race through a batch.
+        """
+        resolved_chain = chain.lower()
+        requested = {str(value).strip() for value in order_hashes if str(value).strip()}
+        active = self._list_synced_active_records(chain=resolved_chain)
+        selected = [item for item in active if item.offer_ref and item.offer_ref in requested]
+        selected_refs = {str(item.offer_ref) for item in selected if item.offer_ref}
+        missing = sorted(requested - selected_refs)
+
+        cancelled = 0
+        failed: list[str] = [f"{order_hash}:not_active" for order_hash in missing]
+        touched_campaigns: set[int] = set()
+
+        initial_block = self._live_selected_cancel_block_reason()
+        if initial_block:
+            failed.extend(f"{item.offer_ref}:blocked:{initial_block}" for item in selected)
+            return {
+                "chain": resolved_chain,
+                "selected_seen": len(selected),
+                "cancelled": 0,
+                "failed": failed,
+                "blocked_reason": initial_block,
+            }
+
+        for item in selected:
+            try:
+                order_params = self._fetch_order_params(item.offer_ref, resolved_chain) if item.offer_ref else None
+                blocked_reason = self._live_selected_cancel_block_reason()
+                if blocked_reason:
+                    failed.append(f"{item.offer_ref}:blocked:{blocked_reason}")
+                    continue
+                ok = bool(item.offer_ref) and self.api_client.cancel_offer(
+                    item.offer_ref,
+                    chain=resolved_chain,
+                    order_params=order_params,
+                )
+            except Exception as exc:
+                failed.append(f"{item.offer_ref or item.token_id}:{exc}")
+                continue
+
+            if ok:
+                cancelled += 1
+                touched_campaigns.add(item.campaign_id)
+                self.tracker.mark_item_status(
+                    record_id=item.record_id,
+                    status="cancelled",
+                    reason="mass_offer_unwind_cancel",
+                )
+                if item.offer_ref:
+                    self.state.mark_offer_status(order_hash=item.offer_ref, status="cancelled")
+            else:
+                failed.append(f"{item.offer_ref or item.token_id}:cancel_failed")
+
+        for campaign_id in touched_campaigns:
+            self.tracker.mark_campaign_status(campaign_id=campaign_id, status="cancelled")
+
+        return {
+            "chain": resolved_chain,
+            "selected_seen": len(selected),
+            "cancelled": cancelled,
+            "failed": failed,
+            "blocked_reason": None,
         }
 
     def _fetch_order_params(self, order_hash: str | None, chain: str) -> dict[str, Any] | None:
