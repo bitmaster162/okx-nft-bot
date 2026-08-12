@@ -41,7 +41,6 @@ class KillSwitchResult:
         return sum(item.failure_count for item in self.chains)
 
 
-
 def activate_multichain_killswitch(
     *,
     settings: Settings,
@@ -65,7 +64,12 @@ def activate_multichain_killswitch(
     resolved_state.set_runtime_value("killswitch_source", "telegram")
 
     resolved_api = api or OKXAPIClient(settings=settings)
-    resolved_chains = tuple(dict.fromkeys(str(chain).strip().lower() for chain in (chains or SUPPORTED_EXECUTION_CHAINS)))
+    resolved_chains = tuple(
+        dict.fromkeys(
+            str(chain).strip().lower()
+            for chain in (chains or SUPPORTED_EXECUTION_CHAINS)
+        )
+    )
     results: list[KillSwitchChainResult] = []
 
     for chain in resolved_chains:
@@ -95,6 +99,16 @@ def activate_multichain_killswitch(
     return KillSwitchResult(activated_at=activated_at, chains=tuple(results))
 
 
+def _exchange_collection(row: dict) -> str:
+    collection = str(
+        row.get("contractAddress")
+        or row.get("collectionAddress")
+        or row.get("collection")
+        or row.get("collection_address")
+        or "exchange_unknown"
+    ).strip().lower()
+    return collection or "exchange_unknown"
+
 
 def _cancel_chain(
     *,
@@ -107,15 +121,19 @@ def _cancel_chain(
     exchange_lookup_error: str | None = None
     exchange_order_hashes: list[str] = []
     exchange_order_params: dict[str, dict] = {}
+    exchange_order_collections: dict[str, str] = {}
 
     try:
         seen: set[str] = set()
         for row in api.get_my_offers(chain=chain, require_all_endpoints=True):
-            order_hash = str(row.get("offerId") or row.get("orderHash") or row.get("id") or "").strip()
+            order_hash = str(
+                row.get("offerId") or row.get("orderHash") or row.get("id") or ""
+            ).strip()
             if not order_hash or order_hash in seen:
                 continue
             seen.add(order_hash)
             exchange_order_hashes.append(order_hash)
+            exchange_order_collections[order_hash] = _exchange_collection(row)
             proto = row.get("protocolData", {})
             if isinstance(proto, str):
                 try:
@@ -152,7 +170,12 @@ def _cancel_chain(
         except Exception as exc:
             failed_order_hashes.append(order_hash)
             failed.append(f"{order_hash}:{exc}")
-            logger.warning("Kill switch cancel failed chain=%s order=%s: %s", chain, order_hash, exc)
+            logger.warning(
+                "Kill switch cancel failed chain=%s order=%s: %s",
+                chain,
+                order_hash,
+                exc,
+            )
             continue
         if ok:
             live_cancelled += 1
@@ -171,7 +194,10 @@ def _cancel_chain(
             state.mark_offer_status(order_hash=offer.order_hash, status="cancelled")
             continue
         if offer.order_hash in failed_hash_set:
-            state.mark_offer_status(order_hash=offer.order_hash, status="killswitch_failed")
+            state.mark_offer_status(
+                order_hash=offer.order_hash,
+                status="killswitch_failed",
+            )
             continue
         if not exchange_lookup_failed:
             if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
@@ -179,8 +205,19 @@ def _cancel_chain(
 
     active_hash_set = {offer.order_hash for offer in active_offers}
     for order_hash in failed_order_hashes:
-        if order_hash not in active_hash_set:
-            state.mark_offer_status(order_hash=order_hash, status="killswitch_failed")
+        if order_hash in active_hash_set:
+            continue
+        # R28: exchange discovery can reveal live orders missing from local
+        # active_offers. UPDATE-only mark_offer_status cannot quarantine such an
+        # order. Persist an explicit sentinel zombie row so subsequent governor
+        # checks see killswitch_failed and veto new live submissions.
+        state.upsert_active_offer(
+            order_hash=order_hash,
+            collection=exchange_order_collections.get(order_hash, "exchange_unknown"),
+            chain=chain,
+            price_bnb=0.0,
+            status="killswitch_failed",
+        )
 
     result = KillSwitchChainResult(
         chain=chain,
@@ -195,7 +232,6 @@ def _cancel_chain(
     )
     _record_chain_audit(state, result)
     return result
-
 
 
 def _record_chain_audit(state: PositionState, result: KillSwitchChainResult) -> None:
@@ -238,7 +274,6 @@ def _record_chain_audit(state: PositionState, result: KillSwitchChainResult) -> 
             "fatal_error": result.fatal_error,
         },
     )
-
 
 
 def format_killswitch_result(result: KillSwitchResult) -> str:
