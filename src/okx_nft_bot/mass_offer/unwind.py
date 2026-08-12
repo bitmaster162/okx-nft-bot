@@ -402,13 +402,14 @@ class MassOfferUnwindController:
         selected_hashes = [item.order_hash for item in report.candidates if item.selected]
         selected_release_bnb = sum(float(item.price_bnb) for item in report.candidates if item.selected)
         requested_dry_run = bool(dry_run)
+        effective_dry_run = self.engine.governor.effective_dry_run(requested_dry_run)
         if not selected_hashes:
             result = MassOfferUnwindExecutionResult(
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 wallet=report.wallet,
                 chain=report.chain,
                 requested_dry_run=requested_dry_run,
-                effective_dry_run=requested_dry_run,
+                effective_dry_run=effective_dry_run,
                 selected_count=0,
                 attempted_count=0,
                 simulated_count=0,
@@ -419,12 +420,12 @@ class MassOfferUnwindController:
             )
             self._persist_runtime_summary(report, execution=result)
             return result
-        if requested_dry_run:
+        if effective_dry_run:
             result = MassOfferUnwindExecutionResult(
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 wallet=report.wallet,
                 chain=report.chain,
-                requested_dry_run=True,
+                requested_dry_run=requested_dry_run,
                 effective_dry_run=True,
                 selected_count=len(selected_hashes),
                 attempted_count=len(selected_hashes),
