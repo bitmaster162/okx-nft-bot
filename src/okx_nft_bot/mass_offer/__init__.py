@@ -43,6 +43,10 @@ from okx_nft_bot.mass_offer.circuit_breaker import (
     get_mass_offer_circuit_runtime_summary,
 )
 from okx_nft_bot.mass_offer.engine import MassOfferEngine, MassOfferItemResult, MassOfferRunResult
+from okx_nft_bot.mass_offer.token_scope_safety import install_mass_offer_token_scope_safety
+
+install_mass_offer_token_scope_safety(MassOfferEngine)
+
 from okx_nft_bot.mass_offer.plan import (
     MassOfferPlanItem,
     MassOfferPlanReport,
