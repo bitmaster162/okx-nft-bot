@@ -132,7 +132,7 @@ def test_local_and_exchange_discovery_failure_is_not_reported_clean():
     assert result.local_state_lookup_failed is True
     assert result.exchange_lookup_failed is True
     assert result.exchange_lookup_error == "eth exchange unavailable"
-    assert result.failure_count == 1
+    assert result.failure_count == 2
 
     text = format_killswitch_result(
         SimpleNamespace(
@@ -143,4 +143,5 @@ def test_local_and_exchange_discovery_failure_is_not_reported_clean():
         )
     )
     assert "state_lookup_failed=1" in text
-    assert "total_failed=1" in text
+    assert "exchange_lookup_failed=1" in text
+    assert "total_failed=2" in text

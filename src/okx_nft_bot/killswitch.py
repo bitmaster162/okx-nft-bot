@@ -34,9 +34,11 @@ class KillSwitchChainResult:
     @property
     def failure_count(self) -> int:
         state_degraded = self.local_state_lookup_failed or self.local_state_persistence_failed
+        exchange_degraded = self.exchange_lookup_failed and not self.fatal_error
         return (
             len(self.failed)
             + (1 if state_degraded else 0)
+            + (1 if exchange_degraded else 0)
             + (1 if self.fatal_error else 0)
         )
 
@@ -536,13 +538,18 @@ def format_killswitch_result(result: KillSwitchResult) -> str:
             if item.local_state_persistence_failed
             else ""
         )
+        exchange_suffix = (
+            " exchange_lookup_failed=1"
+            if item.exchange_lookup_failed
+            else ""
+        )
         lines.append(
             f"chain={item.chain} active_offers_seen={item.active_offers_seen} "
             f"exchange_seen={item.exchange_seen} live_cancelled={item.live_cancelled} "
             f"local_cancelled={item.local_cancelled} already_gone={item.already_gone} "
             f"failed={len(item.failed)} zombies={len(item.failed)} "
             f"state_lookup_failed={1 if item.local_state_lookup_failed else 0}"
-            f"{persistence_suffix}"
+            f"{persistence_suffix}{exchange_suffix}"
         )
     lines.append(f"total_failed={result.total_failed}")
     return "\n".join(lines)

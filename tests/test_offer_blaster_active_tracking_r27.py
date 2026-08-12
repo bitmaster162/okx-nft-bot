@@ -168,9 +168,10 @@ def test_ledger_failure_keeps_active_row_then_forces_safe(monkeypatch, tmp_path)
         repeat=2,
         catch_errors=True,
     )
+    blaster = FakeBlaster()
     client = FakeClient()
 
-    results = FakeBlaster()._blast_eth(client, _payload())
+    results = blaster._blast_eth(client, _payload())
 
     assert FakeClient.submit_calls == 1
     assert events == [("active", "offer-eth-1"), ("submit", "failed")]
@@ -262,6 +263,6 @@ def test_degraded_killswitch_uses_r27_local_active_offer(monkeypatch, tmp_path):
     assert result.active_offers_seen == 1
     assert result.exchange_seen == 1
     assert result.live_cancelled == 1
-    assert result.failure_count == 0
+    assert result.failure_count == 1
     assert api.cancelled == [("offer-eth-1", "eth", None)]
     assert state.get_active_offers(chain="eth") == []
