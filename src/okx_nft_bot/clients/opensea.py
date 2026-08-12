@@ -10,7 +10,7 @@ from typing import Any, Mapping
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from okx_nft_bot.clients.http import StdlibHttpTransport, build_url
+from okx_nft_bot.clients.http import HTTPStatusError, StdlibHttpTransport, build_url
 from okx_nft_bot.config import Settings
 
 log = logging.getLogger("clients.opensea")
@@ -180,6 +180,16 @@ class OpenSeaClient:
 
         # Sign the order with EIP-712
         signature = self._sign_seaport_order(order_params, _private_key, chain_id=1)
+
+        # Public/direct creation must be reconcilable before any marketplace
+        # effect can occur. The private submit helper remains tolerant of old
+        # low-level test stubs, but this supported path always fails closed.
+        try:
+            self._derive_seaport_order_hash(order_params)
+        except Exception as exc:
+            raise RuntimeError(
+                f"OpenSea live submit blocked: deterministic order hash unavailable: {exc}"
+            ) from exc
 
         # Submit to OpenSea API
         return self._submit_opensea_offer(order_params, signature, chain)
@@ -437,6 +447,102 @@ class OpenSeaClient:
             "counter": int(parameters["counter"]),
         }
 
+    def _derive_seaport_order_hash(self, parameters: Mapping[str, Any]) -> str:
+        structured = {
+            "types": EIP712_TYPES,
+            "domain": {
+                "name": "Seaport",
+                "version": "1.6",
+                "chainId": 1,
+                "verifyingContract": SEAPORT_ADDRESS_ETH,
+            },
+            "primaryType": "OrderComponents",
+            "message": self._to_typed_data_message(dict(parameters)),
+        }
+        encoded = encode_typed_data(full_message=structured)
+        body = bytes(encoded.body)
+        if len(body) != 32:
+            raise RuntimeError("OpenSea order hash derivation returned non-bytes32 body")
+        return "0x" + body.hex()
+
+    @staticmethod
+    def _http_status_from_exception(exc: BaseException) -> int | None:
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, HTTPStatusError):
+                return int(current.status)
+            current = current.__cause__ or current.__context__
+        return None
+
+    @classmethod
+    def _ambiguous_submit_failure(cls, exc: BaseException) -> bool:
+        status = cls._http_status_from_exception(exc)
+        if status is None:
+            # Transport failure, decode failure, or a 2xx response that lacked a
+            # durable receipt can all occur after the marketplace persisted it.
+            return True
+        return status in {408, 409, 425, 429} or status >= 500
+
+    def _reconcile_submitted_order(self, order_hash: str) -> dict[str, Any]:
+        base = str(getattr(self.settings, "opensea_api_base", "") or "").strip()
+        api_key = str(getattr(self.settings, "opensea_api_key", "") or "").strip()
+        if not base:
+            raise RuntimeError("OpenSea API base unavailable for reconciliation")
+        if not api_key:
+            raise RuntimeError("OpenSea API key unavailable for reconciliation")
+
+        path = (
+            "/api/v2/orders/chain/ethereum/protocol/"
+            f"{SEAPORT_ADDRESS_ETH}/{order_hash}"
+        )
+        url, _ = build_url(base, path, {})
+        response = self.transport.request_json(
+            method="GET",
+            url=url,
+            headers={
+                "Accept": "application/json",
+                "X-API-KEY": api_key,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            },
+        )
+        if not isinstance(response, Mapping):
+            raise RuntimeError("OpenSea reconciliation response is not an object")
+
+        returned_hash = str(
+            response.get("order_hash")
+            or response.get("orderHash")
+            or response.get("hash")
+            or ""
+        ).strip().lower()
+        if returned_hash != order_hash.lower():
+            raise RuntimeError(
+                "OpenSea reconciliation order hash mismatch: "
+                f"expected={order_hash} returned={returned_hash or '<missing>'}"
+            )
+        return dict(response)
+
+    @staticmethod
+    def _uncertain_submit_result(
+        *,
+        order_hash: str,
+        submit_error: BaseException,
+        reconciliation_error: BaseException,
+    ) -> dict[str, Any]:
+        return {
+            "offer_id": order_hash,
+            "order_id": order_hash,
+            "order_hash": order_hash,
+            "status": "submit_uncertain",
+            "receipt_uncertain": True,
+            "raw": {
+                "order_hash": order_hash,
+                "submit_error": str(submit_error)[:300],
+                "reconciliation_error": str(reconciliation_error)[:300],
+            },
+        }
+
     def _live_submit_block_reason(self, *, chain: str = "eth") -> str | None:
         """Return a safety-state block reason without re-applying spend/cooldown caps.
 
@@ -497,6 +603,15 @@ class OpenSeaClient:
         if blocked_reason:
             raise RuntimeError(f"OpenSea live submit blocked: {blocked_reason}")
 
+        # The supported public create path validates this strictly before calling
+        # us. Keep the low-level helper compatible with tests/private callers that
+        # provide only a partial request shape; such calls simply cannot reconcile
+        # an ambiguous receipt and therefore retain the legacy failure contract.
+        try:
+            expected_order_hash: str | None = self._derive_seaport_order_hash(parameters)
+        except Exception:
+            expected_order_hash = None
+
         # Build request body.
         # PATCH 2026-08-06 (OPENSEA_PROTOCOL_ADDRESS): без protocol_address
         # OpenSea отвечает HTTP 400 "Missing required field 'protocol_address'".
@@ -527,6 +642,7 @@ class OpenSeaClient:
             url, parameters["offerer"][:14], parameters["offer"][0]["startAmount"]
         )
 
+        submit_attempted = False
         try:
             # A create-offer response can be lost after OpenSea has persisted the
             # order. Never inherit generic transport retries for this effectful
@@ -536,6 +652,7 @@ class OpenSeaClient:
                 submit_transport = copy(submit_transport)
                 submit_transport.max_retries = 1
 
+            submit_attempted = True
             response = submit_transport.request_json(
                 method="POST",
                 url=url,
@@ -565,8 +682,40 @@ class OpenSeaClient:
                 "raw": response,
             }
         except Exception as exc:
-            log.error("OpenSea offer submission failed: %s", exc)
-            raise RuntimeError(f"Failed to submit offer to OpenSea: {exc}") from exc
+            if not submit_attempted or not self._ambiguous_submit_failure(exc):
+                log.error("OpenSea offer submission failed: %s", exc)
+                raise RuntimeError(f"Failed to submit offer to OpenSea: {exc}") from exc
+
+            if expected_order_hash is None:
+                log.error(
+                    "OpenSea ambiguous receipt cannot be reconciled without deterministic order hash: %s",
+                    exc,
+                )
+                raise RuntimeError(f"Failed to submit offer to OpenSea: {exc}") from exc
+
+            try:
+                reconciled = self._reconcile_submitted_order(expected_order_hash)
+            except Exception as reconcile_exc:
+                log.error(
+                    "OpenSea submit receipt uncertain: order_hash=%s submit=%s reconcile=%s",
+                    expected_order_hash,
+                    exc,
+                    reconcile_exc,
+                )
+                return self._uncertain_submit_result(
+                    order_hash=expected_order_hash,
+                    submit_error=exc,
+                    reconciliation_error=reconcile_exc,
+                )
+
+            return {
+                "offer_id": expected_order_hash,
+                "order_id": expected_order_hash,
+                "order_hash": expected_order_hash,
+                "status": "submitted",
+                "reconciled": True,
+                "raw": reconciled,
+            }
 
     def _get(self, path: str, params: Mapping[str, Any]) -> dict[str, Any]:
         if not self.settings.opensea_api_key:
