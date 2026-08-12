@@ -372,36 +372,26 @@ class UndercutEngine:
                         # new first; retire old only after we confirmed the new
                         # offer reached the exchange.
                         action.submit_result = self.offer_client.submit_offer(preview_payload or {})
-                        submitted_offer_id = action.submit_result.get("offer_id")
-                        # A5: require real offer_id from exchange. Empty/None
-                        # means reconcile would see a "dryrun-" hash for a live
-                        # order and ignore it (orphan state). Skip the state
-                        # write; next reconcile will pull it from the exchange.
-                        if submitted_offer_id:
-                            action.order_hash = str(submitted_offer_id)
-                            self.state.upsert_active_offer(
-                                order_hash=action.order_hash,
-                                collection=action.collection,
-                                chain=action.chain,
-                                price_bnb=float(action.new_price_bnb or 0.0),
-                                status="active",
-                                current_floor=action.old_price_bnb,
-                                preview_payload=preview_payload,
-                            )
-                            # Now retire the old offer (new one is live)
-                            self._retire_previous_offer_for_defense(
-                                action_type=action.action_type,
-                                previous_order_hash=previous_order_hash,
-                                effective_dry_run=effective_dry_run,
-                                chain=action.chain or "",
-                            )
-                        else:
-                            logger.warning(
-                                "submit_offer returned empty offer_id for %s — "
-                                "skipping state write AND keeping old offer "
-                                "(reconcile will recover)",
-                                action.collection,
-                            )
+                        submitted_offer_id = str(action.submit_result.get("offer_id") or "").strip()
+                        if not submitted_offer_id:
+                            raise RuntimeError("no_offer_id_in_response")
+                        action.order_hash = submitted_offer_id
+                        self.state.upsert_active_offer(
+                            order_hash=action.order_hash,
+                            collection=action.collection,
+                            chain=action.chain,
+                            price_bnb=float(action.new_price_bnb or 0.0),
+                            status="active",
+                            current_floor=action.old_price_bnb,
+                            preview_payload=preview_payload,
+                        )
+                        # Now retire the old offer (new one is live)
+                        self._retire_previous_offer_for_defense(
+                            action_type=action.action_type,
+                            previous_order_hash=previous_order_hash,
+                            effective_dry_run=effective_dry_run,
+                            chain=action.chain or "",
+                        )
                         self.state.record_submit_event(
                             engine="undercutter",
                             action_type=logged_action_type,
