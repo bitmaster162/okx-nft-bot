@@ -292,6 +292,7 @@ def test_opensea_submit_body_includes_seaport_protocol_address():
     transport = _TransportCapture()
     client.settings = _SubmitSettings()
     client.transport = transport
+    client._live_submit_block_reason = lambda **_kwargs: None
     params = {
         "offerer": "0x" + "c" * 40,
         "offer": [{"startAmount": "1"}],
