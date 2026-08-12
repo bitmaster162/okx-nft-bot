@@ -101,7 +101,7 @@ def test_post_cancel_audit_failure_does_not_skip_next_chain(tmp_path):
     assert "audit_submit:eth" in state.trace
 
 
-def test_pre_network_chain_failure_plus_audit_failure_still_reaches_next_chain(tmp_path):
+def test_local_state_read_failure_plus_audit_failure_still_cancels_both_chains(tmp_path):
     state = _AuditFailState(fail_active_chain="bsc")
     api = _API()
 
@@ -112,11 +112,14 @@ def test_pre_network_chain_failure_plus_audit_failure_still_reaches_next_chain(t
         chains=("bsc", "eth"),
     )
 
-    assert "lookup:bsc" not in api.trace
+    assert "lookup:bsc" in api.trace
     assert "lookup:eth" in api.trace
-    assert api.cancel_chains == ["eth"]
+    assert api.cancel_chains == ["bsc", "eth"]
     assert len(result.chains) == 2
-    assert result.chains[0].fatal_error == "bsc state unavailable"
+    assert result.chains[0].fatal_error is None
+    assert result.chains[0].local_state_lookup_failed is True
+    assert result.chains[0].local_state_lookup_error == "bsc state unavailable"
+    assert result.chains[0].live_cancelled == 1
     assert result.chains[1].fatal_error is None
     assert result.chains[1].live_cancelled == 1
     assert result.total_failed == 1
