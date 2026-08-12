@@ -35,20 +35,30 @@ def normalize_offer(raw: dict[str, Any], *, market: str, chain: str) -> Normaliz
     raise ValueError(f"Unsupported market for offer normalization: {market!r}")
 
 
+def _has_token_identifier(value: Any) -> bool:
+    """Return True for an explicit token identifier, including numeric/string zero.
+
+    Token #0 is a specific NFT item. Only explicit absence (None/empty string)
+    denotes no token identifier at this normalization boundary.
+    """
+    return value is not None and value != ""
+
+
 def _normalize_okx(raw: dict[str, Any], *, chain: str) -> NormalizedOffer:
     token_id = raw.get("tokenId")
+    has_token_id = _has_token_identifier(token_id)
     collection = str(raw.get("collectionAddress") or "unknown").lower()
     offer_id = str(
         raw.get("orderId") or raw.get("orderHash") or f"okx:{collection}:{token_id}:{raw.get('createTime','0')}"
     )
     price_raw = raw.get("price")
     price = _to_float(price_raw)
-    source_type = "token_offer" if token_id else "collection_offer"
+    source_type = "token_offer" if has_token_id else "collection_offer"
     return NormalizedOffer(
         market="okx",
         collection_slug_or_address=collection,
         chain=chain,
-        token_id=str(token_id) if token_id is not None else None,
+        token_id=str(token_id) if has_token_id else None,
         offer_id=offer_id,
         maker=raw.get("maker"),
         price=price,
@@ -71,10 +81,19 @@ def _normalize_opensea(raw: dict[str, Any], *, chain: str) -> NormalizedOffer:
     consideration = parameters.get("consideration") or []
     token_id: str | None = None
     collection_addr = "unknown"
+    specific_token_seen = False
     for item in consideration:
-        item_type = item.get("itemType", 0)
+        try:
+            item_type = int(item.get("itemType", 0))
+        except (TypeError, ValueError):
+            item_type = 0
         if item_type in (2, 3):  # ERC721 or ERC1155 — specific token
-            token_id = str(item.get("identifierOrCriteria") or item.get("identifier") or "")
+            specific_token_seen = True
+            identifier = item.get("identifierOrCriteria")
+            if not _has_token_identifier(identifier):
+                identifier = item.get("identifier")
+            if _has_token_identifier(identifier):
+                token_id = str(identifier)
             collection_addr = str(item.get("token") or "").lower()
             break
         if item_type in (4, 5):  # criteria-based = collection offer
@@ -94,12 +113,12 @@ def _normalize_opensea(raw: dict[str, Any], *, chain: str) -> NormalizedOffer:
         price = price / 1e18
     expiration = raw.get("expiration_time") or raw.get("expiry")
     created = raw.get("listing_time") or raw.get("created_date")
-    source_type = "token_offer" if token_id else "collection_offer"
+    source_type = "token_offer" if specific_token_seen else "collection_offer"
     return NormalizedOffer(
         market="opensea",
         collection_slug_or_address=collection_addr,
         chain=chain,
-        token_id=token_id or None,
+        token_id=token_id,
         offer_id=order_hash,
         maker=maker,
         price=price,
