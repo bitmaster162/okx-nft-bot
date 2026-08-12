@@ -128,14 +128,46 @@ def activate_multichain_killswitch(
             )
 
     preflight_error = "; ".join(preflight_errors) or None
-
-    resolved_api = api or OKXAPIClient(settings=settings)
     resolved_chains = tuple(
         dict.fromkeys(
             str(chain).strip().lower()
             for chain in (chains or SUPPORTED_EXECUTION_CHAINS)
         )
     )
+
+    # R37: API construction is itself part of the emergency boundary. If the
+    # client cannot be constructed, no exchange cancellation can be attempted,
+    # but the kill switch must still return structured fatal chain results after
+    # the local/process safety latch rather than throwing out of the command.
+    resolved_api = api
+    if resolved_api is None:
+        try:
+            resolved_api = OKXAPIClient(settings=settings)
+        except Exception as exc:
+            logger.exception(
+                "Kill switch OKX API initialization failed; returning fatal chain results"
+            )
+            failures: list[KillSwitchChainResult] = []
+            for chain in resolved_chains:
+                failure = KillSwitchChainResult(
+                    chain=chain,
+                    active_offers_seen=0,
+                    exchange_seen=0,
+                    live_cancelled=0,
+                    local_cancelled=0,
+                    already_gone=0,
+                    failed=(),
+                    fatal_error=f"api_init: {exc}",
+                )
+                if resolved_state is not None:
+                    _record_chain_audit_best_effort(resolved_state, failure)
+                failures.append(failure)
+            return KillSwitchResult(
+                activated_at=activated_at,
+                chains=tuple(failures),
+                preflight_error=preflight_error,
+            )
+
     results: list[KillSwitchChainResult] = []
 
     for chain in resolved_chains:
