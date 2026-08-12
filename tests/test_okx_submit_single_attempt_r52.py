@@ -176,14 +176,18 @@ def test_submit_order_transport_failure_is_not_retried_by_outer_request_loop():
     assert client.original_calls == []
 
 
-def test_non_submit_request_keeps_configured_transport_retry_policy():
+def test_non_submit_request_keeps_configured_transport_retry_policy(monkeypatch):
     transport = _stdlib_transport(
         _Response(429),
         _Response(200, {"code": "0", "data": {"items": []}}),
     )
     # Remove backoff sleep from this regression test; retry multiplicity is the
     # contract being asserted, not wall-clock timing.
-    transport._sleep_backoff = lambda *args, **kwargs: None
+    monkeypatch.setattr(
+        StdlibHttpTransport,
+        "_sleep_backoff",
+        lambda self, attempt, headers: None,
+    )
     client = _guarded_dummy(transport)
 
     result = client._request(
