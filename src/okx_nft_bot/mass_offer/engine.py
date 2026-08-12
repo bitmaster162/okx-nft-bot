@@ -478,6 +478,87 @@ class MassOfferEngine:
             "collection": collection.lower() if collection else None,
         }
 
+    def _live_selected_cancel_block_reason(self) -> str | None:
+        if self.governor.effective_dry_run(False):
+            return "dry_run_enabled"
+        arm_state = self.governor.get_live_arm_state(now=datetime.now(timezone.utc))
+        if not arm_state["armed"]:
+            if arm_state.get("expires_at"):
+                return "live arm expired"
+            return "live arm required"
+        return None
+
+    def cancel_selected(self, *, chain: str = "bsc", order_hashes: list[str] | tuple[str, ...]) -> dict[str, Any]:
+        """Cancel only explicitly selected active mass offers, fail-closed.
+
+        This is the execution primitive used by the planned unwind flow. Unlike
+        ``cancel_active`` (an explicit manual safety-cancel command), scheduled or
+        planned selected cancellation requires effective live mode and an active
+        live-arm window. The gate is re-checked immediately before each external
+        cancel so force-dry/disarm changes cannot silently race through a batch.
+        """
+        resolved_chain = chain.lower()
+        requested = {str(value).strip() for value in order_hashes if str(value).strip()}
+        active = self._list_synced_active_records(chain=resolved_chain)
+        selected = [item for item in active if item.offer_ref and item.offer_ref in requested]
+        selected_refs = {str(item.offer_ref) for item in selected if item.offer_ref}
+        missing = sorted(requested - selected_refs)
+
+        cancelled = 0
+        failed: list[str] = [f"{order_hash}:not_active" for order_hash in missing]
+        touched_campaigns: set[int] = set()
+
+        initial_block = self._live_selected_cancel_block_reason()
+        if initial_block:
+            failed.extend(f"{item.offer_ref}:blocked:{initial_block}" for item in selected)
+            return {
+                "chain": resolved_chain,
+                "selected_seen": len(selected),
+                "cancelled": 0,
+                "failed": failed,
+                "blocked_reason": initial_block,
+            }
+
+        for item in selected:
+            try:
+                order_params = self._fetch_order_params(item.offer_ref, resolved_chain) if item.offer_ref else None
+                blocked_reason = self._live_selected_cancel_block_reason()
+                if blocked_reason:
+                    failed.append(f"{item.offer_ref}:blocked:{blocked_reason}")
+                    continue
+                ok = bool(item.offer_ref) and self.api_client.cancel_offer(
+                    item.offer_ref,
+                    chain=resolved_chain,
+                    order_params=order_params,
+                )
+            except Exception as exc:
+                failed.append(f"{item.offer_ref or item.token_id}:{exc}")
+                continue
+
+            if ok:
+                cancelled += 1
+                touched_campaigns.add(item.campaign_id)
+                self.tracker.mark_item_status(
+                    record_id=item.record_id,
+                    status="cancelled",
+                    reason="mass_offer_unwind_cancel",
+                )
+                if item.offer_ref:
+                    self.state.mark_offer_status(order_hash=item.offer_ref, status="cancelled")
+            else:
+                failed.append(f"{item.offer_ref or item.token_id}:cancel_failed")
+
+        for campaign_id in touched_campaigns:
+            self.tracker.mark_campaign_status(campaign_id=campaign_id, status="cancelled")
+
+        return {
+            "chain": resolved_chain,
+            "selected_seen": len(selected),
+            "cancelled": cancelled,
+            "failed": failed,
+            "blocked_reason": None,
+        }
+
     def _fetch_order_params(self, order_hash: str | None, chain: str) -> dict[str, Any] | None:
         if not order_hash:
             return None
