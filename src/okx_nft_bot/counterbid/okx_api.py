@@ -305,7 +305,7 @@ class OKXAPIClient:
         account = Account.from_key(private_key)
         chain_lower = chain.lower()
         chain_id = self._CHAIN_IDS.get(chain_lower, 56)
-        is_collection_offer = not token_id or str(token_id) in ("", "0")
+        is_collection_offer = token_id is None or token_id == ""
         ts = int(time.time() * 1000)
 
         # Resolve numeric project ID
@@ -400,7 +400,7 @@ class OKXAPIClient:
                             account=account,
                             private_key=private_key,
                             collection_address=collection_address,
-                            token_id=token_id or "",
+                            token_id="" if token_id is None else token_id,
                             price_raw=price_raw,
                             currency_address=currency_address,
                             valid_time=valid_time,
@@ -1202,7 +1202,7 @@ class OKXAPIClient:
         governor = ExecutionGovernor(settings=self.settings, api_client=self)
         counter = governor.allocate_seaport_counter(account.address, chain)
 
-        is_collection_offer = not token_id or str(token_id) in ("", "0")
+        is_collection_offer = token_id is None or token_id == ""
         int_token_id = 0 if is_collection_offer else int(token_id)
         now = int(time.time())
         duration_s = max(valid_time - now, 3600)
@@ -1223,7 +1223,8 @@ class OKXAPIClient:
         signature = sign_order(parameters, private_key, chain_id=chain_id)
 
         log.info("create_offer_direct chain=%s coll=%s token=%s → submit_seaport_order",
-                 chain, collection_address[:14], token_id or "collection")
+                 chain, collection_address[:14],
+                 "collection" if is_collection_offer else token_id)
         return self.submit_seaport_order(
             chain=chain, wallet_address=account.address,
             parameters=parameters, signature=signature,
