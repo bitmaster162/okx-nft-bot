@@ -368,9 +368,6 @@ class OfferBlaster:
                                  collection[:10], token_id, offer_price_eth, offer_id)
                         placed += 1
 
-                    # ── Increment counter for next offer (Seaport requires unique counter per order)
-                    counter += 1
-
                     # Delay between submissions
                     if self.delay_seconds > 0:
                         time.sleep(self.delay_seconds)
