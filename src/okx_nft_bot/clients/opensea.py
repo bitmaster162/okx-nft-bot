@@ -432,6 +432,36 @@ class OpenSeaClient:
             "counter": int(parameters["counter"]),
         }
 
+    def _live_submit_block_reason(self, *, chain: str = "eth") -> str | None:
+        """Return a safety-state block reason without re-applying spend/cooldown caps.
+
+        OpenSea mirroring happens immediately after a successful OKX submit, so
+        the outer execution path owns price, budget, and shared cooldown checks.
+        This boundary recheck is intentionally limited to state that can change
+        while the OpenSea counter is fetched and the order is signed.
+        """
+        from okx_nft_bot.execution_governor import ExecutionGovernor
+
+        governor = ExecutionGovernor(settings=self.settings)
+        if governor.effective_dry_run():
+            return "dry_run_enabled"
+
+        failed = governor.state.get_killswitch_failed_offers(chain=chain)
+        if failed:
+            return (
+                f"killswitch_failed: {len(failed)} zombie offer(s) need manual cancel"
+            )
+
+        if governor.state.is_force_dry_run():
+            return "force_dry_run_enabled"
+
+        arm_state = governor.get_live_arm_state()
+        if not arm_state["armed"]:
+            if arm_state.get("expires_at"):
+                return "live arm expired"
+            return "live arm required"
+        return None
+
     def _submit_opensea_offer(
         self, parameters: dict[str, Any], signature: str, chain: str = "eth"
     ) -> dict[str, Any]:
@@ -452,8 +482,15 @@ class OpenSeaClient:
         chain_lower = chain.lower()
         if chain_lower in ("eth", "ethereum", "1"):
             opensea_chain = "ethereum"
+            execution_chain = "eth"
         else:
             raise ValueError(f"Unsupported chain: {chain}")
+
+        # Re-check volatile execution safety immediately before the effectful
+        # OpenSea POST. This closes the window created by counter RPC + signing.
+        blocked_reason = self._live_submit_block_reason(chain=execution_chain)
+        if blocked_reason:
+            raise RuntimeError(f"OpenSea live submit blocked: {blocked_reason}")
 
         # Build request body.
         # PATCH 2026-08-06 (OPENSEA_PROTOCOL_ADDRESS): без protocol_address
@@ -495,18 +532,22 @@ class OpenSeaClient:
 
             log.info("OpenSea offer response: %s", json.dumps(response, default=str)[:500])
 
-            # Extract order hash or offer ID from response
+            # Extract order hash or offer ID from response. A successful HTTP
+            # response without a durable exchange ID is not an execution receipt.
             order_hash = response.get("order_hash") or response.get("hash") or response.get("id")
             if not order_hash:
-                # Try to find any ID-like field
                 for key in ("orderHash", "offerId", "order_id", "offer_id"):
                     if key in response:
                         order_hash = response[key]
                         break
 
+            order_id = str(order_hash or "").strip()
+            if not order_id or order_id.lower() in {"pending", "none", "null"}:
+                raise RuntimeError("OpenSea submit response missing order id")
+
             return {
-                "offer_id": order_hash or "pending",
-                "order_id": order_hash or "pending",
+                "offer_id": order_id,
+                "order_id": order_id,
                 "status": "submitted",
                 "raw": response,
             }
