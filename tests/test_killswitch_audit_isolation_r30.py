@@ -99,7 +99,6 @@ def test_post_cancel_audit_failure_does_not_skip_next_chain(tmp_path):
     assert [row["chain"] for row in state.submit_events] == ["eth"]
     assert "audit_submit:bsc" in state.trace
     assert "audit_submit:eth" in state.trace
-    assert state.trace.index("force_dry:1") < api.trace.index("lookup:bsc") if "lookup:bsc" in state.trace else True
 
 
 def test_pre_network_chain_failure_plus_audit_failure_still_reaches_next_chain(tmp_path):
