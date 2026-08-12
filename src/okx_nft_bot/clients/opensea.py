@@ -227,16 +227,19 @@ class OpenSeaClient:
 
             if "error" in result:
                 raise RuntimeError(f"RPC error: {result['error']}")
+            if "result" not in result:
+                raise RuntimeError("RPC response missing result")
 
-            counter_hex = result.get("result", "0x0")
+            counter_hex = result["result"]
+            if not isinstance(counter_hex, str) or not counter_hex.startswith("0x"):
+                raise RuntimeError(f"RPC result is not hex: {counter_hex!r}")
+
             counter = int(counter_hex, 16)
             log.info("Seaport counter for %s: %d", wallet_address[:14], counter)
             return counter
         except Exception as exc:
             log.error("Failed to fetch counter from RPC: %s", exc)
-            # Fallback to counter=0 (will fail if wallet has existing orders, but safer than raising)
-            log.warning("Using fallback counter=0")
-            return 0
+            raise RuntimeError(f"Failed to fetch counter from RPC: {exc}") from exc
 
     def _build_seaport_offer(
         self,
