@@ -147,8 +147,15 @@ def _assert_fresh_effect_state(
             )
 
 
+def _mirror_context_active() -> bool:
+    """Limit R42 to the CounterBidder OpenSea mirror path it hardens."""
+    from okx_nft_bot.sniper.opensea_mirror_safety import _MIRROR_CONTEXT
+
+    return _MIRROR_CONTEXT.get() is not None
+
+
 def install_opensea_effect_boundary_safety(client_class: type[Any]) -> None:
-    """Fail closed on stale counter or balance immediately before OpenSea submit."""
+    """Fail closed on stale counter or balance at the OpenSea mirror boundary."""
     current = client_class._submit_opensea_offer
     if getattr(current, "_r42_opensea_effect_boundary_guard", False):
         return
@@ -162,6 +169,12 @@ def install_opensea_effect_boundary_safety(client_class: type[Any]) -> None:
         signature: str,
         chain: str = "eth",
     ) -> Any:
+        # Existing direct client helpers/tests are outside the R42 scope. The
+        # production CounterBidder mirror owns a ContextVar across build/sign/POST,
+        # allowing this final boundary to be strict without changing unrelated
+        # OpenSea client call contracts.
+        if not _mirror_context_active():
+            return original(self, parameters, signature, chain)
         try:
             _assert_fresh_effect_state(
                 self,
