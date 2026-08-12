@@ -58,62 +58,70 @@ def activate_multichain_killswitch(
 ) -> KillSwitchResult:
     """Latch local safety, then best-effort persist it and cancel every chain.
 
-    A failure on one chain is isolated and does not prevent the remaining
-    chains from being processed. Process-local dry-run is set before any state
-    access. Persistent disarm/forced-dry-run/runtime metadata and integrity
-    preflight are attempted before exchange/RPC work, but their failure is
-    reported rather than allowed to suppress emergency cancellation.
+    Process-local dry-run is set before any state access. If local execution
+    state cannot even be constructed, the kill switch degrades to exchange-only
+    cancellation rather than abandoning the emergency action.
     """
-    # R31: give the invoking process an immediate local safety latch before any
-    # state construction/audit.
     settings.dry_run = True
-    resolved_state = state or PositionState(settings.execution_db_path)
-
     activated_at = datetime.now(timezone.utc).isoformat()
     preflight_errors: list[str] = []
 
-    # R32: each persistent safety write is independent. A degraded state store
-    # must not turn an already-local-dry-run emergency command into "no cancel".
-    try:
-        resolved_state.disarm_live(
-            actor="telegram_killswitch",
-            reason="telegram_killswitch",
-        )
-    except Exception as exc:
-        preflight_errors.append(f"disarm_live: {exc}")
-        logger.exception(
-            "Kill switch persistent live disarm failed; continuing emergency cancellation"
-        )
-
-    try:
-        resolved_state.set_force_dry_run(True, reason="telegram_killswitch")
-    except Exception as exc:
-        preflight_errors.append(f"set_force_dry_run: {exc}")
-        logger.exception(
-            "Kill switch persistent force-dry-run failed; continuing emergency cancellation"
-        )
-
-    for key, value in (
-        ("killswitch_activated_at", activated_at),
-        ("killswitch_source", "telegram"),
-    ):
+    resolved_state: PositionState | None = state
+    state_init_error: str | None = None
+    if resolved_state is None:
         try:
-            resolved_state.set_runtime_value(key, value)
+            resolved_state = PositionState(settings.execution_db_path)
         except Exception as exc:
-            preflight_errors.append(f"set_runtime_value[{key}]: {exc}")
+            state_init_error = str(exc)
+            preflight_errors.append(f"state_init: {exc}")
             logger.exception(
-                "Kill switch runtime metadata persistence failed key=%s; continuing emergency cancellation",
-                key,
+                "Kill switch local state initialization failed; continuing exchange-only cancellation"
             )
 
-    try:
-        resolved_state.audit_integrity()
-    except Exception as exc:
-        # Preserve R31's plain audit error when it is the only preflight failure.
-        preflight_errors.append(str(exc))
-        logger.exception(
-            "Kill switch integrity preflight failed after safety latch; continuing cancellation"
-        )
+    # R32: persistent safety writes and integrity audit are independent. They are
+    # attempted only when a local state store exists; state-init failure is
+    # already represented in preflight_error and must not suppress cancellation.
+    if resolved_state is not None:
+        try:
+            resolved_state.disarm_live(
+                actor="telegram_killswitch",
+                reason="telegram_killswitch",
+            )
+        except Exception as exc:
+            preflight_errors.append(f"disarm_live: {exc}")
+            logger.exception(
+                "Kill switch persistent live disarm failed; continuing emergency cancellation"
+            )
+
+        try:
+            resolved_state.set_force_dry_run(True, reason="telegram_killswitch")
+        except Exception as exc:
+            preflight_errors.append(f"set_force_dry_run: {exc}")
+            logger.exception(
+                "Kill switch persistent force-dry-run failed; continuing emergency cancellation"
+            )
+
+        for key, value in (
+            ("killswitch_activated_at", activated_at),
+            ("killswitch_source", "telegram"),
+        ):
+            try:
+                resolved_state.set_runtime_value(key, value)
+            except Exception as exc:
+                preflight_errors.append(f"set_runtime_value[{key}]: {exc}")
+                logger.exception(
+                    "Kill switch runtime metadata persistence failed key=%s; continuing emergency cancellation",
+                    key,
+                )
+
+        try:
+            resolved_state.audit_integrity()
+        except Exception as exc:
+            # Preserve R31's plain audit error when it is the only preflight failure.
+            preflight_errors.append(str(exc))
+            logger.exception(
+                "Kill switch integrity preflight failed after safety latch; continuing cancellation"
+            )
 
     preflight_error = "; ".join(preflight_errors) or None
 
@@ -132,6 +140,7 @@ def activate_multichain_killswitch(
                 state=resolved_state,
                 api=resolved_api,
                 chain=chain,
+                state_unavailable_error=state_init_error,
             )
         except Exception as exc:
             logger.exception("Kill switch fatal chain failure chain=%s", chain)
@@ -145,10 +154,8 @@ def activate_multichain_killswitch(
                 failed=(),
                 fatal_error=str(exc),
             )
-            # R30: audit persistence must not break multichain isolation. If the
-            # same state/DB failure that killed this chain also prevents audit
-            # writes, log that secondary failure and continue to the next chain.
-            _record_chain_audit_best_effort(resolved_state, failure)
+            if resolved_state is not None:
+                _record_chain_audit_best_effort(resolved_state, failure)
             results.append(failure)
             continue
         results.append(result)
@@ -184,26 +191,29 @@ def _unidentified_exchange_id(row: dict) -> str:
 
 def _cancel_chain(
     *,
-    state: PositionState,
+    state: PositionState | None,
     api: OKXAPIClient,
     chain: str,
+    state_unavailable_error: str | None = None,
 ) -> KillSwitchChainResult:
-    # R33: local SQLite is a useful fallback/accounting source, not a prerequisite
-    # for exchange discovery. If it is unreadable, still attempt exchange cancel
-    # and surface the degraded local-state condition in the result.
+    # R33: local SQLite is fallback/accounting input, not a prerequisite for
+    # exchange discovery. R34 extends this to total state-constructor failure.
     local_state_lookup_failed = False
     local_state_lookup_error: str | None = None
-    try:
-        active_offers = state.get_active_offers(chain=chain)
-    except Exception as exc:
+    if state is None:
         active_offers = []
-        local_state_lookup_failed = True
-        local_state_lookup_error = str(exc)
-        logger.warning(
-            "Kill switch local state lookup failed chain=%s: %s; continuing exchange cancellation",
-            chain,
-            exc,
-        )
+    else:
+        try:
+            active_offers = state.get_active_offers(chain=chain)
+        except Exception as exc:
+            active_offers = []
+            local_state_lookup_failed = True
+            local_state_lookup_error = str(exc)
+            logger.warning(
+                "Kill switch local state lookup failed chain=%s: %s; continuing exchange cancellation",
+                chain,
+                exc,
+            )
 
     exchange_lookup_failed = False
     exchange_lookup_error: str | None = None
@@ -243,6 +253,24 @@ def _cancel_chain(
         exchange_lookup_failed = True
         exchange_lookup_error = str(exc)
         logger.warning("Kill switch exchange lookup failed chain=%s: %s", chain, exc)
+        if state is None:
+            # No local fallback exists at all. This chain could not discover any
+            # cancellation targets, so surface a fatal chain result explicitly.
+            return KillSwitchChainResult(
+                chain=chain,
+                active_offers_seen=0,
+                exchange_seen=0,
+                live_cancelled=0,
+                local_cancelled=0,
+                already_gone=0,
+                failed=(),
+                exchange_lookup_failed=True,
+                exchange_lookup_error=exchange_lookup_error,
+                fatal_error=(
+                    "exchange lookup failed while local state unavailable: "
+                    f"{exchange_lookup_error}"
+                ),
+            )
         exchange_order_hashes = [
             offer.order_hash
             for offer in active_offers
@@ -283,53 +311,49 @@ def _cancel_chain(
             failed_order_hashes.append(order_hash)
             failed.append(f"{order_hash}:cancel_failed")
 
-    failed_hash_set = set(failed_order_hashes)
-    for offer in active_offers:
-        if offer.order_hash.startswith("dryrun-"):
-            if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
-                local_cancelled += 1
-            continue
-        if offer.order_hash in successful_live_cancels:
-            state.mark_offer_status(order_hash=offer.order_hash, status="cancelled")
-            continue
-        if offer.order_hash in failed_hash_set:
-            state.mark_offer_status(
-                order_hash=offer.order_hash,
+    # Local state reconciliation/quarantine is impossible in R34 exchange-only
+    # mode. Never simulate successful persistence; the global state_init
+    # preflight failure plus any per-order failure remains visible in the result.
+    if state is not None:
+        failed_hash_set = set(failed_order_hashes)
+        for offer in active_offers:
+            if offer.order_hash.startswith("dryrun-"):
+                if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
+                    local_cancelled += 1
+                continue
+            if offer.order_hash in successful_live_cancels:
+                state.mark_offer_status(order_hash=offer.order_hash, status="cancelled")
+                continue
+            if offer.order_hash in failed_hash_set:
+                state.mark_offer_status(
+                    order_hash=offer.order_hash,
+                    status="killswitch_failed",
+                )
+                continue
+            if not exchange_lookup_failed:
+                if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
+                    already_gone += 1
+
+        active_hash_set = {offer.order_hash for offer in active_offers}
+        for order_hash in failed_order_hashes:
+            if order_hash in active_hash_set:
+                continue
+            state.upsert_active_offer(
+                order_hash=order_hash,
+                collection=exchange_order_collections.get(order_hash, "exchange_unknown"),
+                chain=chain,
+                price_bnb=0.0,
                 status="killswitch_failed",
             )
-            continue
-        if not exchange_lookup_failed:
-            if state.mark_offer_status(order_hash=offer.order_hash, status="cancelled"):
-                already_gone += 1
 
-    active_hash_set = {offer.order_hash for offer in active_offers}
-    for order_hash in failed_order_hashes:
-        if order_hash in active_hash_set:
-            continue
-        # R28: exchange discovery can reveal live orders missing from local
-        # active_offers. UPDATE-only mark_offer_status cannot quarantine such an
-        # order. Persist an explicit sentinel zombie row so subsequent governor
-        # checks see killswitch_failed and veto new live submissions.
-        state.upsert_active_offer(
-            order_hash=order_hash,
-            collection=exchange_order_collections.get(order_hash, "exchange_unknown"),
-            chain=chain,
-            price_bnb=0.0,
-            status="killswitch_failed",
-        )
-
-    # R29: an exchange row without any durable order identifier is not a clean
-    # cancellation result. It cannot safely be sent to cancel_offer, so persist
-    # a deterministic quarantine fingerprint instead. This keeps the governor
-    # vetoed until the unidentified exchange object is investigated manually.
-    for quarantine_id, collection in unidentified_exchange_orders.items():
-        state.upsert_active_offer(
-            order_hash=quarantine_id,
-            collection=collection,
-            chain=chain,
-            price_bnb=0.0,
-            status="killswitch_failed",
-        )
+        for quarantine_id, collection in unidentified_exchange_orders.items():
+            state.upsert_active_offer(
+                order_hash=quarantine_id,
+                collection=collection,
+                chain=chain,
+                price_bnb=0.0,
+                status="killswitch_failed",
+            )
 
     result = KillSwitchChainResult(
         chain=chain,
@@ -344,10 +368,15 @@ def _cancel_chain(
         local_state_lookup_failed=local_state_lookup_failed,
         local_state_lookup_error=local_state_lookup_error,
     )
+    if state is None:
+        if state_unavailable_error:
+            logger.warning(
+                "Kill switch chain=%s completed without local state persistence: %s",
+                chain,
+                state_unavailable_error,
+            )
+        return result
     if local_state_lookup_failed:
-        # The exchange effect already occurred (or was attempted). A broken local
-        # state store must not replace those counts with an outer zeroed fatal
-        # result merely because audit persistence is also unavailable.
         _record_chain_audit_best_effort(state, result)
     else:
         _record_chain_audit(state, result)
