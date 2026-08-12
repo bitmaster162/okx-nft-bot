@@ -55,6 +55,19 @@ class KillSwitchResult:
         return sum(item.failure_count for item in self.chains) + (1 if self.preflight_error else 0)
 
 
+class _UnavailableOKXAPI:
+    """Duck-typed fail-closed OKX boundary used after constructor failure."""
+
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+    def get_my_offers(self, *, chain: str, require_all_endpoints: bool):
+        raise RuntimeError(self.error)
+
+    def cancel_offer(self, order_hash: str, *, chain: str, order_params=None):
+        raise RuntimeError(self.error)
+
+
 def activate_multichain_killswitch(
     *,
     settings: Settings,
@@ -150,37 +163,20 @@ def activate_multichain_killswitch(
                 "Kill switch OpenSea adapter initialization failed; tracked OpenSea orders will remain quarantined"
             )
 
-    # R37: API construction is itself part of the emergency boundary. If the
-    # client cannot be constructed, no OKX exchange cancellation can be attempted,
-    # but the kill switch must still return structured fatal chain results after
-    # the local/process safety latch rather than throwing out of the command.
+    # R47: an OKX constructor failure is fatal for the OKX marketplace boundary,
+    # but it must not suppress independent cancellation adapters. Preserve the
+    # R37 fatal result while routing every chain through _cancel_chain so tracked
+    # OpenSea exposures can still be cancelled and persisted first.
     resolved_api = api
+    okx_api_init_error: str | None = None
     if resolved_api is None:
         try:
             resolved_api = OKXAPIClient(settings=settings)
         except Exception as exc:
+            okx_api_init_error = f"api_init: {exc}"
+            resolved_api = _UnavailableOKXAPI(okx_api_init_error)
             logger.exception(
-                "Kill switch OKX API initialization failed; returning fatal chain results"
-            )
-            failures: list[KillSwitchChainResult] = []
-            for chain in resolved_chains:
-                failure = KillSwitchChainResult(
-                    chain=chain,
-                    active_offers_seen=0,
-                    exchange_seen=0,
-                    live_cancelled=0,
-                    local_cancelled=0,
-                    already_gone=0,
-                    failed=(),
-                    fatal_error=f"api_init: {exc}",
-                )
-                if resolved_state is not None:
-                    _record_chain_audit_best_effort(resolved_state, failure)
-                failures.append(failure)
-            return KillSwitchResult(
-                activated_at=activated_at,
-                chains=tuple(failures),
-                preflight_error=preflight_error,
+                "Kill switch OKX API initialization failed; continuing independent marketplace cancellation"
             )
 
     results: list[KillSwitchChainResult] = []
@@ -193,6 +189,7 @@ def activate_multichain_killswitch(
                 opensea_api=resolved_opensea_api,
                 chain=chain,
                 state_unavailable_error=state_init_error,
+                fatal_error=okx_api_init_error,
             )
         except Exception as exc:
             logger.exception("Kill switch fatal chain failure chain=%s", chain)
@@ -262,6 +259,7 @@ def _cancel_chain(
     chain: str,
     opensea_api: OpenSeaKillSwitchClient | None = None,
     state_unavailable_error: str | None = None,
+    fatal_error: str | None = None,
 ) -> KillSwitchChainResult:
     # R33/R34: local SQLite is fallback/accounting input, not a prerequisite for
     # exchange discovery or cancellation.
@@ -384,7 +382,8 @@ def _cancel_chain(
                 exchange_lookup_failed=True,
                 exchange_lookup_error=exchange_lookup_error,
                 fatal_error=(
-                    "exchange lookup failed while local state unavailable: "
+                    fatal_error
+                    or "exchange lookup failed while local state unavailable: "
                     f"{exchange_lookup_error}"
                 ),
             )
@@ -576,6 +575,7 @@ def _cancel_chain(
         failed=tuple(failed),
         exchange_lookup_failed=exchange_lookup_failed,
         exchange_lookup_error=exchange_lookup_error,
+        fatal_error=fatal_error,
         local_state_lookup_failed=local_state_lookup_failed,
         local_state_lookup_error=local_state_lookup_error,
         local_state_persistence_failed=local_state_persistence_failed,
@@ -676,7 +676,17 @@ def format_killswitch_result(result: KillSwitchResult) -> str:
     if result.preflight_error:
         lines.append(f"preflight_error={result.preflight_error}")
     for item in result.chains:
-        if item.fatal_error:
+        has_effect_detail = bool(
+            item.active_offers_seen
+            or item.exchange_seen
+            or item.live_cancelled
+            or item.local_cancelled
+            or item.already_gone
+            or item.failed
+            or item.local_state_lookup_failed
+            or item.local_state_persistence_failed
+        )
+        if item.fatal_error and not has_effect_detail:
             lines.append(f"chain={item.chain} fatal_error={item.fatal_error}")
             continue
         persistence_suffix = (
@@ -689,13 +699,18 @@ def format_killswitch_result(result: KillSwitchResult) -> str:
             if item.exchange_lookup_failed
             else ""
         )
+        fatal_suffix = (
+            f" fatal_error={item.fatal_error}"
+            if item.fatal_error
+            else ""
+        )
         lines.append(
             f"chain={item.chain} active_offers_seen={item.active_offers_seen} "
             f"exchange_seen={item.exchange_seen} live_cancelled={item.live_cancelled} "
             f"local_cancelled={item.local_cancelled} already_gone={item.already_gone} "
             f"failed={len(item.failed)} zombies={len(item.failed)} "
             f"state_lookup_failed={1 if item.local_state_lookup_failed else 0}"
-            f"{persistence_suffix}{exchange_suffix}"
+            f"{persistence_suffix}{exchange_suffix}{fatal_suffix}"
         )
     lines.append(f"total_failed={result.total_failed}")
     return "\n".join(lines)
