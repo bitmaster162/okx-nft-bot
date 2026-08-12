@@ -108,7 +108,7 @@ def test_lookup_failure_on_one_chain_does_not_skip_other_chain(tmp_path: Path) -
     assert api.cancel_chains == ["eth"]
     assert result.chains[0].exchange_lookup_failed is True
     assert result.chains[1].exchange_lookup_failed is False
-    assert result.total_failed == 0
+    assert result.total_failed == 1
 
 
 def test_failed_cancel_is_marked_killswitch_failed(tmp_path: Path) -> None:
