@@ -26,10 +26,16 @@ class KillSwitchChainResult:
     exchange_lookup_failed: bool = False
     exchange_lookup_error: str | None = None
     fatal_error: str | None = None
+    local_state_lookup_failed: bool = False
+    local_state_lookup_error: str | None = None
 
     @property
     def failure_count(self) -> int:
-        return len(self.failed) + (1 if self.fatal_error else 0)
+        return (
+            len(self.failed)
+            + (1 if self.local_state_lookup_failed else 0)
+            + (1 if self.fatal_error else 0)
+        )
 
 
 @dataclass(slots=True)
@@ -182,7 +188,23 @@ def _cancel_chain(
     api: OKXAPIClient,
     chain: str,
 ) -> KillSwitchChainResult:
-    active_offers = state.get_active_offers(chain=chain)
+    # R33: local SQLite is a useful fallback/accounting source, not a prerequisite
+    # for exchange discovery. If it is unreadable, still attempt exchange cancel
+    # and surface the degraded local-state condition in the result.
+    local_state_lookup_failed = False
+    local_state_lookup_error: str | None = None
+    try:
+        active_offers = state.get_active_offers(chain=chain)
+    except Exception as exc:
+        active_offers = []
+        local_state_lookup_failed = True
+        local_state_lookup_error = str(exc)
+        logger.warning(
+            "Kill switch local state lookup failed chain=%s: %s; continuing exchange cancellation",
+            chain,
+            exc,
+        )
+
     exchange_lookup_failed = False
     exchange_lookup_error: str | None = None
     exchange_order_hashes: list[str] = []
@@ -319,8 +341,16 @@ def _cancel_chain(
         failed=tuple(failed),
         exchange_lookup_failed=exchange_lookup_failed,
         exchange_lookup_error=exchange_lookup_error,
+        local_state_lookup_failed=local_state_lookup_failed,
+        local_state_lookup_error=local_state_lookup_error,
     )
-    _record_chain_audit(state, result)
+    if local_state_lookup_failed:
+        # The exchange effect already occurred (or was attempted). A broken local
+        # state store must not replace those counts with an outer zeroed fatal
+        # result merely because audit persistence is also unavailable.
+        _record_chain_audit_best_effort(state, result)
+    else:
+        _record_chain_audit(state, result)
     return result
 
 
@@ -336,11 +366,14 @@ def _record_chain_audit(state: PositionState, result: KillSwitchChainResult) -> 
             f"exchange_seen={result.exchange_seen};live_cancelled={result.live_cancelled};"
             f"local_cancelled={result.local_cancelled};already_gone={result.already_gone};"
             f"failed={result.failure_count};"
+            f"local_state_lookup_failed={1 if result.local_state_lookup_failed else 0};"
             f"exchange_lookup_failed={1 if result.exchange_lookup_failed else 0};"
             f"fatal={1 if result.fatal_error else 0}"
         ),
     )
     errors = list(result.failed)
+    if result.local_state_lookup_failed:
+        errors.append(f"local_state_lookup:{result.local_state_lookup_error}")
     if result.fatal_error:
         errors.append(f"fatal:{result.fatal_error}")
     state.log_action(
@@ -358,6 +391,8 @@ def _record_chain_audit(state: PositionState, result: KillSwitchChainResult) -> 
             "live_cancelled": result.live_cancelled,
             "local_cancelled": result.local_cancelled,
             "already_gone": result.already_gone,
+            "local_state_lookup_failed": result.local_state_lookup_failed,
+            "local_state_lookup_error": result.local_state_lookup_error,
             "exchange_lookup_failed": result.exchange_lookup_failed,
             "exchange_lookup_error": result.exchange_lookup_error,
             "failed": list(result.failed),
@@ -395,7 +430,8 @@ def format_killswitch_result(result: KillSwitchResult) -> str:
             f"chain={item.chain} active_offers_seen={item.active_offers_seen} "
             f"exchange_seen={item.exchange_seen} live_cancelled={item.live_cancelled} "
             f"local_cancelled={item.local_cancelled} already_gone={item.already_gone} "
-            f"failed={len(item.failed)} zombies={len(item.failed)}"
+            f"failed={len(item.failed)} zombies={len(item.failed)} "
+            f"state_lookup_failed={1 if item.local_state_lookup_failed else 0}"
         )
     lines.append(f"total_failed={result.total_failed}")
     return "\n".join(lines)
