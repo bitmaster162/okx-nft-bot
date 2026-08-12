@@ -7,6 +7,7 @@ import json
 import logging
 from typing import Iterable
 
+from okx_nft_bot.clients.opensea_killswitch import OpenSeaKillSwitchClient
 from okx_nft_bot.config import SUPPORTED_EXECUTION_CHAINS, Settings
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient
 from okx_nft_bot.undercutter.state import PositionState
@@ -59,6 +60,7 @@ def activate_multichain_killswitch(
     settings: Settings,
     state: PositionState | None = None,
     api: OKXAPIClient | None = None,
+    opensea_api: OpenSeaKillSwitchClient | None = None,
     chains: Iterable[str] | None = None,
 ) -> KillSwitchResult:
     """Latch local safety, then best-effort persist it and cancel every chain.
@@ -135,8 +137,21 @@ def activate_multichain_killswitch(
         )
     )
 
+    # R46: OpenSea cancellation is a separate marketplace boundary. Constructing
+    # this adapter has no network or signing effect; credentials are validated
+    # only if a tracked OpenSea order actually reaches the cancel boundary.
+    resolved_opensea_api = opensea_api
+    if resolved_opensea_api is None:
+        try:
+            resolved_opensea_api = OpenSeaKillSwitchClient(settings=settings)
+        except Exception:
+            resolved_opensea_api = None
+            logger.exception(
+                "Kill switch OpenSea adapter initialization failed; tracked OpenSea orders will remain quarantined"
+            )
+
     # R37: API construction is itself part of the emergency boundary. If the
-    # client cannot be constructed, no exchange cancellation can be attempted,
+    # client cannot be constructed, no OKX exchange cancellation can be attempted,
     # but the kill switch must still return structured fatal chain results after
     # the local/process safety latch rather than throwing out of the command.
     resolved_api = api
@@ -175,6 +190,7 @@ def activate_multichain_killswitch(
             result = _cancel_chain(
                 state=resolved_state,
                 api=resolved_api,
+                opensea_api=resolved_opensea_api,
                 chain=chain,
                 state_unavailable_error=state_init_error,
             )
@@ -244,6 +260,7 @@ def _cancel_chain(
     state: PositionState | None,
     api: OKXAPIClient,
     chain: str,
+    opensea_api: OpenSeaKillSwitchClient | None = None,
     state_unavailable_error: str | None = None,
 ) -> KillSwitchChainResult:
     # R33/R34: local SQLite is fallback/accounting input, not a prerequisite for
@@ -265,18 +282,57 @@ def _cancel_chain(
                 exc,
             )
 
-    # R40: local inventory is multi-marketplace. The exchange API below is OKX
-    # only, so only legacy/explicit OKX rows may participate in OKX fallback or
-    # reconciliation. Every other active marketplace remains unresolved until a
-    # separately verified cancellation adapter exists and is marked failed-closed.
+    # R40/R46: local inventory is marketplace-aware. Legacy/explicit OKX rows
+    # only ever reach OKX. Tracked OpenSea rows have a separately authenticated
+    # SignedZone off-chain cancel boundary. Any other marketplace remains
+    # unsupported and therefore quarantined fail-closed.
     okx_active_offers = []
+    opensea_active_offers = []
     unsupported_active_offers: list[tuple[object, str]] = []
     for offer in active_offers:
         marketplace = _local_offer_marketplace(offer)
         if marketplace == "okx":
             okx_active_offers.append(offer)
+        elif marketplace == "opensea":
+            opensea_active_offers.append(offer)
         else:
             unsupported_active_offers.append((offer, marketplace))
+
+    live_cancelled = 0
+    local_cancelled = 0
+    already_gone = 0
+    failed: list[str] = []
+    failed_order_hashes: list[str] = []
+    successful_live_cancels: set[str] = set()
+    opensea_failed_hashes: set[str] = set()
+
+    # R46: cancel already-tracked OpenSea orders independently of OKX discovery.
+    # The adapter itself single-attempts the effectful POST and requires exact
+    # order readback to confirm cancellation before returning True.
+    for offer in opensea_active_offers:
+        order_hash = offer.order_hash
+        if opensea_api is None:
+            opensea_failed_hashes.add(order_hash)
+            failed.append(f"{order_hash}:opensea_cancel_unavailable")
+            continue
+        try:
+            ok = opensea_api.cancel_offer(order_hash, chain=chain)
+        except Exception as exc:
+            opensea_failed_hashes.add(order_hash)
+            failed.append(f"{order_hash}:opensea_cancel_failed:{exc}")
+            logger.warning(
+                "Kill switch OpenSea cancel failed chain=%s order=%s: %s",
+                chain,
+                order_hash,
+                exc,
+            )
+            continue
+        if ok:
+            live_cancelled += 1
+            successful_live_cancels.add(order_hash)
+        else:
+            opensea_failed_hashes.add(order_hash)
+            failed.append(f"{order_hash}:opensea_cancel_failed")
 
     exchange_lookup_failed = False
     exchange_lookup_error: str | None = None
@@ -321,10 +377,10 @@ def _cancel_chain(
                 chain=chain,
                 active_offers_seen=0,
                 exchange_seen=0,
-                live_cancelled=0,
+                live_cancelled=live_cancelled,
                 local_cancelled=0,
                 already_gone=0,
-                failed=(),
+                failed=tuple(failed),
                 exchange_lookup_failed=True,
                 exchange_lookup_error=exchange_lookup_error,
                 fatal_error=(
@@ -338,19 +394,12 @@ def _cancel_chain(
             if not offer.order_hash.startswith("dryrun-")
         ]
 
-    live_cancelled = 0
-    local_cancelled = 0
-    already_gone = 0
-    failed: list[str] = [
+    failed.extend(
         f"{quarantine_id}:missing_order_id"
         for quarantine_id in unidentified_exchange_orders
-    ]
+    )
     for offer, marketplace in unsupported_active_offers:
-        failed.append(
-            f"{offer.order_hash}:{marketplace}_cancel_unavailable"
-        )
-    failed_order_hashes: list[str] = []
-    successful_live_cancels: set[str] = set()
+        failed.append(f"{offer.order_hash}:{marketplace}_cancel_unavailable")
 
     for order_hash in exchange_order_hashes:
         try:
@@ -391,9 +440,28 @@ def _cancel_chain(
         )
 
     if state is not None:
-        # R40: unsupported marketplace exposure is not "already gone" merely
-        # because OKX inventory cannot see it. Persist an explicit zombie state
-        # so every later live-submit boundary remains fail-closed.
+        # R46: an OpenSea row is cleared only after the adapter has confirmed the
+        # exact order is cancelled. Every other outcome remains a zombie.
+        for offer in opensea_active_offers:
+            status = (
+                "cancelled"
+                if offer.order_hash in successful_live_cancels
+                else "killswitch_failed"
+            )
+            try:
+                state.mark_offer_status(
+                    order_hash=offer.order_hash,
+                    status=status,
+                )
+            except Exception as exc:
+                note_state_persistence_failure(
+                    f"mark_opensea_{status}[{offer.order_hash}]",
+                    exc,
+                )
+
+        # Unsupported marketplace exposure is not "already gone" merely because
+        # OKX inventory cannot see it. Persist an explicit zombie state so every
+        # later live-submit boundary remains fail-closed.
         for offer, marketplace in unsupported_active_offers:
             try:
                 state.mark_offer_status(
