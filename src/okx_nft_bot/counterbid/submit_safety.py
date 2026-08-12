@@ -17,6 +17,25 @@ _CHAIN_BY_ID = {
 
 _NFT_ITEM_TYPES = frozenset({2, 3, 4, 5})
 
+# Canonical ERC20 metadata for the currencies already supported by the
+# CounterBidder/OKX execution paths. Unknown tokens are intentionally not
+# guessed at the final spend-cap boundary.
+_TOKEN_META: dict[str, dict[str, tuple[str, int]]] = {
+    "bsc": {
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": ("WBNB", 18),
+        "0x55d398326f99059ff775485246999027b3197955": ("USDT", 18),
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": ("USDC", 18),
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56": ("BUSD", 18),
+        "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3": ("DAI", 18),
+    },
+    "eth": {
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": ("WETH", 18),
+        "0xdac17f958d2ee523a2206206994597c13d831ec7": ("USDT", 6),
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": ("USDC", 6),
+        "0x6b175474e89094c44da98b954eedeac495271d0f": ("DAI", 18),
+    },
+}
+
 
 def _chain_name(value: Any) -> str | None:
     if isinstance(value, str):
@@ -234,6 +253,70 @@ def _buy_erc20_requirements(
     return wallet, requirements
 
 
+def _buy_price_bnb_equiv(
+    *,
+    chain_name: str,
+    requirements: Mapping[str, int],
+) -> tuple[float, float]:
+    """Normalize signed ERC20 BUY exposure to BNB-equivalent and USD.
+
+    The ExecutionGovernor daily cap is denominated in BNB-equivalent. Conversion
+    therefore uses an explicit chain/token metadata allowlist and the shared
+    price oracle. Unknown token metadata or an unavailable price is uncertainty,
+    not permission to submit.
+    """
+    from decimal import Decimal
+    import math
+
+    from okx_nft_bot.prices import get_usd_price
+
+    chain_meta = _TOKEN_META.get(chain_name)
+    if not chain_meta:
+        raise RuntimeError(f"price normalization unsupported for chain {chain_name!r}")
+
+    bnb_usd_raw = float(get_usd_price("BNB"))
+    if not math.isfinite(bnb_usd_raw) or bnb_usd_raw <= 0:
+        raise RuntimeError("BNB/USD price unavailable")
+    bnb_usd = Decimal(str(bnb_usd_raw))
+
+    total_usd = Decimal("0")
+    for token, required_raw in requirements.items():
+        token_address = _canonical_address(token, label="offer token")
+        metadata = chain_meta.get(token_address)
+        if metadata is None:
+            raise RuntimeError(
+                f"unknown ERC20 metadata for chain={chain_name} token={token_address}"
+            )
+        symbol, decimals = metadata
+        try:
+            raw_amount = int(required_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("signed ERC20 requirement is invalid") from exc
+        if raw_amount <= 0:
+            raise RuntimeError("signed ERC20 requirement must be positive")
+
+        usd_rate_raw = float(get_usd_price(symbol))
+        if not math.isfinite(usd_rate_raw) or usd_rate_raw <= 0:
+            raise RuntimeError(f"{symbol}/USD price unavailable")
+        usd_rate = Decimal(str(usd_rate_raw))
+        token_amount = Decimal(raw_amount) / (Decimal(10) ** decimals)
+        total_usd += token_amount * usd_rate
+
+    if total_usd <= 0:
+        raise RuntimeError("BUY USD exposure is not positive")
+    price_bnb = total_usd / bnb_usd
+    price_bnb_float = float(price_bnb)
+    total_usd_float = float(total_usd)
+    if (
+        not math.isfinite(price_bnb_float)
+        or price_bnb_float <= 0
+        or not math.isfinite(total_usd_float)
+        or total_usd_float <= 0
+    ):
+        raise RuntimeError("BUY exposure normalization is not finite and positive")
+    return price_bnb_float, total_usd_float
+
+
 def _read_erc20_balance_raw(
     client: Any,
     *,
@@ -328,7 +411,7 @@ def _bsc_quota_block_reason(client: Any) -> str | None:
 def install_submit_safety(client_class: type[Any]) -> None:
     """Gate OKX Seaport submitOrder at the final HTTP effect boundary."""
     original_request = client_class._request
-    if getattr(original_request, "_r23_counter_guard", False):
+    if getattr(original_request, "_r24_priced_governor_guard", False):
         return
 
     original_complete = client_class._complete_two_step_offer
@@ -432,6 +515,35 @@ def install_submit_safety(client_class: type[Any]) -> None:
                 ) from exc
 
             if balance_gate is not None:
+                wallet, requirements = balance_gate
+
+                # R24: the R16 safety precheck above intentionally used zero
+                # cost, which protects arm/killswitch/cooldown but cannot prove
+                # the daily BNB-equivalent cap for this new BUY. Normalize the
+                # signed spend and re-run the same governor immediately before
+                # quota/balance/HTTP with the real requested exposure.
+                try:
+                    price_bnb, price_usd = _buy_price_bnb_equiv(
+                        chain_name=chain_name,
+                        requirements=requirements,
+                    )
+                except Exception as exc:
+                    raise OKXSubmitError(
+                        f"submitOrder price gate blocked: {exc}"
+                    ) from exc
+
+                priced_blocked = governor.check_live_submit_allowed(
+                    action_type="LIVE_OKX_SUBMIT_ORDER",
+                    collection="okx_submit_order",
+                    chain=chain_name,
+                    price_bnb=price_bnb,
+                    price_usd=price_usd,
+                )
+                if priced_blocked:
+                    raise OKXSubmitError(
+                        f"submitOrder priced governor blocked: {priced_blocked}"
+                    )
+
                 # R21: preserve the CounterBidder BSC exchange-drift quota at
                 # the final effect boundary. The legacy upstream guard allowed
                 # submissions when SQLite could not be read; uncertainty now
@@ -450,7 +562,6 @@ def install_submit_safety(client_class: type[Any]) -> None:
                         )
 
                 try:
-                    wallet, requirements = balance_gate
                     for token_address, required_raw in requirements.items():
                         balance_raw = _read_erc20_balance_raw(
                             self,
@@ -484,6 +595,7 @@ def install_submit_safety(client_class: type[Any]) -> None:
     guarded_request._r21_quota_guard = True
     guarded_request._r22_protocoldata_guard = True
     guarded_request._r23_counter_guard = True
+    guarded_request._r24_priced_governor_guard = True
     guarded_complete_two_step_offer._r16_submit_context = True
 
     client_class._request = guarded_request
