@@ -274,8 +274,9 @@ class OpenSeaClient:
         salt_input = f"{offerer}:{collection_address}:{token_id}:{price_wei}:{now}:{entropy}".encode("utf-8")
         salt = int(hashlib.sha256(salt_input).hexdigest(), 16)
 
-        # Determine if this is a collection offer or item offer
-        is_collection_offer = token_id is None or str(token_id) in ("", "0")
+        # Collection scope is explicit absence only. Token ID 0 is a valid ERC721
+        # identifier and must remain an item offer.
+        is_collection_offer = token_id is None or token_id == ""
         if is_collection_offer:
             # Collection offer: itemType=4 (ERC721_CRITERIA), identifierOrCriteria=0
             consideration_item_type = 4
