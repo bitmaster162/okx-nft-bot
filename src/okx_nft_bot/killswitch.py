@@ -50,32 +50,66 @@ def activate_multichain_killswitch(
     api: OKXAPIClient | None = None,
     chains: Iterable[str] | None = None,
 ) -> KillSwitchResult:
-    """Disarm execution first, then cancel offers on every supported chain.
+    """Latch local safety, then best-effort persist it and cancel every chain.
 
     A failure on one chain is isolated and does not prevent the remaining
-    chains from being processed. This is intentionally fail-closed: process
-    dry-run, persistent disarm and forced dry-run happen before integrity audit
-    and before the first exchange/RPC lookup.
+    chains from being processed. Process-local dry-run is set before any state
+    access. Persistent disarm/forced-dry-run/runtime metadata and integrity
+    preflight are attempted before exchange/RPC work, but their failure is
+    reported rather than allowed to suppress emergency cancellation.
     """
     # R31: give the invoking process an immediate local safety latch before any
-    # state construction/audit. Persistent state is written immediately after.
+    # state construction/audit.
     settings.dry_run = True
     resolved_state = state or PositionState(settings.execution_db_path)
 
     activated_at = datetime.now(timezone.utc).isoformat()
-    resolved_state.disarm_live(actor="telegram_killswitch", reason="telegram_killswitch")
-    resolved_state.set_force_dry_run(True, reason="telegram_killswitch")
-    resolved_state.set_runtime_value("killswitch_activated_at", activated_at)
-    resolved_state.set_runtime_value("killswitch_source", "telegram")
+    preflight_errors: list[str] = []
 
-    preflight_error: str | None = None
+    # R32: each persistent safety write is independent. A degraded state store
+    # must not turn an already-local-dry-run emergency command into "no cancel".
+    try:
+        resolved_state.disarm_live(
+            actor="telegram_killswitch",
+            reason="telegram_killswitch",
+        )
+    except Exception as exc:
+        preflight_errors.append(f"disarm_live: {exc}")
+        logger.exception(
+            "Kill switch persistent live disarm failed; continuing emergency cancellation"
+        )
+
+    try:
+        resolved_state.set_force_dry_run(True, reason="telegram_killswitch")
+    except Exception as exc:
+        preflight_errors.append(f"set_force_dry_run: {exc}")
+        logger.exception(
+            "Kill switch persistent force-dry-run failed; continuing emergency cancellation"
+        )
+
+    for key, value in (
+        ("killswitch_activated_at", activated_at),
+        ("killswitch_source", "telegram"),
+    ):
+        try:
+            resolved_state.set_runtime_value(key, value)
+        except Exception as exc:
+            preflight_errors.append(f"set_runtime_value[{key}]: {exc}")
+            logger.exception(
+                "Kill switch runtime metadata persistence failed key=%s; continuing emergency cancellation",
+                key,
+            )
+
     try:
         resolved_state.audit_integrity()
     except Exception as exc:
-        preflight_error = str(exc)
+        # Preserve R31's plain audit error when it is the only preflight failure.
+        preflight_errors.append(str(exc))
         logger.exception(
             "Kill switch integrity preflight failed after safety latch; continuing cancellation"
         )
+
+    preflight_error = "; ".join(preflight_errors) or None
 
     resolved_api = api or OKXAPIClient(settings=settings)
     resolved_chains = tuple(
