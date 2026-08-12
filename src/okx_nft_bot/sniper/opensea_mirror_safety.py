@@ -114,11 +114,21 @@ def _force_safe_after_submit_log_failure(
             pass
 
 
+def _durable_mirror_order_id(result: Any) -> str:
+    if not isinstance(result, dict):
+        raise RuntimeError("OpenSea mirror submit result is not an object")
+    raw = result.get("offer_id") or result.get("order_id") or result.get("order_hash")
+    order_id = str(raw or "").strip()
+    if not order_id:
+        raise RuntimeError("OpenSea mirror durable order id unavailable")
+    return order_id
+
+
 def install_opensea_mirror_safety(
     bidder_class: type[Any],
     opensea_client_class: type[Any],
 ) -> None:
-    """Price-gate and strictly account CounterBidder's OpenSea mirror effect."""
+    """Price-gate, track, and strictly account CounterBidder's OpenSea mirror."""
     current_mirror = bidder_class._mirror_to_opensea
     current_create = opensea_client_class.create_opensea_offer
     current_record = bidder_class._record_execution_submit_event
@@ -143,6 +153,7 @@ def install_opensea_mirror_safety(
             "bidder": self,
             "price_bnb": None,
             "price_usd": None,
+            "order_id": None,
             "halted": False,
         }
         token = _MIRROR_CONTEXT.set(context)
@@ -179,7 +190,9 @@ def install_opensea_mirror_safety(
 
         context["price_bnb"] = price_bnb
         context["price_usd"] = price_usd
-        return original_create(self, *args, **kwargs)
+        result = original_create(self, *args, **kwargs)
+        context["order_id"] = _durable_mirror_order_id(result)
+        return result
 
     @wraps(original_record)
     def guarded_record(
@@ -218,12 +231,27 @@ def install_opensea_mirror_safety(
                 reason=reason,
             )
 
-        if normalized_bnb is None or normalized_usd is None:
-            raise RuntimeError("OpenSea mirror durable effect missing normalized accounting price")
+        order_id = str(context.get("order_id") or "").strip()
+        if normalized_bnb is None or normalized_usd is None or not order_id:
+            raise RuntimeError("OpenSea mirror durable effect missing normalized inventory/accounting data")
 
         state = None
         try:
             state = self._get_execution_state()
+            # R40: OpenSea is a distinct marketplace effect. Persist its durable
+            # order id before the submit-ledger row so the emergency kill switch
+            # can see unresolved exposure even if the later ledger write fails.
+            state.upsert_active_offer(
+                order_hash=order_id,
+                collection=collection,
+                chain=chain,
+                price_bnb=float(normalized_bnb),
+                status="active",
+                preview_payload={
+                    "marketplace": "opensea",
+                    "source": "counter_bidder_mirror",
+                },
+            )
             state.record_submit_event(
                 engine="counter_bidder",
                 action_type="LIVE_OPENSEA_MIRROR",
@@ -246,6 +274,7 @@ def install_opensea_mirror_safety(
     guarded_mirror._r39_opensea_mirror_context = True
     guarded_create._r39_opensea_mirror_gate = True
     guarded_record._r39_opensea_mirror_accounting = True
+    guarded_record._r40_opensea_inventory_tracking = True
     bidder_class._mirror_to_opensea = guarded_mirror
     opensea_client_class.create_opensea_offer = guarded_create
     bidder_class._record_execution_submit_event = guarded_record
