@@ -18,15 +18,18 @@ class _Governor:
 
 
 def _install_governor(monkeypatch):
+    import okx_nft_bot.counterbid.submit_safety as safety
     import okx_nft_bot.execution_governor as governor_module
 
     monkeypatch.setattr(governor_module, "ExecutionGovernor", _Governor)
+    monkeypatch.setattr(safety, "_read_seaport_counter", lambda *_a, **_k: 7)
 
 
 def _parameters(*, amount=100):
     wallet = "0x" + "1" * 40
     return {
         "offerer": wallet,
+        "counter": "7",
         "offer": [
             {
                 "itemType": 1,
