@@ -23,6 +23,7 @@ def _install_governor(monkeypatch):
 
     monkeypatch.setattr(governor_module, "ExecutionGovernor", _Governor)
     monkeypatch.setattr(safety, "_read_seaport_counter", lambda *_a, **_k: 7)
+    monkeypatch.setattr(safety, "_buy_price_bnb_equiv", lambda **_kwargs: (0.001, 1.0))
 
 
 def _parameters(*, amount=100):

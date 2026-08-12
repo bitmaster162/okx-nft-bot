@@ -23,6 +23,7 @@ def _install_governor(monkeypatch, blocked=None):
     _Governor.blocked = blocked
     monkeypatch.setattr(governor_module, "ExecutionGovernor", _Governor)
     monkeypatch.setattr(safety, "_bsc_quota_block_reason", lambda _client: None)
+    monkeypatch.setattr(safety, "_buy_price_bnb_equiv", lambda **_kwargs: (0.001, 1.0))
 
 
 def _buy_payload(*, chain=56, wallet=None, offerer=None, amount=100):

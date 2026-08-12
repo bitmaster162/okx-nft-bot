@@ -18,9 +18,11 @@ class _Governor:
 
 
 def _install_governor(monkeypatch):
+    import okx_nft_bot.counterbid.submit_safety as safety
     import okx_nft_bot.execution_governor as governor_module
 
     monkeypatch.setattr(governor_module, "ExecutionGovernor", _Governor)
+    monkeypatch.setattr(safety, "_buy_price_bnb_equiv", lambda **_kwargs: (0.001, 1.0))
 
 
 def _buy_parameters(*, counter=7, amount=100, offerer=None):
