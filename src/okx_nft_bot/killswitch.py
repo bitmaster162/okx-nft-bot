@@ -25,9 +25,9 @@ class KillSwitchChainResult:
     failed: tuple[str, ...]
     exchange_lookup_failed: bool = False
     exchange_lookup_error: str | None = None
+    fatal_error: str | None = None
     local_state_lookup_failed: bool = False
     local_state_lookup_error: str | None = None
-    fatal_error: str | None = None
 
     @property
     def failure_count(self) -> int:
