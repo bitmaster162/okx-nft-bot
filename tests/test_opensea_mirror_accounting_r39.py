@@ -14,10 +14,17 @@ COLLECTION = "0x" + "3" * 40
 
 
 class _State:
-    def __init__(self, *, fail_record: bool = False):
+    def __init__(self, *, fail_record: bool = False, fail_upsert: bool = False):
         self.fail_record = fail_record
+        self.fail_upsert = fail_upsert
         self.events = []
+        self.active = []
         self.forced = []
+
+    def upsert_active_offer(self, **kwargs):
+        if self.fail_upsert:
+            raise RuntimeError("active inventory unavailable")
+        self.active.append(kwargs)
 
     def record_submit_event(self, **kwargs):
         if self.fail_record:
@@ -125,6 +132,7 @@ def test_real_classes_have_r39_mirror_safety_installed():
     assert getattr(CounterBidder._mirror_to_opensea, "_r39_opensea_mirror_context", False) is True
     assert getattr(OpenSeaClient.create_opensea_offer, "_r39_opensea_mirror_gate", False) is True
     assert getattr(CounterBidder._record_execution_submit_event, "_r39_opensea_mirror_accounting", False) is True
+    assert getattr(CounterBidder._record_execution_submit_event, "_r40_opensea_inventory_tracking", False) is True
 
 
 def test_durable_mirror_records_bnb_equivalent_once(monkeypatch):
@@ -149,6 +157,19 @@ def test_durable_mirror_records_bnb_equivalent_once(monkeypatch):
         }
     ]
     assert bidder.legacy_events == []
+    assert state.active == [
+        {
+            "order_hash": "os-order-1",
+            "collection": COLLECTION,
+            "chain": "eth",
+            "price_bnb": 0.25,
+            "status": "active",
+            "preview_payload": {
+                "marketplace": "opensea",
+                "source": "counter_bidder_mirror",
+            },
+        }
+    ]
     assert state.events == [
         {
             "engine": "counter_bidder",
@@ -176,6 +197,7 @@ def test_incremental_daily_cap_blocks_before_opensea_effect(monkeypatch):
 
     assert bidder._mirror_to_opensea(COLLECTION, 0.05, "WETH") is False
     assert FakeClient.calls == 0
+    assert state.active == []
     assert state.events == []
     assert len(bidder.legacy_events) == 1
     assert bidder.legacy_events[0]["status"] == "failed"
@@ -196,6 +218,7 @@ def test_incremental_hourly_limit_blocks_before_opensea_effect(monkeypatch):
 
     assert bidder._mirror_to_opensea(COLLECTION, 0.05, "WETH") is False
     assert FakeClient.calls == 0
+    assert state.active == []
     assert state.events == []
     assert "rate limit hit" in bidder.legacy_events[0]["reason"]
 
@@ -212,6 +235,7 @@ def test_price_normalization_uncertainty_blocks_before_opensea_effect(monkeypatc
 
     assert bidder._mirror_to_opensea(COLLECTION, 0.05, "WETH") is False
     assert FakeClient.calls == 0
+    assert state.active == []
     assert state.events == []
     assert "BNB/USD price unavailable" in bidder.legacy_events[0]["reason"]
 
@@ -236,11 +260,37 @@ def test_post_submit_accounting_failure_forces_safe_state(monkeypatch):
 
     assert FakeClient.calls == 1
     assert bidder.dry_run is True
+    assert state.active[0]["order_hash"] == "os-order-1"
+    assert state.active[0]["preview_payload"]["marketplace"] == "opensea"
     assert state.forced == [(True, "opensea_mirror_submit_log_failure")]
 
     with pytest.raises(RuntimeError, match="OpenSea mirror halted after submit accounting failure"):
         bidder._mirror_to_opensea(COLLECTION, 0.05, "WETH")
     assert FakeClient.calls == 1
+
+
+def test_post_submit_inventory_failure_forces_safe_state(monkeypatch):
+    import okx_nft_bot.counterbid.submit_safety as submit_safety
+
+    monkeypatch.setattr(
+        submit_safety,
+        "_buy_price_bnb_equiv",
+        lambda **_kwargs: (0.25, 150.0),
+    )
+    state = _State(fail_upsert=True)
+    FakeBidder, FakeClient, _ = _fake_classes(state=state)
+    bidder = FakeBidder()
+
+    with pytest.raises(
+        RuntimeError,
+        match="OpenSea mirror post-submit accounting failed after durable effect",
+    ):
+        bidder._mirror_to_opensea(COLLECTION, 0.05, "WETH")
+
+    assert FakeClient.calls == 1
+    assert bidder.dry_run is True
+    assert state.events == []
+    assert state.forced == [(True, "opensea_mirror_submit_log_failure")]
 
 
 def test_non_mirror_opensea_call_is_untouched():
