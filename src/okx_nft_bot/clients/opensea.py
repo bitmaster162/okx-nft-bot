@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 import json
 import logging
 import os
@@ -527,7 +528,15 @@ class OpenSeaClient:
         )
 
         try:
-            response = self.transport.request_json(
+            # A create-offer response can be lost after OpenSea has persisted the
+            # order. Never inherit generic transport retries for this effectful
+            # POST: a second attempt may duplicate a durable marketplace effect.
+            submit_transport = self.transport
+            if isinstance(submit_transport, StdlibHttpTransport):
+                submit_transport = copy(submit_transport)
+                submit_transport.max_retries = 1
+
+            response = submit_transport.request_json(
                 method="POST",
                 url=url,
                 headers=headers,
