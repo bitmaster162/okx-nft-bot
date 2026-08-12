@@ -718,7 +718,9 @@ class MassOfferEngine:
                 currency_address=WBNB_ADDRESS,
                 valid_time=valid_time,
             )
-            offer_ref = str(submit_result.get("offer_id") or submit_result.get("status") or f"submitted:{target.token_id}")
+            offer_ref = str(submit_result.get("offer_id") or "").strip()
+            if not offer_ref:
+                raise RuntimeError("no_offer_id_in_response")
             self.tracker.record_item(
                 campaign_id=campaign_id,
                 collection=collection,
