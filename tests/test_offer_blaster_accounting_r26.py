@@ -13,6 +13,11 @@ from okx_nft_bot.counterbid.okx_api import OKXAPIClient
 WETH_ADDRESS = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 
 
+class _ActiveStateStub:
+    def upsert_active_offer(self, **_kwargs):
+        return None
+
+
 def _payload(*, chain="eth", offer_id="offer-1"):
     _ = offer_id
     wallet = "0x" + "1" * 40
@@ -115,7 +120,7 @@ def test_eth_blaster_durable_submit_records_bnb_equivalent_once(monkeypatch):
 
     events = []
 
-    class FakeState:
+    class FakeState(_ActiveStateStub):
         def __init__(self, db_path):
             assert db_path == Path("/tmp/r26-execution.sqlite3")
 
@@ -159,7 +164,7 @@ def test_accounting_uses_signed_erc20_requirement_for_r24_normalization(monkeypa
 
     observed = []
 
-    class FakeState:
+    class FakeState(_ActiveStateStub):
         def __init__(self, _db_path):
             pass
 
@@ -190,7 +195,7 @@ def test_accounting_failure_forces_safe_state_and_halts_remaining_blast(monkeypa
 
     forced = []
 
-    class FakeState:
+    class FakeState(_ActiveStateStub):
         def __init__(self, _db_path):
             pass
 
@@ -226,7 +231,7 @@ def test_missing_durable_receipt_fails_safe_after_submit(monkeypatch):
 
     forced = []
 
-    class FakeState:
+    class FakeState(_ActiveStateStub):
         def __init__(self, _db_path):
             pass
 
