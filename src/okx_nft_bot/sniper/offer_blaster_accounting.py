@@ -104,9 +104,18 @@ def _force_safe_after_accounting_failure(
             settings.dry_run = True
         except Exception:
             pass
-    if state is not None:
+
+    resolved_state = state
+    if resolved_state is None:
         try:
-            state.set_force_dry_run(
+            from okx_nft_bot.undercutter.state import PositionState
+
+            resolved_state = PositionState(_execution_db_path(context, client))
+        except Exception:
+            resolved_state = None
+    if resolved_state is not None:
+        try:
+            resolved_state.set_force_dry_run(
                 True,
                 reason="offer_blaster_submit_log_failure",
             )
@@ -160,9 +169,10 @@ def install_offer_blaster_accounting(
             )
 
         result = original_submit(self, payload)
-        offer_id = _durable_offer_id(result)
         state = None
+        offer_id = "unknown"
         try:
+            offer_id = _durable_offer_id(result)
             requirements = _eth_buy_requirements(payload)
             from okx_nft_bot.counterbid.submit_safety import _buy_price_bnb_equiv
 
