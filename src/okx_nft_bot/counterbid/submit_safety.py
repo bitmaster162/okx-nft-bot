@@ -184,10 +184,45 @@ def _read_erc20_balance_raw(
     return balance
 
 
+def _read_bsc_active_offer_count(client: Any) -> int:
+    """Read the wallet-wide local active-offer count used by the BSC quota guard."""
+    from okx_nft_bot.undercutter.state import PositionState
+
+    db_path = getattr(client.settings, "execution_db_path", None)
+    if db_path is None:
+        raise RuntimeError("execution_db_path unavailable")
+    state = PositionState(db_path)
+    return state.count_active_offers()
+
+
+def _bsc_quota_block_reason(client: Any) -> str | None:
+    """Fail closed when the BSC OKX active-offer quota cannot be proven safe."""
+    import os
+
+    raw_threshold = os.getenv("COUNTERBID_QUOTA_THRESHOLD", "25")
+    try:
+        threshold = int(raw_threshold)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"invalid COUNTERBID_QUOTA_THRESHOLD={raw_threshold!r}"
+        ) from exc
+    if threshold <= 0:
+        raise RuntimeError(
+            f"invalid COUNTERBID_QUOTA_THRESHOLD={threshold}"
+        )
+
+    active_count = _read_bsc_active_offer_count(client)
+    if active_count < 0:
+        raise RuntimeError("active offer count is negative")
+    if active_count >= threshold:
+        return f"quota_guard:{active_count}/{threshold}"
+    return None
+
+
 def install_submit_safety(client_class: type[Any]) -> None:
     """Gate OKX Seaport submitOrder at the final HTTP effect boundary."""
     original_request = client_class._request
-    if getattr(original_request, "_r20_balance_guard", False):
+    if getattr(original_request, "_r21_quota_guard", False):
         return
 
     original_complete = client_class._complete_two_step_offer
@@ -263,7 +298,30 @@ def install_submit_safety(client_class: type[Any]) -> None:
             # decimals conversion, or upstream cache is trusted here.
             try:
                 balance_gate = _buy_erc20_requirements(payload)
-                if balance_gate is not None:
+            except Exception as exc:
+                raise OKXSubmitError(
+                    f"submitOrder balance gate blocked: {exc}"
+                ) from exc
+
+            if balance_gate is not None:
+                # R21: preserve the CounterBidder BSC exchange-drift quota at
+                # the final effect boundary. The legacy upstream guard allowed
+                # submissions when SQLite could not be read; uncertainty now
+                # blocks instead. The original guard is BSC-only and counts all
+                # locally active offers, so keep those semantics here.
+                if chain_name == "bsc":
+                    try:
+                        quota_block = _bsc_quota_block_reason(self)
+                    except Exception as exc:
+                        raise OKXSubmitError(
+                            f"submitOrder quota gate blocked: {exc}"
+                        ) from exc
+                    if quota_block:
+                        raise OKXSubmitError(
+                            f"submitOrder quota gate blocked: {quota_block}"
+                        )
+
+                try:
                     wallet, requirements = balance_gate
                     for token_address, required_raw in requirements.items():
                         balance_raw = _read_erc20_balance_raw(
@@ -278,12 +336,12 @@ def install_submit_safety(client_class: type[Any]) -> None:
                                 f"token={token_address} required={required_raw} "
                                 f"available={balance_raw}"
                             )
-            except OKXSubmitError:
-                raise
-            except Exception as exc:
-                raise OKXSubmitError(
-                    f"submitOrder balance gate blocked: {exc}"
-                ) from exc
+                except OKXSubmitError:
+                    raise
+                except Exception as exc:
+                    raise OKXSubmitError(
+                        f"submitOrder balance gate blocked: {exc}"
+                    ) from exc
 
         return original_request(
             self,
@@ -295,6 +353,7 @@ def install_submit_safety(client_class: type[Any]) -> None:
 
     guarded_request._r16_submit_guard = True
     guarded_request._r20_balance_guard = True
+    guarded_request._r21_quota_guard = True
     guarded_complete_two_step_offer._r16_submit_context = True
 
     client_class._request = guarded_request
