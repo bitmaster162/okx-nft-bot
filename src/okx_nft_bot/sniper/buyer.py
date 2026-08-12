@@ -675,9 +675,9 @@ class OKXInstantBuyer:
             if buy_data.get("approval_needed"):
                 return {"success": False, "error": "ERC20 approval needed — not yet automated for buy"}
 
-            # Re-check immediately before nonce allocation.  This closes the
-            # window where live arm can expire or a killswitch/rate limit can
-            # become active while OKX calldata is being fetched.
+            # Re-check after fetching OKX calldata. This closes the window where
+            # live arm can expire or a killswitch/rate limit can become active
+            # during the marketplace API request.
             governor = self._get_governor()
             final_blocked = governor.check_live_submit_allowed(
                 action_type="LIVE_BUY",
@@ -689,11 +689,10 @@ class OKXInstantBuyer:
             if final_blocked:
                 return {"success": False, "error": f"LIVE_GATE_BLOCKED:{final_blocked}"}
 
-            # Step 2: Build on-chain transaction
+            # Step 2: Build on-chain transaction and complete all network-side
+            # gas checks before reserving a local nonce.
             chain_cfg = CHAIN_CONFIG[chain]
             value_wei = int(value_str) if value_str.isdigit() else int(float(value_str) * 10**18)
-
-            nonce = governor.allocate_nonce(self.buyer_address, chain)
 
             gas_price = w3.eth.gas_price
             max_gas_wei = int(self.max_gas_gwei * 10**9)
@@ -705,7 +704,6 @@ class OKXInstantBuyer:
                 "to": Web3.to_checksum_address(contract_addr),
                 "data": input_data,
                 "value": value_wei,
-                "nonce": nonce,
                 "chainId": chain_cfg["chain_id"],
             }
 
@@ -724,6 +722,23 @@ class OKXInstantBuyer:
             except Exception as gas_exc:
                 log.warning("Gas estimate failed: %s — using 350k", gas_exc)
                 tx["gas"] = 350_000
+
+            # Final fail-closed check after all network/gas work and immediately
+            # before nonce reservation. From this point to broadcast there are no
+            # external waits, which minimizes disarm/killswitch TOCTOU and avoids
+            # consuming a local nonce when the final gate blocks.
+            broadcast_blocked = governor.check_live_submit_allowed(
+                action_type="LIVE_BUY",
+                collection=resolved_collection,
+                chain=chain,
+                price_bnb=float(price_bnb_equiv or 0.0),
+                price_usd=float(price_usd or 0.0),
+            )
+            if broadcast_blocked:
+                return {"success": False, "error": f"LIVE_GATE_BLOCKED:{broadcast_blocked}"}
+
+            nonce = governor.allocate_nonce(self.buyer_address, chain)
+            tx["nonce"] = nonce
 
             # Step 3: Sign and submit
             signed = Account.sign_transaction(tx, self.buyer_key)
