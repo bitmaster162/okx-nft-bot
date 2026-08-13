@@ -13,6 +13,7 @@ from okx_nft_bot.counterbid.submit_safety import install_submit_safety
 from okx_nft_bot.counterbid.receipt_safety import install_receipt_safety
 from okx_nft_bot.counterbid.inventory_safety import install_inventory_safety
 from okx_nft_bot.counterbid.receipt_reconciliation import install_receipt_reconciliation
+from okx_nft_bot.counterbid.cancel_listing_receipt_safety import install_cancel_listing_receipt_safety
 
 install_approval_safety(OKXAPIClient)
 install_submit_single_attempt_safety(OKXAPIClient)
@@ -21,6 +22,7 @@ install_submit_safety(OKXAPIClient)
 install_receipt_safety(OKXAPIClient)
 install_inventory_safety(OKXAPIClient)
 install_receipt_reconciliation(OKXAPIClient)
+install_cancel_listing_receipt_safety(OKXAPIClient)
 
 if TYPE_CHECKING:
     from okx_nft_bot.counterbid.engine import BatchResult, CounterBidTask, CounterBidder
