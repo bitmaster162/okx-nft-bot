@@ -4,6 +4,9 @@ from okx_nft_bot.undercutter.engine import UndercutAction, UndercutEngine
 from okx_nft_bot.undercutter.monitor import OfferMonitor
 from okx_nft_bot.undercutter.state import ActiveOffer, PositionState
 from okx_nft_bot.undercutter.strategy import AttackTarget, UndercutStrategy
+from okx_nft_bot.undercutter.defense_fanout_safety import install_defense_fanout_safety
+
+install_defense_fanout_safety(UndercutEngine)
 
 __all__ = [
     "ActiveOffer",
