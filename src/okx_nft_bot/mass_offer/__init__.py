@@ -94,6 +94,9 @@ from okx_nft_bot.mass_offer.scanner import (
     MassOfferSkip,
 )
 from okx_nft_bot.mass_offer.tracker import MassOfferCampaign, MassOfferRecord, MassOfferTracker
+from okx_nft_bot.mass_offer.campaign_status_safety import install_mass_offer_campaign_status_safety
+
+install_mass_offer_campaign_status_safety(MassOfferTracker)
 
 __all__ = [
     "AppliedMassOfferPolicy",
