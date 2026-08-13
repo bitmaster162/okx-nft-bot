@@ -10,6 +10,7 @@ from okx_nft_bot.sniper.opensea_receipt_reconciliation import install_opensea_re
 from okx_nft_bot.sniper.token_zero_scope_safety import install_token_zero_scope_safety
 from okx_nft_bot.sniper.sell_token_zero_safety import install_sell_token_zero_safety
 from okx_nft_bot.sniper.sell_cancel_confirmation_safety import install_sell_cancel_confirmation_safety
+from okx_nft_bot.sniper.batch_cancel_effect_safety import install_batch_cancel_effect_safety
 from okx_nft_bot.sniper.offer_blaster import OfferBlaster
 from okx_nft_bot.sniper.counter_bidder import CounterBidder
 from okx_nft_bot.counterbid.okx_api import OKXAPIClient
@@ -23,5 +24,6 @@ install_opensea_single_attempt_submit_safety(OpenSeaClient)
 install_token_zero_scope_safety(CounterBidder)
 install_sell_token_zero_safety(CounterBidder)
 install_sell_cancel_confirmation_safety(CounterBidder)
+install_batch_cancel_effect_safety(CounterBidder)
 install_opensea_mirror_safety(CounterBidder, OpenSeaClient)
 install_opensea_receipt_reconciliation(CounterBidder, OpenSeaClient)
