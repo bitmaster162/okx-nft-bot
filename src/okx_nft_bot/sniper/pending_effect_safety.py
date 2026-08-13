@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import wraps
+import threading
 from typing import Any
 
 
@@ -40,7 +41,8 @@ def install_pending_effect_safety(buyer_cls: type) -> None:
 
         lock = getattr(self, "_lock", None)
         if lock is None:
-            return {"success": False, "error": "PENDING_EFFECT_LOCK_UNAVAILABLE"}
+            lock = threading.Lock()
+            self._lock = lock
 
         with lock:
             pending_orders = getattr(self, "_pending_orders", None)
