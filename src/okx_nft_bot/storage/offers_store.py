@@ -82,9 +82,19 @@ class OffersStore:
                     raw_payload_hash, observed_at, payload_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(offer_id) DO UPDATE SET
-                    status=excluded.status,
+                    market=excluded.market,
+                    chain=excluded.chain,
+                    collection=excluded.collection,
+                    token_id=excluded.token_id,
+                    maker=excluded.maker,
                     price=excluded.price,
+                    currency=excluded.currency,
+                    quantity=excluded.quantity,
+                    status=excluded.status,
+                    created_at=excluded.created_at,
                     expires_at=excluded.expires_at,
+                    source_type=excluded.source_type,
+                    source_reliability=excluded.source_reliability,
                     raw_payload_hash=excluded.raw_payload_hash,
                     observed_at=excluded.observed_at,
                     payload_json=excluded.payload_json
