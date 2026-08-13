@@ -584,8 +584,12 @@ def _normalize_contract_address(value: Any) -> str | None:
 
 
 def _normalize_token_id(value: Any) -> str | None:
-    token = str(value or "").strip()
-    if not token or token in {"0", "col", "collection", "none"}:
+    if value is None or isinstance(value, bool):
+        return None
+    token = str(value).strip()
+    if not token:
+        return None
+    if token.lower() in {"col", "collection", "none"}:
         return None
     return token
 
