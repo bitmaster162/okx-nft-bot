@@ -252,6 +252,11 @@ class ExecutionGovernor:
             exchange_offers.append(normalized)
 
         exchange_by_hash = {offer.order_hash: offer for offer in exchange_offers}
+        # Absence is authoritative only when every exchange row had a usable
+        # identity. A malformed/unidentifiable row may be the local live order
+        # we cannot match, so keep local exposure active until a clean snapshot
+        # can prove that order is absent.
+        negative_inference_allowed = malformed_exchange_rows == 0
         local_active = self.state.get_active_offers(chain=resolved_chain)
         local_dry_run_ignored = sum(1 for offer in local_active if offer.order_hash.startswith("dryrun-"))
         local_live = [offer for offer in local_active if not offer.order_hash.startswith("dryrun-")]
@@ -262,7 +267,10 @@ class ExecutionGovernor:
         exchange_missing_order_hashes: list[str] = []
         for offer in local_live:
             if offer.order_hash not in exchange_by_hash:
-                if self.state.mark_offer_status(order_hash=offer.order_hash, status="exchange_missing"):
+                if negative_inference_allowed and self.state.mark_offer_status(
+                    order_hash=offer.order_hash,
+                    status="exchange_missing",
+                ):
                     local_marked_missing += 1
                     exchange_missing_order_hashes.append(offer.order_hash)
                 continue
@@ -303,7 +311,7 @@ class ExecutionGovernor:
         self.state.set_runtime_value("last_reconcile_at", completed_at)
         self.state.set_runtime_value(f"last_reconcile_at_{resolved_chain}", completed_at)
         # `last_reconcile_chain` is a legacy BSC-only runtime key whose integrity
-        # validator rejects `eth`.  Multi-chain reconciliation already has
+        # validator rejects `eth`. Multi-chain reconciliation already has
         # canonical per-chain timestamps above, so keep the incompatible legacy
         # key absent instead of writing a valid ETH reconciliation into quarantine.
         self.state.set_runtime_value("last_reconcile_chain", None)
@@ -376,7 +384,7 @@ class ExecutionGovernor:
         if price < 0:
             return None
         # OKX /get_my_offers returns price as a wei-denominated string
-        # (e.g. "111655499999999990" == 0.11166 native units).  Legacy
+        # (e.g. "111655499999999990" == 0.11166 native units). Legacy
         # callers of this helper passed already-decimal floats; apply a
         # threshold heuristic so both shapes are coerced to native units.
         # Any real-world NFT offer denominated in wei exceeds 1e10 (even
