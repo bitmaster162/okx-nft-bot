@@ -95,6 +95,27 @@ class SQLiteStore:
                 conn.execute(
                     "ALTER TABLE notification_attempts ADD COLUMN state TEXT NOT NULL DEFAULT 'active'"
                 )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_attempt_resolutions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    prior_state TEXT NOT NULL,
+                    prior_payload_json TEXT,
+                    resolution TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notification_attempt_resolutions_identity
+                ON notification_attempt_resolutions(channel, event_id, id)
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_event_time ON normalized_events(event_time)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_maker ON normalized_events(maker)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_taker ON normalized_events(taker)")
@@ -263,9 +284,82 @@ class SQLiteStore:
             columns = [col[0] for col in cursor.description]
             return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
 
-    def mark_notification_attempt_ambiguous(self, channel: str, event_id: str) -> bool:
+    def fetch_notification_resolutions(
+        self,
+        *,
+        channel: str | None = None,
+        event_id: str | None = None,
+        resolution: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if channel is not None:
+            clauses.append('channel = ?')
+            params.append(channel)
+        if event_id is not None:
+            clauses.append('event_id = ?')
+            params.append(event_id)
+        if resolution is not None:
+            clauses.append('resolution = ?')
+            params.append(resolution)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+        params.append(max(int(limit), 1))
         with self._connect() as conn:
             cursor = conn.execute(
+                f"""
+                SELECT id, channel, event_id, prior_state, prior_payload_json,
+                       resolution, actor, reason, resolved_at
+                FROM notification_attempt_resolutions
+                {where}
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                params,
+            )
+            columns = [col[0] for col in cursor.description]
+            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _notification_resolution_provenance(
+        actor: str | None,
+        reason: str | None,
+        *,
+        fallback_reason: str,
+    ) -> tuple[str, str]:
+        resolved_actor = str(actor or '').strip() or 'legacy-api'
+        resolved_reason = str(reason or '').strip() or fallback_reason
+        return resolved_actor, resolved_reason
+
+    def mark_notification_attempt_ambiguous(
+        self,
+        channel: str,
+        event_id: str,
+        *,
+        actor: str | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        resolved_actor, resolved_reason = self._notification_resolution_provenance(
+            actor,
+            reason,
+            fallback_reason='legacy API mark-ambiguous without explicit provenance',
+        )
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute(
+                """
+                SELECT payload_json, state
+                FROM notification_attempts
+                WHERE channel = ? AND event_id = ?
+                """,
+                (channel, event_id),
+            ).fetchone()
+            if row is None:
+                return False
+            payload_json, state = row
+            if state != 'active':
+                return False
+            updated = conn.execute(
                 """
                 UPDATE notification_attempts
                 SET state = 'ambiguous'
@@ -273,7 +367,25 @@ class SQLiteStore:
                 """,
                 (channel, event_id),
             )
-            return cursor.rowcount == 1
+            if updated.rowcount != 1:
+                return False
+            conn.execute(
+                """
+                INSERT INTO notification_attempt_resolutions(
+                    channel, event_id, prior_state, prior_payload_json,
+                    resolution, actor, reason, resolved_at
+                ) VALUES (?, ?, ?, ?, 'mark-ambiguous', ?, ?, datetime('now'))
+                """,
+                (
+                    channel,
+                    event_id,
+                    state,
+                    payload_json,
+                    resolved_actor,
+                    resolved_reason,
+                ),
+            )
+            return True
 
     def resolve_notification_attempt(
         self,
@@ -281,9 +393,16 @@ class SQLiteStore:
         event_id: str,
         *,
         resolution: str,
+        actor: str | None = None,
+        reason: str | None = None,
     ) -> bool:
         if resolution not in {'mark-sent', 'release-for-retry'}:
             raise ValueError(f'Unsupported notification attempt resolution: {resolution}')
+        resolved_actor, resolved_reason = self._notification_resolution_provenance(
+            actor,
+            reason,
+            fallback_reason=f'legacy API {resolution} without explicit provenance',
+        )
         with self._connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
             cursor = conn.execute(
@@ -312,15 +431,36 @@ class SQLiteStore:
                     'DELETE FROM notification_attempts WHERE channel = ? AND event_id = ?',
                     (channel, event_id),
                 )
-                return deleted.rowcount == 1
-            deleted = conn.execute(
+                if deleted.rowcount != 1:
+                    return False
+            else:
+                deleted = conn.execute(
+                    """
+                    DELETE FROM notification_attempts
+                    WHERE channel = ? AND event_id = ? AND state = 'ambiguous'
+                    """,
+                    (channel, event_id),
+                )
+                if deleted.rowcount != 1:
+                    return False
+            conn.execute(
                 """
-                DELETE FROM notification_attempts
-                WHERE channel = ? AND event_id = ? AND state = 'ambiguous'
+                INSERT INTO notification_attempt_resolutions(
+                    channel, event_id, prior_state, prior_payload_json,
+                    resolution, actor, reason, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 """,
-                (channel, event_id),
+                (
+                    channel,
+                    event_id,
+                    state,
+                    payload_json,
+                    resolution,
+                    resolved_actor,
+                    resolved_reason,
+                ),
             )
-            return deleted.rowcount == 1
+            return True
 
     def mark_notified(self, channel: str, event_id: str, payload: dict[str, object] | None = None) -> None:
         with self._connect() as conn:
