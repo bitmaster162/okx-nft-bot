@@ -190,7 +190,6 @@ class Monitor:
             try:
                 result = self.notifier.send(alert)
             except Exception:
-                self._clear_delivery_attempt(channel, event.event_id)
                 raise
             if result.delivered:
                 self.store.mark_notified(channel, event.event_id, payload=payload)
@@ -223,7 +222,6 @@ class Monitor:
                 try:
                     result = notifier.send(alert)
                 except Exception:
-                    self._clear_delivery_attempt(channel, event.event_id)
                     raise
                 if result.delivered:
                     self.store.mark_notified(channel, event.event_id, payload=payload)
