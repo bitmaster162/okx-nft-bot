@@ -81,7 +81,7 @@ class DurablePendingEffectStore:
                 """
                 UPDATE instant_buy_pending_effects
                 SET state='pending', tx_hash=?, updated_at=CURRENT_TIMESTAMP
-                WHERE wallet=? AND chain=? AND order_id=?
+                WHERE wallet=? AND chain=? AND order_id=? AND state!='completed'
                 """,
                 (str(tx_hash or "").strip() or None, *identity),
             )
