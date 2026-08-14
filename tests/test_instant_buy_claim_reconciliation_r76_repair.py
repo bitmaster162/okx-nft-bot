@@ -59,6 +59,12 @@ def test_mark_completed_keeps_terminal_identity_blocked(tmp_path: Path) -> None:
 def test_release_for_retry_removes_claim_and_allows_new_reservation(tmp_path: Path) -> None:
     store = _store(tmp_path)
     assert store.reserve(wallet=WALLET, chain=CHAIN, order_id=ORDER_ID) is True
+    store.mark_pending(
+        wallet=WALLET,
+        chain=CHAIN,
+        order_id=ORDER_ID,
+        tx_hash="0xr76-release",
+    )
 
     assert store.resolve_claim(
         wallet=WALLET,

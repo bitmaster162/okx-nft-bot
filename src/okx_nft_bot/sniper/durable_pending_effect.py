@@ -158,7 +158,7 @@ class DurablePendingEffectStore:
                 cursor = conn.execute(
                     """
                     DELETE FROM instant_buy_pending_effects
-                    WHERE wallet=? AND chain=? AND order_id=? AND state!='completed'
+                    WHERE wallet=? AND chain=? AND order_id=? AND state='pending'
                     """,
                     identity,
                 )
