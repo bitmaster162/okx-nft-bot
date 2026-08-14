@@ -309,6 +309,7 @@ class DurablePendingEffectStore:
                     UPDATE instant_buy_pending_effects
                     SET state='completed', updated_at=CURRENT_TIMESTAMP
                     WHERE wallet=? AND chain=? AND order_id=?
+                      AND state IN ('reserved', 'pending')
                     """,
                     identity,
                 )
