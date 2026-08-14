@@ -10,6 +10,7 @@ from okx_nft_bot.config import Settings
 from okx_nft_bot.logging_utils import log_event
 from okx_nft_bot.models import DeliveryResult, FilterDecision, NFTEvent, RawEvent
 from okx_nft_bot.notifiers.base import AlertEnvelope, Notifier
+from okx_nft_bot.notifiers.fanout import FanoutNotifier
 from okx_nft_bot.pipeline.normalize import normalize_many
 from okx_nft_bot.providers.magiceden_marketplace import MagicEdenListingsProvider, MagicEdenTradesProvider
 from okx_nft_bot.providers.okx_marketplace import OKXMarketplaceListingsProvider, OKXMarketplaceTradesProvider
@@ -150,6 +151,9 @@ class Monitor:
         )
 
     def _deliver(self, events: list[NFTEvent], decisions: list[FilterDecision]) -> list[DeliveryResult]:
+        if isinstance(self.notifier, FanoutNotifier):
+            return self._deliver_fanout(events, decisions)
+
         decision_by_id = {decision.event_id: decision for decision in decisions}
         results: list[DeliveryResult] = []
         for event in events:
@@ -165,4 +169,40 @@ class Monitor:
             if result.delivered:
                 self.store.mark_notified(channel, event.event_id, payload=alert.event.model_dump(mode='json'))
             results.append(result)
+        return results
+
+    def _deliver_fanout(self, events: list[NFTEvent], decisions: list[FilterDecision]) -> list[DeliveryResult]:
+        decision_by_id = {decision.event_id: decision for decision in decisions}
+        results: list[DeliveryResult] = []
+        terminal_details = {'already_notified', 'disabled'}
+        for event in events:
+            decision = decision_by_id[event.event_id]
+            if self.settings.notification_mode == 'passed_only' and not decision.passed:
+                continue
+            alert = AlertEnvelope(event=event, decision=decision)
+            all_terminal = True
+            details: list[str] = []
+            for notifier in self.notifier.notifiers:
+                channel = notifier.channel
+                if self.store.was_notified(channel, event.event_id):
+                    details.append(f'{channel}:already_notified')
+                    continue
+                result = notifier.send(alert)
+                if result.delivered:
+                    self.store.mark_notified(channel, event.event_id, payload=alert.event.model_dump(mode='json'))
+                    details.append(f'{channel}:ok')
+                    continue
+                if result.detail in terminal_details:
+                    details.append(f'{channel}:{result.detail}')
+                    continue
+                all_terminal = False
+                details.append(f'{channel}:fail')
+            results.append(
+                DeliveryResult(
+                    channel=self.notifier.channel,
+                    event_id=event.event_id,
+                    delivered=all_terminal,
+                    detail=', '.join(details) if all_terminal else 'fanout_incomplete: ' + ', '.join(details),
+                )
+            )
         return results
