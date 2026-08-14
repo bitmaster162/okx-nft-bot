@@ -73,9 +73,18 @@ def _normalize_okx(raw: dict[str, Any], *, chain: str) -> NormalizedOffer:
     )
 
 
+def _opensea_offer_id(raw: dict[str, Any]) -> str:
+    order_hash = raw.get("order_hash") or raw.get("orderHash")
+    if order_hash:
+        return str(order_hash)
+    serialized = json.dumps(raw, sort_keys=True, ensure_ascii=False, default=str)
+    digest = hashlib.sha256(serialized.encode()).hexdigest()
+    return f"opensea:sha256:{digest}"
+
+
 def _normalize_opensea(raw: dict[str, Any], *, chain: str) -> NormalizedOffer:
     # OpenSea v2 offer shape: order_hash, maker (dict or str), current_price, protocol_data, etc.
-    order_hash = str(raw.get("order_hash") or raw.get("orderHash") or "unknown")
+    order_hash = _opensea_offer_id(raw)
     protocol_data = raw.get("protocol_data") or {}
     parameters = protocol_data.get("parameters") or {}
     consideration = parameters.get("consideration") or []
