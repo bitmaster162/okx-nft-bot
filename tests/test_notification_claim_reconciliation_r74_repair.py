@@ -105,6 +105,10 @@ def test_cli_exposes_explicit_notification_attempt_resolution_command() -> None:
             EVENT_ID,
             "--resolution",
             "release-for-retry",
+            "--actor",
+            "ops-r74",
+            "--reason",
+            "operator verified retry is safe",
             "--yes",
         ]
     )
@@ -113,4 +117,6 @@ def test_cli_exposes_explicit_notification_attempt_resolution_command() -> None:
     assert args.channel == CHANNEL
     assert args.event_id == EVENT_ID
     assert args.resolution == "release-for-retry"
+    assert args.actor == "ops-r74"
+    assert args.reason == "operator verified retry is safe"
     assert args.yes is True

@@ -39,20 +39,50 @@ def cmd_notification_attempts(
     return 0
 
 
+def cmd_notification_resolutions(
+    *,
+    channel: str | None,
+    event_id: str | None,
+    resolution: str | None,
+    limit: int,
+) -> int:
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    rows = store.fetch_notification_resolutions(
+        channel=channel,
+        event_id=event_id,
+        resolution=resolution,
+        limit=limit,
+    )
+    print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
 def cmd_mark_notification_attempt_ambiguous(
     *,
     channel: str,
     event_id: str,
     sender_stopped: bool,
     force: bool,
+    actor: str | None = None,
+    reason: str | None = None,
 ) -> int:
     if not force:
         raise SystemExit('mark-notification-attempt-ambiguous requires --yes')
     if not sender_stopped:
         raise SystemExit('mark-notification-attempt-ambiguous requires --sender-stopped')
+    resolved_actor = str(actor or '').strip()
+    resolved_reason = str(reason or '').strip()
+    if not resolved_actor or not resolved_reason:
+        raise SystemExit('mark-notification-attempt-ambiguous requires --actor and --reason')
     settings = load_settings()
     store = SQLiteStore(settings.db_path)
-    marked = store.mark_notification_attempt_ambiguous(channel, event_id)
+    marked = store.mark_notification_attempt_ambiguous(
+        channel,
+        event_id,
+        actor=resolved_actor,
+        reason=resolved_reason,
+    )
     if not marked:
         raise SystemExit(
             f'No active notification attempt: channel={channel} event_id={event_id}'
@@ -64,6 +94,8 @@ def cmd_mark_notification_attempt_ambiguous(
                 'channel': channel,
                 'event_id': event_id,
                 'sender_stopped': True,
+                'actor': resolved_actor,
+                'reason': resolved_reason,
             },
             ensure_ascii=False,
             indent=2,
@@ -78,15 +110,23 @@ def cmd_resolve_notification_attempt(
     event_id: str,
     resolution: str,
     force: bool,
+    actor: str | None = None,
+    reason: str | None = None,
 ) -> int:
     if not force:
         raise SystemExit('resolve-notification-attempt requires --yes')
+    resolved_actor = str(actor or '').strip()
+    resolved_reason = str(reason or '').strip()
+    if not resolved_actor or not resolved_reason:
+        raise SystemExit('resolve-notification-attempt requires --actor and --reason')
     settings = load_settings()
     store = SQLiteStore(settings.db_path)
     resolved = store.resolve_notification_attempt(
         channel,
         event_id,
         resolution=resolution,
+        actor=resolved_actor,
+        reason=resolved_reason,
     )
     if not resolved:
         raise SystemExit(
@@ -99,6 +139,8 @@ def cmd_resolve_notification_attempt(
                 'channel': channel,
                 'event_id': event_id,
                 'resolution': resolution,
+                'actor': resolved_actor,
+                'reason': resolved_reason,
             },
             ensure_ascii=False,
             indent=2,
@@ -207,6 +249,19 @@ def build_parser() -> argparse.ArgumentParser:
     attempts.add_argument('--event-id', default=None)
     attempts.add_argument('--limit', type=int, default=100)
 
+    notification_resolutions = subparsers.add_parser(
+        'notification-resolutions',
+        help='List durable notification reconciliation history',
+    )
+    notification_resolutions.add_argument('--channel', default=None)
+    notification_resolutions.add_argument('--event-id', default=None)
+    notification_resolutions.add_argument(
+        '--resolution',
+        choices=['mark-ambiguous', 'mark-sent', 'release-for-retry'],
+        default=None,
+    )
+    notification_resolutions.add_argument('--limit', type=int, default=100)
+
     mark_ambiguous = subparsers.add_parser(
         'mark-notification-attempt-ambiguous',
         help='Mark an active notification attempt ambiguous after sender shutdown is confirmed',
@@ -214,6 +269,8 @@ def build_parser() -> argparse.ArgumentParser:
     mark_ambiguous.add_argument('--channel', required=True)
     mark_ambiguous.add_argument('--event-id', required=True)
     mark_ambiguous.add_argument('--sender-stopped', action='store_true', required=True)
+    mark_ambiguous.add_argument('--actor', required=True)
+    mark_ambiguous.add_argument('--reason', required=True)
     mark_ambiguous.add_argument('--yes', action='store_true')
 
     resolve = subparsers.add_parser(
@@ -227,6 +284,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=['mark-sent', 'release-for-retry'],
         required=True,
     )
+    resolve.add_argument('--actor', required=True)
+    resolve.add_argument('--reason', required=True)
     resolve.add_argument('--yes', action='store_true')
 
     claims = subparsers.add_parser(
@@ -280,12 +339,21 @@ def main() -> int:
             event_id=args.event_id,
             limit=args.limit,
         )
+    if args.command == 'notification-resolutions':
+        return cmd_notification_resolutions(
+            channel=args.channel,
+            event_id=args.event_id,
+            resolution=args.resolution,
+            limit=args.limit,
+        )
     if args.command == 'mark-notification-attempt-ambiguous':
         return cmd_mark_notification_attempt_ambiguous(
             channel=args.channel,
             event_id=args.event_id,
             sender_stopped=args.sender_stopped,
             force=args.yes,
+            actor=args.actor,
+            reason=args.reason,
         )
     if args.command == 'resolve-notification-attempt':
         return cmd_resolve_notification_attempt(
@@ -293,6 +361,8 @@ def main() -> int:
             event_id=args.event_id,
             resolution=args.resolution,
             force=args.yes,
+            actor=args.actor,
+            reason=args.reason,
         )
     if args.command == 'instant-buy-claims':
         return cmd_instant_buy_claims(

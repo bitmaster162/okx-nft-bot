@@ -98,6 +98,10 @@ def test_cli_requires_sender_stopped_attestation_for_ambiguous_transition() -> N
             CHANNEL,
             "--event-id",
             EVENT_ID,
+            "--actor",
+            "ops-r81",
+            "--reason",
+            "sender process confirmed stopped",
             "--yes",
         ])
 
@@ -108,10 +112,16 @@ def test_cli_requires_sender_stopped_attestation_for_ambiguous_transition() -> N
         "--event-id",
         EVENT_ID,
         "--sender-stopped",
+        "--actor",
+        "ops-r81",
+        "--reason",
+        "sender process confirmed stopped",
         "--yes",
     ])
     assert args.command == "mark-notification-attempt-ambiguous"
     assert args.sender_stopped is True
+    assert args.actor == "ops-r81"
+    assert args.reason == "sender process confirmed stopped"
     assert args.yes is True
 
 
