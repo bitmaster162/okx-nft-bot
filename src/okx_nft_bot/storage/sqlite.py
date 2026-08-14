@@ -222,6 +222,68 @@ class SQLiteStore:
                 (channel, event_id),
             )
 
+    def fetch_notification_attempts(
+        self,
+        *,
+        channel: str | None = None,
+        event_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if channel is not None:
+            clauses.append('channel = ?')
+            params.append(channel)
+        if event_id is not None:
+            clauses.append('event_id = ?')
+            params.append(event_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+        params.append(max(int(limit), 1))
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT channel, event_id, started_at, payload_json
+                FROM notification_attempts
+                {where}
+                ORDER BY started_at ASC, channel ASC, event_id ASC
+                LIMIT ?
+                """,
+                params,
+            )
+            columns = [col[0] for col in cursor.description]
+            return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+    def resolve_notification_attempt(
+        self,
+        channel: str,
+        event_id: str,
+        *,
+        resolution: str,
+    ) -> bool:
+        if resolution not in {'mark-sent', 'release-for-retry'}:
+            raise ValueError(f'Unsupported notification attempt resolution: {resolution}')
+        with self._connect() as conn:
+            cursor = conn.execute(
+                'SELECT payload_json FROM notification_attempts WHERE channel = ? AND event_id = ?',
+                (channel, event_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            if resolution == 'mark-sent':
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO sent_notifications(channel, event_id, sent_at, payload_json)
+                    VALUES (?, ?, datetime('now'), ?)
+                    """,
+                    (channel, event_id, row[0]),
+                )
+            conn.execute(
+                'DELETE FROM notification_attempts WHERE channel = ? AND event_id = ?',
+                (channel, event_id),
+            )
+            return True
+
     def mark_notified(self, channel: str, event_id: str, payload: dict[str, object] | None = None) -> None:
         with self._connect() as conn:
             conn.execute(
