@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from okx_nft_bot import cli_entry
@@ -50,6 +52,40 @@ def test_operator_must_mark_attempt_ambiguous_before_release_for_retry(tmp_path)
     ) is True
     assert store.fetch_notification_attempts(channel=CHANNEL, event_id=EVENT_ID, limit=10) == []
     assert store.was_notified(CHANNEL, EVENT_ID) is False
+
+
+def test_legacy_notification_attempt_table_migrates_fail_closed(tmp_path) -> None:
+    db_path = tmp_path / "legacy-r81.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE notification_attempts (
+                channel TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                payload_json TEXT,
+                PRIMARY KEY(channel, event_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO notification_attempts(channel, event_id, started_at, payload_json)
+            VALUES (?, ?, datetime('now'), ?)
+            """,
+            (CHANNEL, EVENT_ID, '{}'),
+        )
+
+    store = SQLiteStore(db_path)
+    rows = store.fetch_notification_attempts(channel=CHANNEL, event_id=EVENT_ID, limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["state"] == "active"
+    assert store.resolve_notification_attempt(
+        CHANNEL,
+        EVENT_ID,
+        resolution="release-for-retry",
+    ) is False
 
 
 def test_cli_requires_sender_stopped_attestation_for_ambiguous_transition() -> None:
