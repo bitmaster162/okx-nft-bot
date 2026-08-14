@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from okx_nft_bot.cli import build_parser
+from okx_nft_bot.cli_entry import build_parser
 from okx_nft_bot.storage.sqlite import SQLiteStore
 
 
