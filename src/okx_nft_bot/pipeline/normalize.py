@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from okx_nft_bot.models import NFTEvent, RawEvent
 
 
 def _parse_dt(value: str | None) -> datetime:
     if not value:
-        return datetime.now(timezone.utc)
+        raise ValueError("event_time is required")
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
