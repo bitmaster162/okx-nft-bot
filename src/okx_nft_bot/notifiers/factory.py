@@ -10,9 +10,12 @@ from okx_nft_bot.notifiers.webhook import WebhookNotifier
 
 
 def build_notifier(settings: Settings) -> Notifier:
+    # Effectful notification POSTs are deliberately single-attempt. Unknown
+    # outcomes are retained by the durable reconciliation flow instead of
+    # being retried inside the HTTP transport.
     transport = StdlibHttpTransport(
         timeout=settings.okx_request_timeout,
-        max_retries=settings.okx_max_retries,
+        max_retries=1,
         rate_limit_per_sec=settings.okx_rate_limit_per_sec,
     )
     notifiers: list[Notifier] = []
