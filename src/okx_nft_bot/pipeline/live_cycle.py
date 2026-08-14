@@ -122,18 +122,29 @@ class Monitor:
         new_events = self.store.filter_new_events(normalized)
         if new_events:
             self.store.upsert_normalized_events(new_events)
-        state.set(self.store, cursor)
 
         rule_packs = load_rule_packs(self.settings.rules_path)
-        decisions = [evaluate_event(event, self.settings, rule_packs=rule_packs) for event in new_events]
-        deliveries = self._deliver(new_events, decisions)
+        delivery_decisions = [evaluate_event(event, self.settings, rule_packs=rule_packs) for event in normalized]
+        new_event_ids = {event.event_id for event in new_events}
+        decisions = [decision for decision in delivery_decisions if decision.event_id in new_event_ids]
+        deliveries = self._deliver(normalized, delivery_decisions)
+
+        delivery_blocked = any(
+            not result.delivered and result.detail not in {'already_notified', 'disabled'}
+            for result in deliveries
+        )
+        end_cursor = start_cursor
+        if not delivery_blocked:
+            state.set(self.store, cursor)
+            end_cursor = cursor
+
         return LiveCycleResult(
             raw_events=raw_events,
             new_events=new_events,
             decisions=decisions,
             deliveries=deliveries,
             start_cursor=start_cursor,
-            end_cursor=cursor,
+            end_cursor=end_cursor,
             pages_fetched=pages_fetched,
             source_mode=source_mode,
         )
