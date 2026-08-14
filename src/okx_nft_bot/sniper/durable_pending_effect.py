@@ -42,6 +42,28 @@ class DurablePendingEffectStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS instant_buy_claim_resolutions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wallet TEXT NOT NULL,
+                    chain TEXT NOT NULL,
+                    order_id TEXT NOT NULL,
+                    prior_state TEXT NOT NULL,
+                    prior_tx_hash TEXT,
+                    resolution TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_instant_buy_claim_resolutions_identity
+                ON instant_buy_claim_resolutions(wallet, chain, order_id, id)
+                """
+            )
 
     @staticmethod
     def _identity(wallet: str, chain: str, order_id: str) -> tuple[str, str, str]:
@@ -138,6 +160,48 @@ class DurablePendingEffectStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def fetch_resolutions(
+        self,
+        *,
+        wallet: str | None = None,
+        chain: str | None = None,
+        order_id: str | None = None,
+        resolution: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if wallet is not None:
+            clauses.append("wallet=?")
+            params.append(str(wallet).strip().lower())
+        if chain is not None:
+            resolved_chain = str(chain).strip().lower()
+            if resolved_chain == "ethereum":
+                resolved_chain = "eth"
+            clauses.append("chain=?")
+            params.append(resolved_chain)
+        if order_id is not None:
+            clauses.append("order_id=?")
+            params.append(str(order_id).strip())
+        if resolution is not None:
+            clauses.append("resolution=?")
+            params.append(str(resolution).strip().lower())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        bounded_limit = max(1, min(int(limit), 1000))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, wallet, chain, order_id, prior_state, prior_tx_hash,
+                       resolution, actor, reason, resolved_at
+                FROM instant_buy_claim_resolutions
+                {where}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (*params, bounded_limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def resolve_claim(
         self,
         *,
@@ -145,6 +209,8 @@ class DurablePendingEffectStore:
         chain: str,
         order_id: str,
         resolution: str,
+        actor: str | None = None,
+        reason: str | None = None,
     ) -> bool:
         identity = self._identity(wallet, chain, order_id)
         resolved_resolution = str(resolution or "").strip().lower()
@@ -152,9 +218,27 @@ class DurablePendingEffectStore:
             raise ValueError(
                 "resolution must be 'mark-completed' or 'release-for-retry'"
             )
+        resolved_actor = str(actor or "").strip() or "legacy-api"
+        resolved_reason = str(reason or "").strip() or "legacy API reconciliation"
 
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT state, tx_hash
+                FROM instant_buy_pending_effects
+                WHERE wallet=? AND chain=? AND order_id=?
+                """,
+                identity,
+            ).fetchone()
+            if row is None:
+                return False
+
+            prior_state = str(row["state"])
+            prior_tx_hash = row["tx_hash"]
             if resolved_resolution == "release-for-retry":
+                if prior_state != "pending":
+                    return False
                 cursor = conn.execute(
                     """
                     DELETE FROM instant_buy_pending_effects
@@ -162,14 +246,33 @@ class DurablePendingEffectStore:
                     """,
                     identity,
                 )
-                return cursor.rowcount == 1
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE instant_buy_pending_effects
+                    SET state='completed', updated_at=CURRENT_TIMESTAMP
+                    WHERE wallet=? AND chain=? AND order_id=?
+                    """,
+                    identity,
+                )
 
-            cursor = conn.execute(
+            if cursor.rowcount != 1:
+                return False
+
+            conn.execute(
                 """
-                UPDATE instant_buy_pending_effects
-                SET state='completed', updated_at=CURRENT_TIMESTAMP
-                WHERE wallet=? AND chain=? AND order_id=?
+                INSERT INTO instant_buy_claim_resolutions (
+                    wallet, chain, order_id, prior_state, prior_tx_hash,
+                    resolution, actor, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                identity,
+                (
+                    *identity,
+                    prior_state,
+                    prior_tx_hash,
+                    resolved_resolution,
+                    resolved_actor,
+                    resolved_reason,
+                ),
             )
-            return cursor.rowcount == 1
+            return True

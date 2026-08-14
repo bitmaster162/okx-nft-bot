@@ -94,6 +94,26 @@ def cmd_instant_buy_claims(
     return 0
 
 
+def cmd_instant_buy_resolutions(
+    *,
+    wallet: str | None,
+    chain: str | None,
+    order_id: str | None,
+    resolution: str | None,
+    limit: int,
+) -> int:
+    store = DurablePendingEffectStore(_execution_db_path())
+    rows = store.fetch_resolutions(
+        wallet=wallet,
+        chain=chain,
+        order_id=order_id,
+        resolution=resolution,
+        limit=limit,
+    )
+    print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
 def cmd_resolve_instant_buy_claim(
     *,
     wallet: str,
@@ -101,19 +121,27 @@ def cmd_resolve_instant_buy_claim(
     order_id: str,
     resolution: str,
     force: bool,
+    actor: str | None = None,
+    reason: str | None = None,
 ) -> int:
     if not force:
         raise SystemExit('resolve-instant-buy-claim requires --yes')
+    resolved_actor = str(actor or '').strip()
+    resolved_reason = str(reason or '').strip()
+    if not resolved_actor or not resolved_reason:
+        raise SystemExit('resolve-instant-buy-claim requires --actor and --reason')
     store = DurablePendingEffectStore(_execution_db_path())
     resolved = store.resolve_claim(
         wallet=wallet,
         chain=chain,
         order_id=order_id,
         resolution=resolution,
+        actor=resolved_actor,
+        reason=resolved_reason,
     )
     if not resolved:
         raise SystemExit(
-            'No matching instant-buy claim: '
+            'No matching instant-buy claim eligible for this resolution: '
             f'wallet={wallet} chain={chain} order_id={order_id}'
         )
     print(
@@ -124,6 +152,8 @@ def cmd_resolve_instant_buy_claim(
                 'chain': chain,
                 'order_id': order_id,
                 'resolution': resolution,
+                'actor': resolved_actor,
+                'reason': resolved_reason,
             },
             ensure_ascii=False,
             indent=2,
@@ -167,6 +197,20 @@ def build_parser() -> argparse.ArgumentParser:
     claims.add_argument('--state', choices=['reserved', 'pending', 'completed'], default=None)
     claims.add_argument('--limit', type=int, default=100)
 
+    resolutions = subparsers.add_parser(
+        'instant-buy-resolutions',
+        help='List durable instant-buy reconciliation history',
+    )
+    resolutions.add_argument('--wallet', default=None)
+    resolutions.add_argument('--chain', default=None)
+    resolutions.add_argument('--order-id', default=None)
+    resolutions.add_argument(
+        '--resolution',
+        choices=['mark-completed', 'release-for-retry'],
+        default=None,
+    )
+    resolutions.add_argument('--limit', type=int, default=100)
+
     resolve_claim = subparsers.add_parser(
         'resolve-instant-buy-claim',
         help='Explicitly reconcile one durable instant-buy effect claim',
@@ -179,6 +223,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=['mark-completed', 'release-for-retry'],
         required=True,
     )
+    resolve_claim.add_argument('--actor', required=True)
+    resolve_claim.add_argument('--reason', required=True)
     resolve_claim.add_argument('--yes', action='store_true')
     return parser
 
@@ -207,6 +253,14 @@ def main() -> int:
             state=args.state,
             limit=args.limit,
         )
+    if args.command == 'instant-buy-resolutions':
+        return cmd_instant_buy_resolutions(
+            wallet=args.wallet,
+            chain=args.chain,
+            order_id=args.order_id,
+            resolution=args.resolution,
+            limit=args.limit,
+        )
     if args.command == 'resolve-instant-buy-claim':
         return cmd_resolve_instant_buy_claim(
             wallet=args.wallet,
@@ -214,6 +268,8 @@ def main() -> int:
             order_id=args.order_id,
             resolution=args.resolution,
             force=args.yes,
+            actor=args.actor,
+            reason=args.reason,
         )
     return legacy_cli.main()
 

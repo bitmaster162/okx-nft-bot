@@ -100,6 +100,10 @@ def test_cli_exposes_read_and_explicit_resolution_commands() -> None:
         ORDER_ID,
         "--resolution",
         "mark-completed",
+        "--actor",
+        "r76-test",
+        "--reason",
+        "r76 explicit reconciliation test",
         "--yes",
     ])
     assert resolve_args.command == "resolve-instant-buy-claim"
