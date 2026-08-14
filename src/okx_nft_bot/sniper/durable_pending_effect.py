@@ -12,6 +12,7 @@ class DurablePendingEffectStore:
     SQLite database. They are intentionally conservative: a surviving claim
     means the prior process may have crossed the external effect boundary, so a
     later process must not submit the same order again without reconciliation.
+    Completed claims are terminal tombstones and cannot be released for retry.
     """
 
     def __init__(self, db_path: Path | str) -> None:
@@ -91,7 +92,7 @@ class DurablePendingEffectStore:
             conn.execute(
                 """
                 DELETE FROM instant_buy_pending_effects
-                WHERE wallet=? AND chain=? AND order_id=?
+                WHERE wallet=? AND chain=? AND order_id=? AND state!='completed'
                 """,
                 identity,
             )
@@ -157,7 +158,7 @@ class DurablePendingEffectStore:
                 cursor = conn.execute(
                     """
                     DELETE FROM instant_buy_pending_effects
-                    WHERE wallet=? AND chain=? AND order_id=?
+                    WHERE wallet=? AND chain=? AND order_id=? AND state!='completed'
                     """,
                     identity,
                 )
