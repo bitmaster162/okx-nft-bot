@@ -23,7 +23,7 @@ dev = [
 ]
 
 [project.scripts]
-okx-nft-bot = "okx_nft_bot.cli:main"
+okx-nft-bot = "okx_nft_bot.cli_entry:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
