@@ -150,6 +150,17 @@ class Monitor:
             source_mode=source_mode,
         )
 
+    def _begin_delivery_attempt(self, channel: str, event_id: str, payload: dict[str, object]) -> bool:
+        begin_attempt = getattr(self.store, 'begin_notification_attempt', None)
+        if begin_attempt is None:
+            return True
+        return bool(begin_attempt(channel, event_id, payload=payload))
+
+    def _clear_delivery_attempt(self, channel: str, event_id: str) -> None:
+        clear_attempt = getattr(self.store, 'clear_notification_attempt', None)
+        if clear_attempt is not None:
+            clear_attempt(channel, event_id)
+
     def _deliver(self, events: list[NFTEvent], decisions: list[FilterDecision]) -> list[DeliveryResult]:
         if isinstance(self.notifier, FanoutNotifier):
             return self._deliver_fanout(events, decisions)
@@ -165,9 +176,26 @@ class Monitor:
                 results.append(DeliveryResult(channel=channel, event_id=event.event_id, delivered=False, detail='already_notified'))
                 continue
             alert = AlertEnvelope(event=event, decision=decision)
-            result = self.notifier.send(alert)
+            payload = alert.event.model_dump(mode='json')
+            if not self._begin_delivery_attempt(channel, event.event_id, payload):
+                results.append(
+                    DeliveryResult(
+                        channel=channel,
+                        event_id=event.event_id,
+                        delivered=False,
+                        detail='delivery_outcome_unknown',
+                    )
+                )
+                continue
+            try:
+                result = self.notifier.send(alert)
+            except Exception:
+                self._clear_delivery_attempt(channel, event.event_id)
+                raise
             if result.delivered:
-                self.store.mark_notified(channel, event.event_id, payload=alert.event.model_dump(mode='json'))
+                self.store.mark_notified(channel, event.event_id, payload=payload)
+            else:
+                self._clear_delivery_attempt(channel, event.event_id)
             results.append(result)
         return results
 
@@ -180,6 +208,7 @@ class Monitor:
             if self.settings.notification_mode == 'passed_only' and not decision.passed:
                 continue
             alert = AlertEnvelope(event=event, decision=decision)
+            payload = alert.event.model_dump(mode='json')
             all_terminal = True
             details: list[str] = []
             for notifier in self.notifier.notifiers:
@@ -187,11 +216,20 @@ class Monitor:
                 if self.store.was_notified(channel, event.event_id):
                     details.append(f'{channel}:already_notified')
                     continue
-                result = notifier.send(alert)
+                if not self._begin_delivery_attempt(channel, event.event_id, payload):
+                    all_terminal = False
+                    details.append(f'{channel}:delivery_outcome_unknown')
+                    continue
+                try:
+                    result = notifier.send(alert)
+                except Exception:
+                    self._clear_delivery_attempt(channel, event.event_id)
+                    raise
                 if result.delivered:
-                    self.store.mark_notified(channel, event.event_id, payload=alert.event.model_dump(mode='json'))
+                    self.store.mark_notified(channel, event.event_id, payload=payload)
                     details.append(f'{channel}:ok')
                     continue
+                self._clear_delivery_attempt(channel, event.event_id)
                 if result.detail in terminal_details:
                     details.append(f'{channel}:{result.detail}')
                     continue
