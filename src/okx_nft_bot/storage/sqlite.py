@@ -76,6 +76,17 @@ class SQLiteStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_attempts (
+                    channel TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    payload_json TEXT,
+                    PRIMARY KEY(channel, event_id)
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_event_time ON normalized_events(event_time)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_maker ON normalized_events(maker)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_taker ON normalized_events(taker)")
@@ -188,6 +199,29 @@ class SQLiteStore:
             )
             return cursor.fetchone() is not None
 
+    def begin_notification_attempt(
+        self,
+        channel: str,
+        event_id: str,
+        payload: dict[str, object] | None = None,
+    ) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO notification_attempts(channel, event_id, started_at, payload_json)
+                VALUES (?, ?, datetime('now'), ?)
+                """,
+                (channel, event_id, json.dumps(payload, ensure_ascii=False) if payload is not None else None),
+            )
+            return cursor.rowcount == 1
+
+    def clear_notification_attempt(self, channel: str, event_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                'DELETE FROM notification_attempts WHERE channel = ? AND event_id = ?',
+                (channel, event_id),
+            )
+
     def mark_notified(self, channel: str, event_id: str, payload: dict[str, object] | None = None) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -196,6 +230,10 @@ class SQLiteStore:
                 VALUES (?, ?, datetime('now'), ?)
                 """,
                 (channel, event_id, json.dumps(payload, ensure_ascii=False) if payload is not None else None),
+            )
+            conn.execute(
+                'DELETE FROM notification_attempts WHERE channel = ? AND event_id = ?',
+                (channel, event_id),
             )
 
     def fetch_latest_events(self, limit: int = 20) -> list[dict[str, object]]:
