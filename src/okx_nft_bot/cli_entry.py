@@ -189,6 +189,55 @@ def cmd_instant_buy_resolutions(
     return 0
 
 
+def cmd_mark_instant_buy_claim_pending(
+    *,
+    wallet: str,
+    chain: str,
+    order_id: str,
+    worker_stopped: bool,
+    force: bool,
+    actor: str | None = None,
+    reason: str | None = None,
+) -> int:
+    if not force:
+        raise SystemExit('mark-instant-buy-claim-pending requires --yes')
+    if not worker_stopped:
+        raise SystemExit('mark-instant-buy-claim-pending requires --worker-stopped')
+    resolved_actor = str(actor or '').strip()
+    resolved_reason = str(reason or '').strip()
+    if not resolved_actor or not resolved_reason:
+        raise SystemExit('mark-instant-buy-claim-pending requires --actor and --reason')
+    store = DurablePendingEffectStore(_execution_db_path())
+    marked = store.mark_reserved_pending(
+        wallet=wallet,
+        chain=chain,
+        order_id=order_id,
+        actor=resolved_actor,
+        reason=resolved_reason,
+    )
+    if not marked:
+        raise SystemExit(
+            'No matching reserved instant-buy claim eligible for pending transition: '
+            f'wallet={wallet} chain={chain} order_id={order_id}'
+        )
+    print(
+        json.dumps(
+            {
+                'marked_pending': True,
+                'wallet': wallet,
+                'chain': chain,
+                'order_id': order_id,
+                'worker_stopped': True,
+                'actor': resolved_actor,
+                'reason': resolved_reason,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_resolve_instant_buy_claim(
     *,
     wallet: str,
@@ -307,10 +356,22 @@ def build_parser() -> argparse.ArgumentParser:
     resolutions.add_argument('--order-id', default=None)
     resolutions.add_argument(
         '--resolution',
-        choices=['mark-completed', 'release-for-retry'],
+        choices=['mark-pending', 'mark-completed', 'release-for-retry'],
         default=None,
     )
     resolutions.add_argument('--limit', type=int, default=100)
+
+    mark_pending = subparsers.add_parser(
+        'mark-instant-buy-claim-pending',
+        help='Move a reserved instant-buy claim into pending reconciliation after worker shutdown is confirmed',
+    )
+    mark_pending.add_argument('--wallet', required=True)
+    mark_pending.add_argument('--chain', required=True)
+    mark_pending.add_argument('--order-id', required=True)
+    mark_pending.add_argument('--worker-stopped', action='store_true', required=True)
+    mark_pending.add_argument('--actor', required=True)
+    mark_pending.add_argument('--reason', required=True)
+    mark_pending.add_argument('--yes', action='store_true')
 
     resolve_claim = subparsers.add_parser(
         'resolve-instant-buy-claim',
@@ -379,6 +440,16 @@ def main() -> int:
             order_id=args.order_id,
             resolution=args.resolution,
             limit=args.limit,
+        )
+    if args.command == 'mark-instant-buy-claim-pending':
+        return cmd_mark_instant_buy_claim_pending(
+            wallet=args.wallet,
+            chain=args.chain,
+            order_id=args.order_id,
+            worker_stopped=args.worker_stopped,
+            force=args.yes,
+            actor=args.actor,
+            reason=args.reason,
         )
     if args.command == 'resolve-instant-buy-claim':
         return cmd_resolve_instant_buy_claim(
