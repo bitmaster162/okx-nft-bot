@@ -139,7 +139,7 @@ def test_receipt_timeout_blocks_same_order_after_process_restart(monkeypatch, tm
         currency="WETH",
     )
 
+    assert len(second_w3.eth.send_calls) == 0
     assert second["success"] is False
     assert second.get("pending") is True
     assert "pending" in str(second.get("error", "")).lower()
-    assert len(second_w3.eth.send_calls) == 0
