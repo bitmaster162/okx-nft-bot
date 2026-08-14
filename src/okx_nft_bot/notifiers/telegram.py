@@ -23,10 +23,20 @@ class TelegramNotifier(Notifier):
         }
         body = parse.urlencode(payload)
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        self.transport.request_json(
+        response = self.transport.request_json(
             method="POST",
             url=url,
             headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
             body=body,
         )
-        return DeliveryResult(channel=self.channel, event_id=alert.event.event_id, delivered=True)
+        ok = response.get("ok")
+        if ok is True:
+            return DeliveryResult(channel=self.channel, event_id=alert.event.event_id, delivered=True)
+        if ok is False:
+            return DeliveryResult(
+                channel=self.channel,
+                event_id=alert.event.event_id,
+                delivered=False,
+                detail="telegram_rejected",
+            )
+        raise RuntimeError("Telegram Bot API response missing boolean 'ok'")
