@@ -117,12 +117,12 @@ class Monitor:
                 cursor = next_cursor
                 break
             cursor = str(next_cursor)
-        state.set(self.store, cursor)
 
         normalized = normalize_many(raw_events)
         new_events = self.store.filter_new_events(normalized)
         if new_events:
             self.store.upsert_normalized_events(new_events)
+        state.set(self.store, cursor)
 
         rule_packs = load_rule_packs(self.settings.rules_path)
         decisions = [evaluate_event(event, self.settings, rule_packs=rule_packs) for event in new_events]
