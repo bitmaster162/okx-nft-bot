@@ -16,7 +16,7 @@ def _seed_attempt(store: SQLiteStore) -> None:
     assert created is True
 
 
-def test_ambiguous_notification_attempts_are_inspectable(tmp_path) -> None:
+def test_notification_attempts_are_inspectable_with_state(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "r74.sqlite3")
     _seed_attempt(store)
 
@@ -27,10 +27,11 @@ def test_ambiguous_notification_attempts_are_inspectable(tmp_path) -> None:
     assert row["channel"] == CHANNEL
     assert row["event_id"] == EVENT_ID
     assert row["started_at"]
+    assert row["state"] == "active"
     assert json.loads(row["payload_json"]) == PAYLOAD
 
 
-def test_operator_can_mark_ambiguous_attempt_as_sent_atomically(tmp_path) -> None:
+def test_operator_can_mark_attempt_as_sent_atomically(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "r74.sqlite3")
     _seed_attempt(store)
 
@@ -48,6 +49,7 @@ def test_operator_can_mark_ambiguous_attempt_as_sent_atomically(tmp_path) -> Non
 def test_operator_can_release_ambiguous_attempt_for_retry_without_marking_sent(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "r74.sqlite3")
     _seed_attempt(store)
+    assert store.mark_notification_attempt_ambiguous(CHANNEL, EVENT_ID) is True
 
     resolved = store.resolve_notification_attempt(
         CHANNEL,

@@ -39,6 +39,39 @@ def cmd_notification_attempts(
     return 0
 
 
+def cmd_mark_notification_attempt_ambiguous(
+    *,
+    channel: str,
+    event_id: str,
+    sender_stopped: bool,
+    force: bool,
+) -> int:
+    if not force:
+        raise SystemExit('mark-notification-attempt-ambiguous requires --yes')
+    if not sender_stopped:
+        raise SystemExit('mark-notification-attempt-ambiguous requires --sender-stopped')
+    settings = load_settings()
+    store = SQLiteStore(settings.db_path)
+    marked = store.mark_notification_attempt_ambiguous(channel, event_id)
+    if not marked:
+        raise SystemExit(
+            f'No active notification attempt: channel={channel} event_id={event_id}'
+        )
+    print(
+        json.dumps(
+            {
+                'marked_ambiguous': True,
+                'channel': channel,
+                'event_id': event_id,
+                'sender_stopped': True,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_resolve_notification_attempt(
     *,
     channel: str,
@@ -57,7 +90,7 @@ def cmd_resolve_notification_attempt(
     )
     if not resolved:
         raise SystemExit(
-            f'No matching notification attempt: channel={channel} event_id={event_id}'
+            f'No matching notification attempt eligible for this resolution: channel={channel} event_id={event_id}'
         )
     print(
         json.dumps(
@@ -168,15 +201,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     attempts = subparsers.add_parser(
         'notification-attempts',
-        help='List durable ambiguous notification delivery attempts',
+        help='List durable notification delivery attempts',
     )
     attempts.add_argument('--channel', default=None)
     attempts.add_argument('--event-id', default=None)
     attempts.add_argument('--limit', type=int, default=100)
 
+    mark_ambiguous = subparsers.add_parser(
+        'mark-notification-attempt-ambiguous',
+        help='Mark an active notification attempt ambiguous after sender shutdown is confirmed',
+    )
+    mark_ambiguous.add_argument('--channel', required=True)
+    mark_ambiguous.add_argument('--event-id', required=True)
+    mark_ambiguous.add_argument('--sender-stopped', action='store_true', required=True)
+    mark_ambiguous.add_argument('--yes', action='store_true')
+
     resolve = subparsers.add_parser(
         'resolve-notification-attempt',
-        help='Explicitly reconcile one ambiguous notification delivery attempt',
+        help='Explicitly reconcile one notification delivery attempt',
     )
     resolve.add_argument('--channel', required=True)
     resolve.add_argument('--event-id', required=True)
@@ -237,6 +279,13 @@ def main() -> int:
             channel=args.channel,
             event_id=args.event_id,
             limit=args.limit,
+        )
+    if args.command == 'mark-notification-attempt-ambiguous':
+        return cmd_mark_notification_attempt_ambiguous(
+            channel=args.channel,
+            event_id=args.event_id,
+            sender_stopped=args.sender_stopped,
+            force=args.yes,
         )
     if args.command == 'resolve-notification-attempt':
         return cmd_resolve_notification_attempt(
