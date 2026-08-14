@@ -12,7 +12,7 @@ def _hashless_offer(*, maker: str, price: str) -> dict[str, object]:
                 "consideration": [
                     {
                         "itemType": 4,
-                        "token": "0x00000000000000000000000000000000000000aa",
+                        "token": "collection-aa",
                         "identifierOrCriteria": "0",
                     }
                 ]
@@ -23,11 +23,11 @@ def _hashless_offer(*, maker: str, price: str) -> dict[str, object]:
 
 def test_hashless_opensea_offers_get_distinct_stable_fallback_ids() -> None:
     first_raw = _hashless_offer(
-        maker="0x0000000000000000000000000000000000000001",
+        maker="maker-one",
         price="1000000000000000000",
     )
     second_raw = _hashless_offer(
-        maker="0x0000000000000000000000000000000000000002",
+        maker="maker-two",
         price="2000000000000000000",
     )
 
@@ -42,7 +42,7 @@ def test_hashless_opensea_offers_get_distinct_stable_fallback_ids() -> None:
 
 def test_opensea_external_order_hash_remains_the_canonical_offer_id() -> None:
     raw = _hashless_offer(
-        maker="0x0000000000000000000000000000000000000001",
+        maker="maker-one",
         price="1000000000000000000",
     )
     raw["order_hash"] = "0xexternal-order-hash"
