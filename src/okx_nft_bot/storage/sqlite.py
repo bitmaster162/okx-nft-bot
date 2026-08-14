@@ -83,10 +83,18 @@ class SQLiteStore:
                     event_id TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     payload_json TEXT,
+                    state TEXT NOT NULL DEFAULT 'active',
                     PRIMARY KEY(channel, event_id)
                 )
                 """
             )
+            notification_attempt_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(notification_attempts)").fetchall()
+            }
+            if 'state' not in notification_attempt_columns:
+                conn.execute(
+                    "ALTER TABLE notification_attempts ADD COLUMN state TEXT NOT NULL DEFAULT 'active'"
+                )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_event_time ON normalized_events(event_time)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_maker ON normalized_events(maker)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_normalized_events_taker ON normalized_events(taker)")
@@ -208,8 +216,10 @@ class SQLiteStore:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT OR IGNORE INTO notification_attempts(channel, event_id, started_at, payload_json)
-                VALUES (?, ?, datetime('now'), ?)
+                INSERT OR IGNORE INTO notification_attempts(
+                    channel, event_id, started_at, payload_json, state
+                )
+                VALUES (?, ?, datetime('now'), ?, 'active')
                 """,
                 (channel, event_id, json.dumps(payload, ensure_ascii=False) if payload is not None else None),
             )
@@ -242,7 +252,7 @@ class SQLiteStore:
         with self._connect() as conn:
             cursor = conn.execute(
                 f"""
-                SELECT channel, event_id, started_at, payload_json
+                SELECT channel, event_id, started_at, payload_json, state
                 FROM notification_attempts
                 {where}
                 ORDER BY started_at ASC, channel ASC, event_id ASC
@@ -252,6 +262,18 @@ class SQLiteStore:
             )
             columns = [col[0] for col in cursor.description]
             return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+    def mark_notification_attempt_ambiguous(self, channel: str, event_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE notification_attempts
+                SET state = 'ambiguous'
+                WHERE channel = ? AND event_id = ? AND state = 'active'
+                """,
+                (channel, event_id),
+            )
+            return cursor.rowcount == 1
 
     def resolve_notification_attempt(
         self,
@@ -263,12 +285,20 @@ class SQLiteStore:
         if resolution not in {'mark-sent', 'release-for-retry'}:
             raise ValueError(f'Unsupported notification attempt resolution: {resolution}')
         with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             cursor = conn.execute(
-                'SELECT payload_json FROM notification_attempts WHERE channel = ? AND event_id = ?',
+                """
+                SELECT payload_json, state
+                FROM notification_attempts
+                WHERE channel = ? AND event_id = ?
+                """,
                 (channel, event_id),
             )
             row = cursor.fetchone()
             if row is None:
+                return False
+            payload_json, state = row
+            if resolution == 'release-for-retry' and state != 'ambiguous':
                 return False
             if resolution == 'mark-sent':
                 conn.execute(
@@ -276,13 +306,21 @@ class SQLiteStore:
                     INSERT OR REPLACE INTO sent_notifications(channel, event_id, sent_at, payload_json)
                     VALUES (?, ?, datetime('now'), ?)
                     """,
-                    (channel, event_id, row[0]),
+                    (channel, event_id, payload_json),
                 )
-            conn.execute(
-                'DELETE FROM notification_attempts WHERE channel = ? AND event_id = ?',
+                deleted = conn.execute(
+                    'DELETE FROM notification_attempts WHERE channel = ? AND event_id = ?',
+                    (channel, event_id),
+                )
+                return deleted.rowcount == 1
+            deleted = conn.execute(
+                """
+                DELETE FROM notification_attempts
+                WHERE channel = ? AND event_id = ? AND state = 'ambiguous'
+                """,
                 (channel, event_id),
             )
-            return True
+            return deleted.rowcount == 1
 
     def mark_notified(self, channel: str, event_id: str, payload: dict[str, object] | None = None) -> None:
         with self._connect() as conn:
