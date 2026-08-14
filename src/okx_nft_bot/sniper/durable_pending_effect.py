@@ -202,6 +202,63 @@ class DurablePendingEffectStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_reserved_pending(
+        self,
+        *,
+        wallet: str,
+        chain: str,
+        order_id: str,
+        actor: str,
+        reason: str,
+    ) -> bool:
+        """Move a stopped worker's reserved claim into reconciliation state.
+
+        This transition deliberately does not release the claim or authorize a
+        retry. It only reclassifies a surviving ``reserved`` claim as ``pending``
+        after the caller has independently established worker quiescence. Any
+        later retry release remains a separate audited reconciliation decision.
+        """
+        identity = self._identity(wallet, chain, order_id)
+        resolved_actor = str(actor or "").strip()
+        resolved_reason = str(reason or "").strip()
+        if not resolved_actor or not resolved_reason:
+            raise ValueError("actor and reason are required for reserved-to-pending transition")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT state, tx_hash
+                FROM instant_buy_pending_effects
+                WHERE wallet=? AND chain=? AND order_id=?
+                """,
+                identity,
+            ).fetchone()
+            if row is None or str(row["state"]) != "reserved":
+                return False
+
+            cursor = conn.execute(
+                """
+                UPDATE instant_buy_pending_effects
+                SET state='pending', updated_at=CURRENT_TIMESTAMP
+                WHERE wallet=? AND chain=? AND order_id=? AND state='reserved'
+                """,
+                identity,
+            )
+            if cursor.rowcount != 1:
+                return False
+
+            conn.execute(
+                """
+                INSERT INTO instant_buy_claim_resolutions (
+                    wallet, chain, order_id, prior_state, prior_tx_hash,
+                    resolution, actor, reason
+                ) VALUES (?, ?, ?, 'reserved', ?, 'mark-pending', ?, ?)
+                """,
+                (*identity, row["tx_hash"], resolved_actor, resolved_reason),
+            )
+            return True
+
     def resolve_claim(
         self,
         *,
