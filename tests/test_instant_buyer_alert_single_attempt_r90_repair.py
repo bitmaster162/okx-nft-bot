@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import sys
+import types
 
 from okx_nft_bot.sniper.buyer import BuyAttempt, OKXInstantBuyer
 
@@ -28,6 +30,12 @@ def _attempt() -> BuyAttempt:
     )
 
 
+def _install_fake_legacy_sender(monkeypatch, post):
+    module = types.ModuleType("okx_nft_bot.sales_stream")
+    module.http = types.SimpleNamespace(post=post)
+    monkeypatch.setitem(sys.modules, "okx_nft_bot.sales_stream", module)
+
+
 def test_instant_buyer_alert_unknown_outcome_is_single_attempt(monkeypatch):
     calls = {"transport": 0, "legacy_post": 0, "legacy_fallback": 0}
 
@@ -44,11 +52,10 @@ def test_instant_buyer_alert_unknown_outcome_is_single_attempt(monkeypatch):
         raise AssertionError("unknown notification outcome must never be retried")
 
     from okx_nft_bot.clients.http import StdlibHttpTransport
-    from okx_nft_bot.sales_stream import http as sales_http
     import urllib.request
 
     monkeypatch.setattr(StdlibHttpTransport, "request_json", transport_unknown)
-    monkeypatch.setattr(sales_http, "post", legacy_unknown)
+    _install_fake_legacy_sender(monkeypatch, legacy_unknown)
     monkeypatch.setattr(urllib.request, "urlopen", legacy_fallback)
 
     _buyer()._alert_buy_attempt(_attempt())
@@ -67,11 +74,10 @@ def test_instant_buyer_alert_requires_telegram_provider_ack(monkeypatch, caplog)
         raise AssertionError("legacy Telegram sender must not be used")
 
     from okx_nft_bot.clients.http import StdlibHttpTransport
-    from okx_nft_bot.sales_stream import http as sales_http
     import urllib.request
 
     monkeypatch.setattr(StdlibHttpTransport, "request_json", provider_rejects)
-    monkeypatch.setattr(sales_http, "post", legacy_path)
+    _install_fake_legacy_sender(monkeypatch, legacy_path)
     monkeypatch.setattr(urllib.request, "urlopen", legacy_path)
 
     caplog.set_level(logging.WARNING, logger="sniper.buyer")
