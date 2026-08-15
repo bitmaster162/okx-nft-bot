@@ -102,12 +102,6 @@ def install_pending_effect_safety(buyer_cls: type) -> None:
         if success:
             try:
                 tx_hash = result.get("tx_hash") if isinstance(result, dict) else None
-                durable.mark_pending(
-                    wallet=wallet,
-                    chain=chain,
-                    order_id=order_id,
-                    tx_hash=tx_hash,
-                )
                 durable.resolve_claim(
                     wallet=wallet,
                     chain=chain,
@@ -119,6 +113,7 @@ def install_pending_effect_safety(buyer_cls: type) -> None:
                         if tx_hash
                         else "receipt-confirmed successful instant-buy"
                     ),
+                    tx_hash=tx_hash,
                 )
             except Exception:
                 # If terminal finalization fails, retain the pre-effect claim in
