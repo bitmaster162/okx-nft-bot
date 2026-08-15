@@ -259,6 +259,77 @@ class DurablePendingEffectStore:
             )
             return True
 
+    def complete_confirmed_success(
+        self,
+        *,
+        wallet: str,
+        chain: str,
+        order_id: str,
+        tx_hash: str | None,
+        actor: str,
+        reason: str,
+    ) -> bool:
+        """Atomically persist receipt-confirmed success as a terminal tombstone.
+
+        The tx-hash capture, pending classification, terminal completion, and
+        immutable audit row share one write transaction. No reconciliation
+        release can interleave between those steps.
+        """
+        identity = self._identity(wallet, chain, order_id)
+        resolved_actor = str(actor or "").strip()
+        resolved_reason = str(reason or "").strip()
+        if not resolved_actor or not resolved_reason:
+            raise ValueError("actor and reason are required for confirmed-success completion")
+        supplied_tx_hash = str(tx_hash or "").strip() or None
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT state, tx_hash
+                FROM instant_buy_pending_effects
+                WHERE wallet=? AND chain=? AND order_id=?
+                """,
+                identity,
+            ).fetchone()
+            if row is None or str(row["state"]) not in {"reserved", "pending"}:
+                return False
+
+            effective_tx_hash = supplied_tx_hash or row["tx_hash"]
+            cursor = conn.execute(
+                """
+                UPDATE instant_buy_pending_effects
+                SET state='pending', tx_hash=?, updated_at=CURRENT_TIMESTAMP
+                WHERE wallet=? AND chain=? AND order_id=?
+                  AND state IN ('reserved', 'pending')
+                """,
+                (effective_tx_hash, *identity),
+            )
+            if cursor.rowcount != 1:
+                return False
+
+            cursor = conn.execute(
+                """
+                UPDATE instant_buy_pending_effects
+                SET state='completed', updated_at=CURRENT_TIMESTAMP
+                WHERE wallet=? AND chain=? AND order_id=? AND state='pending'
+                """,
+                identity,
+            )
+            if cursor.rowcount != 1:
+                return False
+
+            conn.execute(
+                """
+                INSERT INTO instant_buy_claim_resolutions (
+                    wallet, chain, order_id, prior_state, prior_tx_hash,
+                    resolution, actor, reason
+                ) VALUES (?, ?, ?, 'pending', ?, 'mark-completed', ?, ?)
+                """,
+                (*identity, effective_tx_hash, resolved_actor, resolved_reason),
+            )
+            return True
+
     def resolve_claim(
         self,
         *,
