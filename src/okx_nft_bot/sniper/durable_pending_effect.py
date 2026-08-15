@@ -202,6 +202,76 @@ class DurablePendingEffectStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def complete_success(
+        self,
+        *,
+        wallet: str,
+        chain: str,
+        order_id: str,
+        tx_hash: str | None,
+        actor: str,
+        reason: str,
+    ) -> bool:
+        """Atomically persist a receipt-confirmed successful instant-buy.
+
+        The terminal state, transaction hash, and immutable audit row are one
+        SQLite transaction. Any failure leaves the prior claim unchanged, so a
+        confirmed success can never fall into the ordinary retry-release lane.
+        """
+        identity = self._identity(wallet, chain, order_id)
+        resolved_actor = str(actor or "").strip()
+        resolved_reason = str(reason or "").strip()
+        resolved_tx_hash = str(tx_hash or "").strip() or None
+        if not resolved_actor or not resolved_reason:
+            raise ValueError("actor and reason are required for successful completion")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT state, tx_hash
+                FROM instant_buy_pending_effects
+                WHERE wallet=? AND chain=? AND order_id=?
+                """,
+                identity,
+            ).fetchone()
+            if row is None:
+                return False
+
+            prior_state = str(row["state"])
+            prior_tx_hash = row["tx_hash"]
+            if prior_state not in {"reserved", "pending"}:
+                return False
+
+            cursor = conn.execute(
+                """
+                UPDATE instant_buy_pending_effects
+                SET state='completed', tx_hash=?, updated_at=CURRENT_TIMESTAMP
+                WHERE wallet=? AND chain=? AND order_id=?
+                  AND state IN ('reserved', 'pending')
+                """,
+                (resolved_tx_hash, *identity),
+            )
+            if cursor.rowcount != 1:
+                return False
+
+            conn.execute(
+                """
+                INSERT INTO instant_buy_claim_resolutions (
+                    wallet, chain, order_id, prior_state, prior_tx_hash,
+                    resolution, actor, reason
+                ) VALUES (?, ?, ?, ?, ?, 'mark-completed', ?, ?)
+                """,
+                (
+                    *identity,
+                    prior_state,
+                    prior_tx_hash,
+                    resolved_actor,
+                    resolved_reason,
+                ),
+            )
+            return True
+
     def mark_reserved_pending(
         self,
         *,
