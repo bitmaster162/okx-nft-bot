@@ -268,6 +268,7 @@ class DurablePendingEffectStore:
         resolution: str,
         actor: str | None = None,
         reason: str | None = None,
+        tx_hash: str | None = None,
     ) -> bool:
         identity = self._identity(wallet, chain, order_id)
         resolved_resolution = str(resolution or "").strip().lower()
@@ -277,6 +278,7 @@ class DurablePendingEffectStore:
             )
         resolved_actor = str(actor or "").strip() or "legacy-api"
         resolved_reason = str(reason or "").strip() or "legacy API reconciliation"
+        resolved_tx_hash = str(tx_hash or "").strip() or None
 
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -307,11 +309,12 @@ class DurablePendingEffectStore:
                 cursor = conn.execute(
                     """
                     UPDATE instant_buy_pending_effects
-                    SET state='completed', updated_at=CURRENT_TIMESTAMP
+                    SET state='completed', tx_hash=COALESCE(?, tx_hash),
+                        updated_at=CURRENT_TIMESTAMP
                     WHERE wallet=? AND chain=? AND order_id=?
                       AND state IN ('reserved', 'pending')
                     """,
-                    identity,
+                    (resolved_tx_hash, *identity),
                 )
 
             if cursor.rowcount != 1:
