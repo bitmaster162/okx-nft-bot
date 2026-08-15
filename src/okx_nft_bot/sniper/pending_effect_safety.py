@@ -100,19 +100,14 @@ def install_pending_effect_safety(buyer_cls: type) -> None:
             keep_reserved = True
 
         if success:
+            finalized = False
             try:
                 tx_hash = result.get("tx_hash") if isinstance(result, dict) else None
-                durable.mark_pending(
+                finalized = durable.complete_success(
                     wallet=wallet,
                     chain=chain,
                     order_id=order_id,
                     tx_hash=tx_hash,
-                )
-                durable.resolve_claim(
-                    wallet=wallet,
-                    chain=chain,
-                    order_id=order_id,
-                    resolution="mark-completed",
                     actor="instant-buyer-runtime",
                     reason=(
                         f"receipt-confirmed successful instant-buy; tx_hash={tx_hash}"
@@ -121,12 +116,12 @@ def install_pending_effect_safety(buyer_cls: type) -> None:
                     ),
                 )
             except Exception:
-                # If terminal finalization fails, retain the pre-effect claim in
-                # reserved/pending state. A stale claim is safer than replaying
-                # an already-confirmed purchase after restart.
-                pass
-            with lock:
-                getattr(self, "_pending_orders", set()).discard(order_id)
+                # Atomic finalization rolls back on failure. Keep both the
+                # in-memory latch and durable pre-effect reservation fail-closed.
+                finalized = False
+            if finalized:
+                with lock:
+                    getattr(self, "_pending_orders", set()).discard(order_id)
         elif keep_reserved:
             try:
                 durable.mark_pending(
