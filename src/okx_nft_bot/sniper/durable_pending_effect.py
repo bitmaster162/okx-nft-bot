@@ -268,6 +268,7 @@ class DurablePendingEffectStore:
         resolution: str,
         actor: str | None = None,
         reason: str | None = None,
+        known_tx_no_effect_confirmed: bool = False,
     ) -> bool:
         identity = self._identity(wallet, chain, order_id)
         resolved_resolution = str(resolution or "").strip().lower()
@@ -293,9 +294,14 @@ class DurablePendingEffectStore:
 
             prior_state = str(row["state"])
             prior_tx_hash = row["tx_hash"]
+            audit_resolution = resolved_resolution
             if resolved_resolution == "release-for-retry":
                 if prior_state != "pending":
                     return False
+                if str(prior_tx_hash or "").strip():
+                    if not known_tx_no_effect_confirmed:
+                        return False
+                    audit_resolution = "release-for-retry-known-tx-no-effect"
                 cursor = conn.execute(
                     """
                     DELETE FROM instant_buy_pending_effects
@@ -328,7 +334,7 @@ class DurablePendingEffectStore:
                     *identity,
                     prior_state,
                     prior_tx_hash,
-                    resolved_resolution,
+                    audit_resolution,
                     resolved_actor,
                     resolved_reason,
                 ),
