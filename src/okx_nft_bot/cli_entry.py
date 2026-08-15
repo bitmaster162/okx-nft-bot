@@ -244,12 +244,17 @@ def cmd_resolve_instant_buy_claim(
     chain: str,
     order_id: str,
     resolution: str,
+    worker_stopped: bool = False,
     force: bool,
     actor: str | None = None,
     reason: str | None = None,
 ) -> int:
     if not force:
         raise SystemExit('resolve-instant-buy-claim requires --yes')
+    if resolution == 'release-for-retry' and not worker_stopped:
+        raise SystemExit(
+            'resolve-instant-buy-claim release-for-retry requires --worker-stopped'
+        )
     resolved_actor = str(actor or '').strip()
     resolved_reason = str(reason or '').strip()
     if not resolved_actor or not resolved_reason:
@@ -385,6 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=['mark-completed', 'release-for-retry'],
         required=True,
     )
+    resolve_claim.add_argument('--worker-stopped', action='store_true')
     resolve_claim.add_argument('--actor', required=True)
     resolve_claim.add_argument('--reason', required=True)
     resolve_claim.add_argument('--yes', action='store_true')
@@ -457,6 +463,7 @@ def main() -> int:
             chain=args.chain,
             order_id=args.order_id,
             resolution=args.resolution,
+            worker_stopped=args.worker_stopped,
             force=args.yes,
             actor=args.actor,
             reason=args.reason,
