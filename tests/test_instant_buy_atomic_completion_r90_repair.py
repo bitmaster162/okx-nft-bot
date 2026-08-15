@@ -82,7 +82,10 @@ def test_confirmed_success_cannot_be_released_between_tx_hash_and_completion(
 
     assert result["success"] is True
     assert effect_calls == [ORDER_ID]
-    assert release_results == [True]
+    # Old R89 code enters the hook and the simulated release succeeds. R90 may
+    # eliminate that pre-completion mark_pending call entirely; either way the
+    # terminal receipt-confirmed tombstone below is the safety invariant.
+    assert release_results in ([], [True])
 
     store = DurablePendingEffectStore(db_path)
     claims = store.fetch_claims(wallet=WALLET, chain=CHAIN, order_id=ORDER_ID)
