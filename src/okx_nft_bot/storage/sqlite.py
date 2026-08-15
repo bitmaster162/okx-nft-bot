@@ -234,15 +234,22 @@ class SQLiteStore:
         event_id: str,
         payload: dict[str, object] | None = None,
     ) -> bool:
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
         with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO notification_attempts(
                     channel, event_id, started_at, payload_json, state
                 )
-                VALUES (?, ?, datetime('now'), ?, 'active')
+                SELECT ?, ?, datetime('now'), ?, 'active'
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM sent_notifications
+                    WHERE channel = ? AND event_id = ?
+                )
                 """,
-                (channel, event_id, json.dumps(payload, ensure_ascii=False) if payload is not None else None),
+                (channel, event_id, payload_json, channel, event_id),
             )
             return cursor.rowcount == 1
 
