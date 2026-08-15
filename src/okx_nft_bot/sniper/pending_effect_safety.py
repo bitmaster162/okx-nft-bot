@@ -93,12 +93,41 @@ def install_pending_effect_safety(buyer_cls: type) -> None:
             # Unknown interruption: retain both in-memory and durable claims.
             raise
 
+        success = bool(isinstance(result, dict) and result.get("success") is True)
         keep_reserved = bool(isinstance(result, dict) and result.get("pending") is True)
         failed_orders = getattr(self, "_failed_orders", set())
         if order_id in failed_orders:
             keep_reserved = True
 
-        if keep_reserved:
+        if success:
+            try:
+                tx_hash = result.get("tx_hash") if isinstance(result, dict) else None
+                durable.mark_pending(
+                    wallet=wallet,
+                    chain=chain,
+                    order_id=order_id,
+                    tx_hash=tx_hash,
+                )
+                durable.resolve_claim(
+                    wallet=wallet,
+                    chain=chain,
+                    order_id=order_id,
+                    resolution="mark-completed",
+                    actor="instant-buyer-runtime",
+                    reason=(
+                        f"receipt-confirmed successful instant-buy; tx_hash={tx_hash}"
+                        if tx_hash
+                        else "receipt-confirmed successful instant-buy"
+                    ),
+                )
+            except Exception:
+                # If terminal finalization fails, retain the pre-effect claim in
+                # reserved/pending state. A stale claim is safer than replaying
+                # an already-confirmed purchase after restart.
+                pass
+            with lock:
+                getattr(self, "_pending_orders", set()).discard(order_id)
+        elif keep_reserved:
             try:
                 durable.mark_pending(
                     wallet=wallet,
