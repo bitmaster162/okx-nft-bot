@@ -29,16 +29,20 @@ def _resolve_args(resolution: str) -> list[str]:
     ]
 
 
-def test_release_for_retry_parser_requires_worker_stopped_attestation() -> None:
+def test_release_for_retry_parser_carries_worker_stopped_attestation() -> None:
     parser = cli_entry.build_parser()
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(_resolve_args("release-for-retry"))
+    without_attestation = parser.parse_args(_resolve_args("release-for-retry"))
+    assert without_attestation.command == "resolve-instant-buy-claim"
+    assert without_attestation.resolution == "release-for-retry"
+    assert without_attestation.worker_stopped is False
 
-    args = parser.parse_args(_resolve_args("release-for-retry") + ["--worker-stopped"])
-    assert args.command == "resolve-instant-buy-claim"
-    assert args.resolution == "release-for-retry"
-    assert args.worker_stopped is True
+    with_attestation = parser.parse_args(
+        _resolve_args("release-for-retry") + ["--worker-stopped"]
+    )
+    assert with_attestation.command == "resolve-instant-buy-claim"
+    assert with_attestation.resolution == "release-for-retry"
+    assert with_attestation.worker_stopped is True
 
 
 def test_mark_completed_does_not_require_worker_stopped_attestation() -> None:
