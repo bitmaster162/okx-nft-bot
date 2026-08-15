@@ -13,6 +13,7 @@ log = logging.getLogger("counterbid.cancel_effect_safety")
 
 _CANCEL_PATH = "/api/v5/mktplace/nft/markets/cancel-listing"
 _AMBIGUOUS_HTTP_STATUSES = frozenset({408, 409, 425, 429})
+_ACK_KEYS = ("success", "cancelled", "result")
 
 
 def _http_status_from_exception(exc: BaseException) -> int | None:
@@ -33,6 +34,19 @@ def _ambiguous_cancel_failure(exc: BaseException) -> bool:
     if status is not None:
         return status in _AMBIGUOUS_HTTP_STATUSES or status >= 500
     return isinstance(exc, (OKXNetworkError, OKXRateLimitError)) or status is None
+
+
+def _confirmed_cancel_ack(client: Any, response: Mapping[str, Any]) -> bool:
+    """Return True only for a code=0 receipt with explicit affirmative cancellation acknowledgement."""
+    if str(response.get("code", "")) != "0":
+        return False
+
+    success = client._extract_scalar(response, keys=_ACK_KEYS)
+    if success is None:
+        return False
+    if isinstance(success, bool):
+        return success
+    return str(success).lower() not in {"0", "false", "failed"}
 
 
 def _strict_active_readback(self: Any, *, offer_id: str, chain: str) -> bool | None:
@@ -227,6 +241,14 @@ def install_cancel_effect_safety(client_class: type[Any]) -> None:
         if deterministic_reject:
             if order_params:
                 return self._cancel_onchain_seaport(order_params, chain_name)
+            return False
+
+        if not _confirmed_cancel_ack(self, response):
+            _strict_active_readback(self, offer_id=str(offer_id), chain=chain_name)
+            log.warning(
+                "cancel_offer %s: cancellation not explicitly acknowledged; on-chain fallback suppressed",
+                str(offer_id)[:14],
+            )
             return False
 
         log.info("cancel_offer %s: SUCCESS via single-attempt API cancel", str(offer_id)[:14])
