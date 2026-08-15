@@ -247,6 +247,7 @@ def cmd_resolve_instant_buy_claim(
     force: bool,
     actor: str | None = None,
     reason: str | None = None,
+    tx_no_effect_confirmed: bool = False,
 ) -> int:
     if not force:
         raise SystemExit('resolve-instant-buy-claim requires --yes')
@@ -262,6 +263,7 @@ def cmd_resolve_instant_buy_claim(
         resolution=resolution,
         actor=resolved_actor,
         reason=resolved_reason,
+        known_tx_no_effect_confirmed=tx_no_effect_confirmed,
     )
     if not resolved:
         raise SystemExit(
@@ -276,6 +278,7 @@ def cmd_resolve_instant_buy_claim(
                 'chain': chain,
                 'order_id': order_id,
                 'resolution': resolution,
+                'tx_no_effect_confirmed': bool(tx_no_effect_confirmed),
                 'actor': resolved_actor,
                 'reason': resolved_reason,
             },
@@ -356,7 +359,12 @@ def build_parser() -> argparse.ArgumentParser:
     resolutions.add_argument('--order-id', default=None)
     resolutions.add_argument(
         '--resolution',
-        choices=['mark-pending', 'mark-completed', 'release-for-retry'],
+        choices=[
+            'mark-pending',
+            'mark-completed',
+            'release-for-retry',
+            'release-for-retry-known-tx-no-effect',
+        ],
         default=None,
     )
     resolutions.add_argument('--limit', type=int, default=100)
@@ -384,6 +392,11 @@ def build_parser() -> argparse.ArgumentParser:
         '--resolution',
         choices=['mark-completed', 'release-for-retry'],
         required=True,
+    )
+    resolve_claim.add_argument(
+        '--tx-no-effect-confirmed',
+        action='store_true',
+        help='Attest that a known transaction hash was independently confirmed to have produced no external effect',
     )
     resolve_claim.add_argument('--actor', required=True)
     resolve_claim.add_argument('--reason', required=True)
@@ -460,6 +473,7 @@ def main() -> int:
             force=args.yes,
             actor=args.actor,
             reason=args.reason,
+            tx_no_effect_confirmed=args.tx_no_effect_confirmed,
         )
     return legacy_cli.main()
 
