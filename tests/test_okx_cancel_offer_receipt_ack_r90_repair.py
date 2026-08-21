@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from okx_nft_bot.counterbid.cancel_effect_safety import install_cancel_effect_safety
 
 
@@ -64,8 +66,8 @@ def _client(response):
     return Client(response)
 
 
-def test_code_zero_without_explicit_ack_is_not_cancel_success():
-    client = _client({"code": "0", "data": {}})
+def _assert_fail_closed(response) -> None:
+    client = _client(response)
 
     result = client.cancel_offer(
         "offer-r90",
@@ -75,19 +77,15 @@ def test_code_zero_without_explicit_ack_is_not_cancel_success():
     assert result is False
     assert client.market.transport.calls == 1
     assert client.onchain_calls == []
+    assert client.readback_calls == [("bsc", "", True)]
+
+
+def test_code_zero_without_explicit_ack_is_not_cancel_success():
+    _assert_fail_closed({"code": "0", "data": {}})
 
 
 def test_code_zero_with_explicit_false_ack_is_not_cancel_success():
-    client = _client({"code": "0", "data": {"success": False}})
-
-    result = client.cancel_offer(
-        "offer-r90",
-        order_params={"offerer": "0x1"},
-    )
-
-    assert result is False
-    assert client.market.transport.calls == 1
-    assert client.onchain_calls == []
+    _assert_fail_closed({"code": "0", "data": {"success": False}})
 
 
 def test_code_zero_with_explicit_true_ack_remains_success():
@@ -101,3 +99,56 @@ def test_code_zero_with_explicit_true_ack_remains_success():
     assert result is True
     assert client.market.transport.calls == 1
     assert client.onchain_calls == []
+    assert client.readback_calls == []
+
+
+@pytest.mark.parametrize(
+    "ack",
+    ["true", "false", "yes", "no", "ok", "error", 1, 0],
+)
+def test_non_boolean_acknowledgements_never_confirm_cancel(ack):
+    _assert_fail_closed({"code": "0", "data": {"result": ack}})
+
+
+def test_conflicting_acknowledgements_fail_closed():
+    _assert_fail_closed(
+        {
+            "code": "0",
+            "success": True,
+            "data": {"cancelled": False},
+        }
+    )
+
+
+def test_mixed_list_acknowledgements_fail_closed():
+    _assert_fail_closed(
+        {
+            "code": "0",
+            "data": [
+                {"success": True},
+                {"result": False},
+            ],
+        }
+    )
+
+
+def test_all_true_list_acknowledgements_remain_success():
+    client = _client(
+        {
+            "code": "0",
+            "data": [
+                {"success": True},
+                {"result": True},
+            ],
+        }
+    )
+
+    result = client.cancel_offer(
+        "offer-r90",
+        order_params={"offerer": "0x1"},
+    )
+
+    assert result is True
+    assert client.market.transport.calls == 1
+    assert client.onchain_calls == []
+    assert client.readback_calls == []

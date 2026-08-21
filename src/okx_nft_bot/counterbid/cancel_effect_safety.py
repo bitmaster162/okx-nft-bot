@@ -36,37 +36,38 @@ def _ambiguous_cancel_failure(exc: BaseException) -> bool:
     return isinstance(exc, (OKXNetworkError, OKXRateLimitError)) or status is None
 
 
-def _ack_value(response: Mapping[str, Any]) -> Any:
+def _ack_values(response: Mapping[str, Any]) -> list[Any]:
+    """Collect every supported provider acknowledgement without coercion."""
+    values: list[Any] = []
+
     for key in _ACK_KEYS:
         if key in response:
-            return response[key]
+            values.append(response[key])
 
     data = response.get("data")
     if isinstance(data, Mapping):
         for key in _ACK_KEYS:
             if key in data:
-                return data[key]
+                values.append(data[key])
     elif isinstance(data, list):
         for item in data:
             if not isinstance(item, Mapping):
                 continue
             for key in _ACK_KEYS:
                 if key in item:
-                    return item[key]
-    return None
+                    values.append(item[key])
+    return values
 
 
 def _confirmed_cancel_ack(response: Mapping[str, Any]) -> bool:
-    """Return True only for a code=0 receipt with explicit affirmative cancellation acknowledgement."""
+    """Require code=0 plus explicit, non-conflicting boolean True acknowledgement(s)."""
     if str(response.get("code", "")) != "0":
         return False
 
-    success = _ack_value(response)
-    if success is None:
+    acknowledgements = _ack_values(response)
+    if not acknowledgements:
         return False
-    if isinstance(success, bool):
-        return success
-    return str(success).lower() not in {"0", "false", "failed"}
+    return all(value is True for value in acknowledgements)
 
 
 def _strict_active_readback(self: Any, *, offer_id: str, chain: str) -> bool | None:
