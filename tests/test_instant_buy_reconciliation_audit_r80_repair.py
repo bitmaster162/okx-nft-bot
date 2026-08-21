@@ -36,6 +36,7 @@ def test_release_for_retry_keeps_durable_audit_after_claim_is_removed(tmp_path: 
         resolution="release-for-retry",
         actor=ACTOR,
         reason=REASON,
+        known_tx_no_effect_confirmed=True,
     ) is True
 
     assert store.fetch_claims(wallet=WALLET, chain=CHAIN, order_id=ORDER_ID) == []
@@ -43,7 +44,7 @@ def test_release_for_retry_keeps_durable_audit_after_claim_is_removed(tmp_path: 
     assert len(rows) == 1
     assert rows[0]["prior_state"] == "pending"
     assert rows[0]["prior_tx_hash"] == "0xr80-pending"
-    assert rows[0]["resolution"] == "release-for-retry"
+    assert rows[0]["resolution"] == "release-for-retry-known-tx-no-effect"
     assert rows[0]["actor"] == ACTOR
     assert rows[0]["reason"] == REASON
 
