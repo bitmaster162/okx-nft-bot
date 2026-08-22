@@ -259,6 +259,90 @@ class DurablePendingEffectStore:
             )
             return True
 
+    def complete_confirmed_success(
+        self,
+        *,
+        wallet: str,
+        chain: str,
+        order_id: str,
+        tx_hash: str | None,
+        actor: str,
+        reason: str,
+    ) -> bool:
+        """Atomically persist a receipt-confirmed success as a terminal tombstone.
+
+        Receipt-confirmed external success is stronger evidence than a stale
+        retry-release decision. If a pending claim was released immediately
+        before this transaction, recreate it directly as ``completed`` so the
+        confirmed effect cannot become replayable after restart.
+        """
+        identity = self._identity(wallet, chain, order_id)
+        resolved_tx_hash = str(tx_hash or "").strip() or None
+        resolved_actor = str(actor or "").strip()
+        resolved_reason = str(reason or "").strip()
+        if not resolved_actor or not resolved_reason:
+            raise ValueError("actor and reason are required for confirmed-success completion")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT state, tx_hash
+                FROM instant_buy_pending_effects
+                WHERE wallet=? AND chain=? AND order_id=?
+                """,
+                identity,
+            ).fetchone()
+
+            if row is not None and str(row["state"]) == "completed":
+                return True
+
+            prior_state = str(row["state"]) if row is not None else "missing"
+            prior_tx_hash = row["tx_hash"] if row is not None else None
+            final_tx_hash = resolved_tx_hash or prior_tx_hash
+
+            if row is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO instant_buy_pending_effects (
+                        wallet, chain, order_id, state, tx_hash, updated_at
+                    ) VALUES (?, ?, ?, 'completed', ?, CURRENT_TIMESTAMP)
+                    """,
+                    (*identity, final_tx_hash),
+                )
+            else:
+                if prior_state not in {"reserved", "pending"}:
+                    return False
+                cursor = conn.execute(
+                    """
+                    UPDATE instant_buy_pending_effects
+                    SET state='completed', tx_hash=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE wallet=? AND chain=? AND order_id=?
+                      AND state IN ('reserved', 'pending')
+                    """,
+                    (final_tx_hash, *identity),
+                )
+
+            if cursor.rowcount != 1:
+                return False
+
+            conn.execute(
+                """
+                INSERT INTO instant_buy_claim_resolutions (
+                    wallet, chain, order_id, prior_state, prior_tx_hash,
+                    resolution, actor, reason
+                ) VALUES (?, ?, ?, ?, ?, 'mark-completed', ?, ?)
+                """,
+                (
+                    *identity,
+                    prior_state,
+                    prior_tx_hash,
+                    resolved_actor,
+                    resolved_reason,
+                ),
+            )
+            return True
+
     def resolve_claim(
         self,
         *,
@@ -268,6 +352,7 @@ class DurablePendingEffectStore:
         resolution: str,
         actor: str | None = None,
         reason: str | None = None,
+        known_tx_no_effect_confirmed: bool = False,
     ) -> bool:
         identity = self._identity(wallet, chain, order_id)
         resolved_resolution = str(resolution or "").strip().lower()
@@ -293,9 +378,14 @@ class DurablePendingEffectStore:
 
             prior_state = str(row["state"])
             prior_tx_hash = row["tx_hash"]
+            audit_resolution = resolved_resolution
             if resolved_resolution == "release-for-retry":
                 if prior_state != "pending":
                     return False
+                if str(prior_tx_hash or "").strip():
+                    if not known_tx_no_effect_confirmed:
+                        return False
+                    audit_resolution = "release-for-retry-known-tx-no-effect"
                 cursor = conn.execute(
                     """
                     DELETE FROM instant_buy_pending_effects
@@ -328,7 +418,7 @@ class DurablePendingEffectStore:
                     *identity,
                     prior_state,
                     prior_tx_hash,
-                    resolved_resolution,
+                    audit_resolution,
                     resolved_actor,
                     resolved_reason,
                 ),

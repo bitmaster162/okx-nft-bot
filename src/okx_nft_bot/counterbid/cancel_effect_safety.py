@@ -13,6 +13,7 @@ log = logging.getLogger("counterbid.cancel_effect_safety")
 
 _CANCEL_PATH = "/api/v5/mktplace/nft/markets/cancel-listing"
 _AMBIGUOUS_HTTP_STATUSES = frozenset({408, 409, 425, 429})
+_ACK_KEYS = ("success", "cancelled", "result")
 
 
 def _http_status_from_exception(exc: BaseException) -> int | None:
@@ -33,6 +34,40 @@ def _ambiguous_cancel_failure(exc: BaseException) -> bool:
     if status is not None:
         return status in _AMBIGUOUS_HTTP_STATUSES or status >= 500
     return isinstance(exc, (OKXNetworkError, OKXRateLimitError)) or status is None
+
+
+def _ack_values(response: Mapping[str, Any]) -> list[Any]:
+    """Collect every supported provider acknowledgement without coercion."""
+    values: list[Any] = []
+
+    for key in _ACK_KEYS:
+        if key in response:
+            values.append(response[key])
+
+    data = response.get("data")
+    if isinstance(data, Mapping):
+        for key in _ACK_KEYS:
+            if key in data:
+                values.append(data[key])
+    elif isinstance(data, list):
+        for item in data:
+            if not isinstance(item, Mapping):
+                continue
+            for key in _ACK_KEYS:
+                if key in item:
+                    values.append(item[key])
+    return values
+
+
+def _confirmed_cancel_ack(response: Mapping[str, Any]) -> bool:
+    """Require code=0 plus explicit, non-conflicting boolean True acknowledgement(s)."""
+    if str(response.get("code", "")) != "0":
+        return False
+
+    acknowledgements = _ack_values(response)
+    if not acknowledgements:
+        return False
+    return all(value is True for value in acknowledgements)
 
 
 def _strict_active_readback(self: Any, *, offer_id: str, chain: str) -> bool | None:
@@ -227,6 +262,14 @@ def install_cancel_effect_safety(client_class: type[Any]) -> None:
         if deterministic_reject:
             if order_params:
                 return self._cancel_onchain_seaport(order_params, chain_name)
+            return False
+
+        if not _confirmed_cancel_ack(response):
+            _strict_active_readback(self, offer_id=str(offer_id), chain=chain_name)
+            log.warning(
+                "cancel_offer %s: cancellation not explicitly acknowledged; on-chain fallback suppressed",
+                str(offer_id)[:14],
+            )
             return False
 
         log.info("cancel_offer %s: SUCCESS via single-attempt API cancel", str(offer_id)[:14])

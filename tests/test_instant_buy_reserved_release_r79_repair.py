@@ -31,14 +31,13 @@ def test_reserved_claim_cannot_be_released_for_retry(tmp_path: Path) -> None:
     assert store.reserve(wallet=WALLET, chain=CHAIN, order_id=ORDER_ID) is False
 
 
-def test_pending_claim_can_still_be_released_for_retry(tmp_path: Path) -> None:
+def test_pending_claim_without_tx_hash_can_still_be_released_for_retry(tmp_path: Path) -> None:
     store = _store(tmp_path)
     assert store.reserve(wallet=WALLET, chain=CHAIN, order_id=ORDER_ID) is True
     store.mark_pending(
         wallet=WALLET,
         chain=CHAIN,
         order_id=ORDER_ID,
-        tx_hash="0xr79",
     )
 
     assert store.resolve_claim(
